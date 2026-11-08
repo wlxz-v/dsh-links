@@ -36,6 +36,12 @@ fun decideCompletionNotice(
     notifyOnDone: Boolean,
     showReplyFirstLine: Boolean,
     replyFirstLine: String?,
+    /**
+     * 宿主的事件帧建议（`notify` 字段）。插件会把「同一会话 60 秒内重复的同一种终态」
+     * 标成 false——那是自动重试里的瞬时失败或轮询抖动，通知过就不必再响。
+     * 缺省 true：老插件不发这个字段。
+     */
+    hostNotifyHint: Boolean = true,
 ): CompletionNotice {
     val kind = when (state) {
         "completed" -> CompletionNoticeKind.Done
@@ -46,7 +52,7 @@ fun decideCompletionNotice(
     val schedule = origin == "schedule"
     val thresholdMs = normalizeLongTaskMinutes(longTaskMinutes).toLong() * 60_000L
     val longEnough = observedDurationMs != null && observedDurationMs >= thresholdMs
-    val notify = notifyOnDone && kind != CompletionNoticeKind.None && (schedule || longEnough)
+    val notify = notifyOnDone && hostNotifyHint && kind != CompletionNoticeKind.None && (schedule || longEnough)
     val duration = observedDurationMs?.coerceAtLeast(0)
     val first = if (notify && showReplyFirstLine) replyFirstLine(replyFirstLine) else null
     return CompletionNotice(

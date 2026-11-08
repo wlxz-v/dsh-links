@@ -31,6 +31,8 @@ class HostEventClient(
             val title: String,
             val origin: String,
             val seq: Long,
+            /** 宿主的通知建议：false 表示同一会话 60 秒内重复的同一种终态，不必再响一次。老插件不发，缺省 true。 */
+            val notify: Boolean = true,
         ) : Item
         data object Resync : Item
         data object Disconnected : Item
@@ -171,6 +173,7 @@ class HostEventClient(
                         title = obj.optString("title"),
                         origin = obj.optString("origin"),
                         seq = seq ?: obj.optLong("seq"),
+                        notify = obj.optBoolean("notify", true),
                     ),
                 )
             }

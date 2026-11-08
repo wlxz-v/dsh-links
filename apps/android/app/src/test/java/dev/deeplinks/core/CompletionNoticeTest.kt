@@ -115,6 +115,19 @@ class CompletionNoticeTest {
         assertNull(tracker.finish("s2", 9_000))
     }
 
+    @Test
+    fun `host notify hint suppresses duplicate terminal state`() {
+        val notice = decide(
+            origin = "schedule",
+            state = "failed",
+            durationMs = 10_000,
+            hostNotifyHint = false,
+        )
+        assertFalse(notice.notify)
+        assertEquals(CompletionNoticeKind.None, notice.kind)
+        assertNull(notice.durationMs)
+    }
+
     private fun decide(
         origin: String,
         state: String,
@@ -123,6 +136,7 @@ class CompletionNoticeTest {
         showReplyFirstLine: Boolean = false,
         reply: String? = null,
         minutes: Int = 3,
+        hostNotifyHint: Boolean = true,
     ) = decideCompletionNotice(
         origin = origin,
         state = state,
@@ -131,5 +145,6 @@ class CompletionNoticeTest {
         notifyOnDone = notifyOnDone,
         showReplyFirstLine = showReplyFirstLine,
         replyFirstLine = reply,
+        hostNotifyHint = hostNotifyHint,
     )
 }

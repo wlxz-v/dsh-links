@@ -11,6 +11,8 @@
 - 诊断口径修正：`/dsh-link/diagnostics` 的 `host.services` 先重试一次建 peer，再取快照（原先会长期显示启动窗口里的 `peerError: "no-connection"`，看起来像网关坏了）；新增 `peerTransport`（gateway / 空）与 `peerRecreated`（重建次数）。预览探测失败不再静默成空列表，会带回 `detectedError`。
 - 主机级会话事件新增 `notify` 提示：同一会话在 60 秒内重复同一种终态（自动重试里的瞬时失败、轮询抖动）标 `notify: false`，客户端可据此不重复弹通知；事件本身照发，UI 不会漏状态。参考 `dsh-meow-smooth` 的「自动重试中的瞬时错误不打扰、每条恰好一条」。
 
+- Android 侧：`CompletionNotice.decideCompletionNotice()` 增加末位参数 `hostNotifyHint`（缺省 `true`），`HostEventClient.Item.State` 解析事件帧的 `notify`（缺省 `true`），后台监控把它透传下来——宿主标了 `notify:false` 的同一种重复终态不再弹第二次通知；老插件不发该字段，行为不变。契约见 `docs/MOBILE_SYNC_CONTRACT.md`。
+
 **已知问题（Windows 开发机）**
 
 - `npm test` 里 13 个用例仍失败，全部是 Windows 环境限制、与插件行为无关：符号链接需要开发者模式/管理员（8 个）、`chmod 448` 在 Windows 上是 438（1 个）、`openssl` / `npm` 不在 PATH（2 个）、POSIX 路径分隔符断言（2 个）。Linux CI 上全部通过。

@@ -271,6 +271,7 @@ class SessionBackgroundMonitorService : Service() {
             notifyOnDone = prefs.notifyOnDone,
             showReplyFirstLine = false,
             replyFirstLine = null,
+            hostNotifyHint = item.notify,
         )
         if (!preliminary.notify) return
         val showLine = prefs.notifyReplyFirstLine
@@ -293,6 +294,7 @@ class SessionBackgroundMonitorService : Service() {
                 notifyOnDone = prefs.notifyOnDone,
                 showReplyFirstLine = showLine,
                 replyFirstLine = line,
+                hostNotifyHint = item.notify,
             )
             if (!notice.notify) return@launch
             withContext(Dispatchers.Main) {
