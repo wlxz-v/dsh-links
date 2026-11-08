@@ -241,7 +241,16 @@ class SessionBackgroundMonitorService : Service() {
         }
         if (item.sessionId != takeoverId) {
             if (item.state == "awaitingApproval") {
-                DshNotifier.notifyHandleOnComputer(this, host, item.sessionId, item.title.ifBlank { sessionTitle })
+                val title = item.title.ifBlank { sessionTitle }
+                val tool = item.approvalToolName
+                val approvalId = item.approvalId
+                // 双端审批：宿主把审批同时给了电脑和手机。带上 approvalId 就能在通知上
+                // 直接「允许一次 / 拒绝」（先答先算）；老插件不给 id 时退回旧提示。
+                if (!approvalId.isNullOrBlank() && !tool.isNullOrBlank()) {
+                    DshNotifier.notifyApproval(this, host, item.sessionId, tool, approvalId, title)
+                } else {
+                    DshNotifier.notifyHandleOnComputer(this, host, item.sessionId, title)
+                }
             }
             return
         }

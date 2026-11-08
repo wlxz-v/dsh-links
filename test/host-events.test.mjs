@@ -143,3 +143,37 @@ test("事件帧带 seq，心跳不带会话内容", () => {
     seq: 4,
   })
 })
+
+test("待审批事件带 approvalId：App 后台通知可以直接作答（双端审批）", () => {
+  const approval = classifyHostSession(row({
+    pendingApproval: true,
+    pendingApprovalId: "ap-123",
+    pendingApprovalToolName: "pwsh",
+  }))
+  assert.deepEqual(approval, {
+    sessionId: "s1",
+    state: "awaitingApproval",
+    title: "修登录",
+    origin: "user",
+    approvalId: "ap-123",
+    approvalToolName: "pwsh",
+  })
+  const frame = hostEventFrame({ ...approval, seq: 7 })
+  const body = JSON.parse(frame.split("data: ")[1])
+  assert.equal(body.approvalId, "ap-123")
+  assert.equal(body.approvalToolName, "pwsh")
+
+  // 换了一条审批（id 不同）也要算变化，否则手机还留着上一条的通知。
+  const prev = new Map([["s1", approval]])
+  const next = new Map([["s1", classifyHostSession(row({
+    pendingApproval: true,
+    pendingApprovalId: "ap-456",
+    pendingApprovalToolName: "pwsh",
+  }))]])
+  const changed = diffHostSessions(prev, next)
+  assert.equal(changed.length, 1)
+  assert.equal(changed[0].approvalId, "ap-456")
+
+  // 没有挂起审批时事件形状不变（工具名只随审批出现）。
+  assert.deepEqual(Object.keys(classifyHostSession(row())).sort(), ["origin", "sessionId", "state", "title"])
+})

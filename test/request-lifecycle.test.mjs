@@ -3,6 +3,7 @@ import assert from "node:assert/strict"
 import {
   createRequestRegistry,
   canDeviceHandle,
+  desktopApprovalDecided,
   graceDurationMs,
   mapApprovalUiStatus,
   APPROVAL_TIMEOUT_MS,
@@ -40,6 +41,19 @@ test("宽限内原设备可处理，吊销后立即拒绝", () => {
   assert.equal(canDeviceHandle(rec, { deviceId: "dev-1", authorized: false, subscribed: false, inGrace: true }), false)
   assert.equal(canDeviceHandle(rec, { deviceId: "dev-2", authorized: true, subscribed: false, inGrace: true }), false)
   assert.equal(canDeviceHandle(rec, { deviceId: "dev-1", authorized: true, subscribed: true, inGrace: false }), true)
+})
+
+test("双端审批：已配对设备没订阅、没宽限也能作答（后台通知直接批准）", () => {
+  const { rec } = pending()
+  assert.equal(canDeviceHandle(rec, { deviceId: "dev-1", authorized: true, subscribed: false, inGrace: false }), true)
+  // 没进候选集合的设备照样拒。
+  assert.equal(canDeviceHandle(rec, { deviceId: "dev-9", authorized: true, subscribed: false, inGrace: false }), false)
+  // 电脑端只有明确答复才算定案；unavailable / cancelled 让手机端继续等。
+  assert.equal(desktopApprovalDecided("allowed-once"), true)
+  assert.equal(desktopApprovalDecided("rejected"), true)
+  assert.equal(desktopApprovalDecided("unavailable"), false)
+  assert.equal(desktopApprovalDecided("cancelled"), false)
+  assert.equal(desktopApprovalDecided(undefined), false)
 })
 
 test("终态幂等响应仍绑定原会话", () => {

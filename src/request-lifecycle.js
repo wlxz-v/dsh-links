@@ -18,15 +18,29 @@ export function graceDurationMs(rec, now, grace = RECONNECT_GRACE_MS) {
   return Math.min(grace, remainingMs(rec, now))
 }
 
-export function canDeviceHandle(rec, { deviceId, authorized, subscribed, inGrace }) {
+export function canDeviceHandle(rec, { deviceId, authorized, subscribed }) {
   if (!rec || !deviceId || !authorized) return false
   if (subscribed) return true
-  return Boolean(inGrace && rec.eligibleDeviceIds?.has(deviceId))
+  // 双端审批：从后台通知直接作答的设备并没有订阅这个会话（也没有重连宽限），
+  // 但它是这次审批的候选设备之一、且已通过设备令牌鉴权，让它答；其他设备照样拒。
+  return Boolean(rec.eligibleDeviceIds?.has(deviceId))
 }
 
 /** 请求 ID 可能来自另一个会话；终态幂等响应也必须绑定 URL 会话。 */
 export function requestBelongsToSession(request, sessionId) {
   return Boolean(request?.sessionId) && request.sessionId === sessionId
+}
+
+/**
+ * 双端审批（2026-11-09 用户要求「双端同时推送、先答先算」）。
+ *
+ * 电脑端是同一个 waterfall 的下游：插件把请求交给它之后，只有网页真的接了这个会话
+ * 才会给出 allowed-once / rejected。`unavailable` 是「没有应答者」、`cancelled` 是
+ * 「网页端撤销了这次提问」，两者都不代表用户做了决定——不能拿来抢答，否则网页没打开
+ * 该会话时手机端会被瞬间判成无人应答。
+ */
+export function desktopApprovalDecided(outcome) {
+  return outcome === "allowed-once" || outcome === "rejected"
 }
 
 export function mapApprovalUiStatus(outcome) {

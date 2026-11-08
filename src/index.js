@@ -50,6 +50,7 @@ import {
   APPROVAL_TIMEOUT_MS,
   canDeviceHandle,
   createRequestRegistry,
+  desktopApprovalDecided,
   mapApprovalUiStatus,
   requestBelongsToSession,
 } from "./request-lifecycle.js"
@@ -955,6 +956,18 @@ function createRuntime(config) {
     // sessionId → 未结束的审批 / 澄清问题数（含交给电脑端的），首页「等待确认」用
     awaiting: createAwaitingInput(),
   }
+}
+
+/**
+ * 双端审批：手机端此刻是否可能收到审批——任一会话有 SSE 订阅，或后台监视的主机事件流还在。
+ * 只看「有没有」不看具体设备：审批的候选设备在 rec.eligibleDeviceIds 里另算。
+ */
+export function hasLiveMobileDevice(rt, hostSubscriberCount = 0) {
+  if (Number(hostSubscriberCount) > 0) return true
+  for (const writers of rt?.sessionStreams?.values() ?? []) {
+    if ((writers?.size ?? 0) > 0) return true
+  }
+  return false
 }
 
 function sseCounts(rt) {
@@ -1942,24 +1955,32 @@ export function apply(ctx, config) {
     if (req?.signal?.aborted === true) return Promise.resolve("cancelled")
     const sessionId = req?.agent?.session?.id
     const writers = sessionId ? rt.sessionStreams.get(sessionId) : null
-    if (!writers || writers.size === 0) {
-      ctx.logger.info(`dsh-links: approval/request passthrough（无手机订阅）session=${String(sessionId ?? "?").slice(0, 8)} tool=${req?.toolName ?? req?.name ?? "?"}`)
-      return next()
-    }
     const id = findApprovalId(req)
     if (!id) {
       ctx.logger.info(`dsh-links: approval/request passthrough（无法解析审批 id）session=${String(sessionId ?? "?").slice(0, 8)} callId=${req?.callId ?? "无"} reqId=${req?.id ?? "无"} tool=${req?.toolName ?? req?.name ?? "?"}`)
       return next()
     }
-    ctx.logger.info(`dsh-links: approval/request 接管 session=${String(sessionId).slice(0, 8)} id=${String(id).slice(0, 24)} callId=${req?.callId ?? "无"} tool=${req?.toolName ?? req?.name ?? "?"}`)
+    // 双端审批：只要手机端还在线（在看这个会话，或后台挂着主机事件流）就接管，
+    // 同时把请求继续交给下游的电脑端——两边各弹各的，谁先答用谁。
+    const hostSubscribers = hostEvents.subscriberCount
+    if (!writers?.size && !hasLiveMobileDevice(rt, hostSubscribers)) {
+      ctx.logger.info(`dsh-links: approval/request passthrough（手机端离线）session=${String(sessionId ?? "?").slice(0, 8)} tool=${req?.toolName ?? req?.name ?? "?"}`)
+      return next()
+    }
+    ctx.logger.info(`dsh-links: approval/request 双端接管 session=${String(sessionId).slice(0, 8)} id=${String(id).slice(0, 24)} callId=${req?.callId ?? "无"} tool=${req?.toolName ?? req?.name ?? "?"} 手机订阅=${writers?.size ?? 0} 后台流=${hostSubscribers}`)
     return new Promise((resolve) => {
+      const eligible = subscribedDeviceIds(writers)
+      // 没在看这个会话的手机也要能作答：后台通知点开会话后按 deviceId 认人。
+      for (const device of state.devices ?? []) {
+        if (device?.deviceId) eligible.add(device.deviceId)
+      }
       const rec = {
         id,
         sessionId,
         type: "approval",
         createdAt: Date.now(),
         deadlineAt: Date.now() + APPROVAL_TIMEOUT_MS,
-        eligibleDeviceIds: subscribedDeviceIds(writers),
+        eligibleDeviceIds: eligible,
         settled: false,
         callId: req?.callId ?? null,
         toolName: req?.toolName ?? req?.name ?? req?.payload?.toolName ?? null,
@@ -1971,6 +1992,21 @@ export function apply(ctx, config) {
       rec.timer?.unref?.()
       rt.requests.addApproval(rec)
       req.signal?.addEventListener("abort", rec.onAbort, { once: true })
+      // 电脑端：api-remotes 把这个 waterfall 转给网页。它给出明确答复就用它的；
+      // 没有应答者 / 网页没接这个会话 / 抛错，都继续等手机端。
+      Promise.resolve()
+        .then(() => next())
+        .then((outcome) => {
+          if (rec.settled) return
+          if (!desktopApprovalDecided(outcome)) {
+            ctx.logger.info(`dsh-links: 电脑端未定案（${String(outcome)}），继续等手机端 session=${String(sessionId).slice(0, 8)}`)
+            return
+          }
+          ctx.logger.info(`dsh-links: 审批由电脑端定案 ${outcome} session=${String(sessionId).slice(0, 8)}`)
+          rt.requests.finishApproval(rec, outcome)
+        }, (error) => {
+          ctx.logger.warn(`dsh-links: 电脑端审批通道异常：${String(error?.code ?? error?.message ?? error)} session=${String(sessionId).slice(0, 8)}`)
+        })
     })
   }), { prepend: true })
 
@@ -2020,23 +2056,30 @@ export function apply(ctx, config) {
   const hostEvents = createHostEventHub({
     listSessions: async () => {
       const list = await callLocalRpc(targetPort, "session.list", {})
-      const approvals = new Set()
+      const approvals = new Map()
       const questions = new Set()
       for (const rec of rt.requests.pendingApprovals.values()) {
-        if (rec?.sessionId) approvals.add(rec.sessionId)
+        if (!rec?.sessionId || approvals.has(rec.sessionId)) continue
+        approvals.set(rec.sessionId, { id: rec.id, toolName: rec.toolName ?? "" })
       }
       for (const rec of rt.requests.pendingQuestions.values()) {
         if (rec?.sessionId) questions.add(rec.sessionId)
       }
-      return (list?.items ?? []).map((item) => ({
-        sessionId: item?.sessionId,
-        title: item?.projections?.values?.title,
-        origin: item?.origin,
-        running: Boolean(item?.running),
-        pendingApproval: approvals.has(item?.sessionId),
-        pendingQuestion: questions.has(item?.sessionId),
-        awaitingInput: Boolean(rt.awaiting?.has(item?.sessionId)),
-      }))
+      return (list?.items ?? []).map((item) => {
+        const approval = approvals.get(item?.sessionId)
+        return {
+          sessionId: item?.sessionId,
+          title: item?.projections?.values?.title,
+          origin: item?.origin,
+          running: Boolean(item?.running),
+          pendingApproval: Boolean(approval),
+          // 双端审批：让 App 后台通知能带上审批 id 和工具名，直接给「允许一次 / 拒绝」。
+          pendingApprovalId: approval?.id ?? null,
+          pendingApprovalToolName: approval?.toolName ?? null,
+          pendingQuestion: questions.has(item?.sessionId),
+          awaitingInput: Boolean(rt.awaiting?.has(item?.sessionId)),
+        }
+      })
     },
     terminalReason: async (sessionId) => {
       const history = await callLocalRpc(targetPort, "session.history", { sessionId, maxMessages: 8 })

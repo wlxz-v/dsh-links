@@ -758,7 +758,9 @@ export async function handleMobileApi(req, res, targetPort, state, stateFile, de
       const sessionId = decodeURIComponent(requestsMatch[1])
       const subscribed = isDeviceSubscribedToSession(rt, sessionId, device.deviceId)
       const eligible = rt.requests.pendingForSession(sessionId).some((rec) => rec.eligibleDeviceIds.has(device.deviceId))
-      if (!subscribed && !(rt.requests.inGrace(sessionId) && eligible)) {
+      // 双端审批：从后台通知点进来的设备没有 SSE 订阅，也没有重连宽限，
+      // 但它是这台主机上已配对的设备，允许它读待处理列表（审批/澄清的合法性由作答接口再判）。
+      if (!subscribed && !eligible) {
         return json(res, 403, { error: "仅该会话的当前连接设备可查看待处理请求" })
       }
       return json(res, 200, { version: 1, ...rt.requests.snapshot(sessionId) })

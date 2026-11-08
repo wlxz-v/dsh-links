@@ -13,6 +13,15 @@
 
 - Android 侧：`CompletionNotice.decideCompletionNotice()` 增加末位参数 `hostNotifyHint`（缺省 `true`），`HostEventClient.Item.State` 解析事件帧的 `notify`（缺省 `true`），后台监控把它透传下来——宿主标了 `notify:false` 的同一种重复终态不再弹第二次通知；老插件不发该字段，行为不变。契约见 `docs/MOBILE_SYNC_CONTRACT.md`。
 
+**双端审批（先答先算）**
+
+- 审批请求现在同时推给电脑端与手机端：钩子里先建手机端记录，再把请求交给 `next()`（电脑端网页）；两端谁先给出明确答复就用谁的结果。电脑端的 `unavailable`（没人在看这个会话）与 `cancelled`（网页端撤销提问）不算定案，手机端继续等——否则电脑没打开该会话时手机端会被瞬间判成无人应答。
+- 手机端在线判定不再要求「这个会话正被订阅」：会话 SSE 有订阅者，或后台挂着主机事件流（`GET /dsh-link/mobile/events`）任一成立就接管；两边都不在时照旧交回电脑端。
+- 主机事件 `session/state` 在 `state == "awaitingApproval"` 时带 `approvalId` 与 `approvalToolName`（≤64 字符），App 后台据此直接发带「允许一次 / 拒绝」的通知，不必等用户打开该会话；换了另一条审批（id 不同）也会算作变化下发。
+- 作答权限放宽：这次审批的候选设备（已配对、已鉴权）即使没订阅该会话、没有重连宽限也能作答——从后台通知直接点按钮就是这条路。`GET .../requests` 对这些设备同样返回快照，合法性由 POST 再判。
+- Android 侧：`HostEventClient.Item.State` 解析 `approvalId` / `approvalToolName`；后台监控在「非当前会话 + 待审批」时，有 id 就发带动作的审批通知（`DshNotifier.notifyApproval`），没有则保持旧的「请在电脑上处理」提示。
+- 已知体验缺口：手机先答时，电脑端那条 waterfall 请求仍在册，网页上的审批框要等宿主把 `approval/decided` 写进会话后自己收（插件无法替下游取消），通常在一次事件轮询内。
+
 **已知问题（Windows 开发机）**
 
 - `npm test` 里 13 个用例仍失败，全部是 Windows 环境限制、与插件行为无关：符号链接需要开发者模式/管理员（8 个）、`chmod 448` 在 Windows 上是 438（1 个）、`openssl` / `npm` 不在 PATH（2 个）、POSIX 路径分隔符断言（2 个）。Linux CI 上全部通过。

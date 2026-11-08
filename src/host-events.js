@@ -31,7 +31,22 @@ export function classifyHostSession(row) {
   else if (row?.running && (row?.pendingQuestion || row?.awaitingInput)) state = "awaitingInput"
   else if (row?.running) state = "running"
   else state = terminalHostState(row?.stoppedReason)
-  return { sessionId, state, title, origin }
+  // 双端审批：待办审批带上请求 id，App 后台就能直接弹出可操作的审批通知，
+  // 而不是只提示「请在电脑上处理」。没有挂起审批时不带这个键，事件形状保持不变。
+  const approvalId = state === "awaitingApproval" && typeof row?.pendingApprovalId === "string" && row.pendingApprovalId
+    ? row.pendingApprovalId
+    : null
+  const approvalToolName = approvalId && typeof row?.pendingApprovalToolName === "string" && row.pendingApprovalToolName
+    ? row.pendingApprovalToolName.slice(0, 64)
+    : null
+  return {
+    sessionId,
+    state,
+    title,
+    origin,
+    ...(approvalId ? { approvalId } : {}),
+    ...(approvalToolName ? { approvalToolName } : {}),
+  }
 }
 
 /**
@@ -50,7 +65,8 @@ export function diffHostSessions(previous, next, { initial = false } = {}) {
       events.push({ ...row })
       continue
     }
-    if (prev.state !== row.state || prev.title !== row.title || prev.origin !== row.origin) {
+    if (prev.state !== row.state || prev.title !== row.title || prev.origin !== row.origin
+      || prev.approvalId !== row.approvalId || prev.approvalToolName !== row.approvalToolName) {
       events.push({ ...row })
     }
   }
@@ -69,6 +85,8 @@ export function hostEventFrame(event) {
     title: event.title,
     origin: event.origin,
     seq: event.seq,
+    ...(event.approvalId ? { approvalId: event.approvalId } : {}),
+    ...(event.approvalToolName ? { approvalToolName: event.approvalToolName } : {}),
     // F2：终态事件是否值得推一条通知。缺失/true 时按老行为推送；
     // false 表示「同一个会话刚刚已经报过终态」——自动重试里的瞬时失败、
     // 或轮询抖动导致的重复终态，别让手机再响一次。

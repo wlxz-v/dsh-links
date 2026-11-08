@@ -33,6 +33,12 @@ class HostEventClient(
             val seq: Long,
             /** 宿主的通知建议：false 表示同一会话 60 秒内重复的同一种终态，不必再响一次。老插件不发，缺省 true。 */
             val notify: Boolean = true,
+            /**
+             * 待办审批的 id 与工具名（双端审批）。有它就能在通知上直接「允许一次 / 拒绝」，
+             * 不必等手机打开该会话；老插件不发，两个都是 null。
+             */
+            val approvalId: String? = null,
+            val approvalToolName: String? = null,
         ) : Item
         data object Resync : Item
         data object Disconnected : Item
@@ -174,6 +180,9 @@ class HostEventClient(
                         origin = obj.optString("origin"),
                         seq = seq ?: obj.optLong("seq"),
                         notify = obj.optBoolean("notify", true),
+                        // optString 缺键返回 ""，这里要的是「有没有」，空串统一成 null。
+                        approvalId = obj.optString("approvalId").takeIf { it.isNotBlank() },
+                        approvalToolName = obj.optString("approvalToolName").takeIf { it.isNotBlank() },
                     ),
                 )
             }
