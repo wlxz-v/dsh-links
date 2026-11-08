@@ -1,0 +1,426 @@
+package dev.deeplinks.native
+
+import dev.deeplinks.native.DshIconSize
+import dev.deeplinks.core.DshType
+
+import android.content.Context
+import android.widget.Toast
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.ui.semantics.Role
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.lazy.LazyListScope
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.Icon
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.ui.text.font.FontFamily
+
+import dev.deeplinks.core.Dsh
+import dev.deeplinks.core.Host
+import dev.deeplinks.core.L
+import dev.deeplinks.native.MobileMessage
+import dev.deeplinks.native.util.MessageGroup
+import dev.deeplinks.native.util.activityLine
+import dev.deeplinks.native.util.turnEndAssistantIds
+import dev.deeplinks.native.util.copiedNeedsAppToast
+import dev.deeplinks.native.util.goalRoundObjective
+import dev.deeplinks.native.util.foldToolCalls
+import dev.deeplinks.native.util.MarkdownSplitCache
+import dev.deeplinks.native.util.isContextInjectionText
+import dev.deeplinks.native.util.isModelChangedNotice
+import dev.deeplinks.native.isTurnEnd
+
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+
+/** 从消息列表提取最上方（最新）的 goal 摘要文本。 */
+internal fun latestGoalSummary(messages: List<MobileMessage>): String? {
+    // 优先取显式 role=goal 消息
+    for (msg in messages.asReversed()) {
+        if (msg.role == "goal" && msg.goalSummary != null) return msg.goalSummary
+    }
+    // 降级：从最新一条 goal_round 注入文本中提取 objective
+    for (msg in messages.asReversed()) {
+        if ((msg.role == "assistant" || msg.role == "user")) {
+            val obj = goalRoundObjective(msg.text)
+            if (obj != null) return obj
+        }
+    }
+    return null
+}
+
+/**
+ * 活动摘要行（2026-10-02 Lody 简化 4.3）：一批工具调用 + 相邻思考收成一行灰字，
+ * 下方一根发丝线；整行点按切到轨迹视图看明细。运行中显示「◌ 当前命令」。
+ * 与轨迹视图组头共用 [activityLine] 口径（两个视图不再各说各话）。
+ */
+@Composable
+private fun ToolSummaryCard(summary: MessageGroup.ToolSummary, onOpenTrace: () -> Unit) {
+    // v4 4.1：过程收成灰色单行（图标 + 摘要 + ›），运行中是转圈 + 等宽命令；不画分隔线、不做卡片
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(min = DshTouch.min)
+            .clip(RoundedCornerShape(DshRadius.control))
+            .clickable(role = Role.Button, onClickLabel = L.viewInTrace, onClick = onOpenTrace)
+            .padding(vertical = DshSpace.s4),
+        horizontalArrangement = Arrangement.spacedBy(DshSpace.s8),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        if (summary.running) {
+            CircularProgressIndicator(
+                modifier = Modifier.size(DshIconSize.sm),
+                color = Dsh.brand400,
+                trackColor = Dsh.primarySoft,
+                strokeWidth = 2.dp,
+            )
+            val label = if (summary.lastToolName == null) L.thinkingActive else L.executing
+            Text(label.trimEnd('…', '.', '。'), color = Dsh.labelPrimary, style = DshType.supporting, maxLines = 1)
+            Text(
+                text = summary.lastToolName.orEmpty(),
+                color = Dsh.tertiaryText,
+                style = DshType.supporting.copy(fontFamily = FontFamily.Monospace),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f),
+            )
+        } else {
+            Icon(
+                if (summary.activity.thinkingMs != null) SparkleOutline16 else CodeOutline16,
+                contentDescription = null,
+                tint = Dsh.labelSecondary,
+                modifier = Modifier.size(DshIconSize.sm),
+            )
+            val line = activityLine(summary.activity).joinToString(" · ")
+                .ifBlank { L.toolSummary.format(summary.count) }
+            Text(
+                text = line,
+                color = Dsh.labelSecondary,
+                style = DshType.supporting,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f, fill = false),
+            )
+            if (summary.failedCount > 0) {
+                Text(
+                    text = L.toolSummaryFailed.format(summary.failedCount),
+                    color = Dsh.err,
+                    style = DshType.supporting,
+                    maxLines = 1,
+                )
+            }
+            Icon(ChevronRightOutline16, contentDescription = null, tint = Dsh.labelSecondary, modifier = Modifier.size(DshIconSize.xs))
+        }
+    }
+}
+
+/**
+ * 消息渲染所需的状态与副作用（从 WorkspaceScreen 抽出，COM-001 拆解）。
+ *
+ * 状态用 getter/setter 注入而不是持有 Compose State，因此实例可稳定复用，
+ * 回调在调用时读取最新值。真正的 IO（审批/提问/反馈/重生成）留在类里，
+ * 与原先内联在 composable 中的行为一一对应。
+ */
+internal class ChatFeedActions(
+    private val client: MobileApiClient,
+    private val scope: CoroutineScope,
+    private val context: Context,
+    private val host: Host,
+    private val currentSessionId: () -> String?,
+    private val messages: () -> List<MobileMessage>,
+    private val setMessages: (List<MobileMessage>) -> Unit,
+    private val olderMessages: () -> List<MobileMessage>,
+    private val composerText: () -> String,
+    private val setComposerText: (String) -> Unit,
+    private val setComposerError: (String?) -> Unit,
+    private val isRunning: () -> Boolean,
+    private val busyEnter: () -> String,
+    private val isFeedbackSupported: () -> Boolean,
+    private val feedbackFor: (String) -> Pair<String, String>?,
+    private val updateFeedback: (transform: (Map<String, Pair<String, String>>) -> Map<String, Pair<String, String>>) -> Unit,
+    private val refreshSessions: () -> Unit,
+    private val fork: (String) -> Unit,
+    /** 打开改动审查面：轮次 seq + 文件下标（null = 文件列表）。 */
+    val openChanges: (Long, Int?) -> Unit = { _, _ -> },
+    /** 工具摘要行点按：切到轨迹视图看明细。 */
+    val openTrace: () -> Unit = {},
+) {
+    fun onCopy(msg: MobileMessage): () -> Unit = {
+        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+        clipboard.setPrimaryClip(android.content.ClipData.newPlainText("dsh message", msg.text))
+        if (copiedNeedsAppToast(android.os.Build.VERSION.SDK_INT)) {
+            Toast.makeText(context, L.copied, Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    fun onQuote(msg: MobileMessage): () -> Unit = {
+        // DSH 引用：把消息首行作为引用注入输入框
+        val firstLine = msg.text.lineSequence().firstOrNull().orEmpty().take(120)
+        val current = composerText()
+        setComposerText(if (current.isBlank()) "> $firstLine\n" else "> $firstLine\n$current")
+    }
+
+    fun onFork(): () -> Unit = {
+        val sid = currentSessionId()
+        if (sid != null) fork(sid)
+    }
+
+    fun onRegenerate(msg: MobileMessage): (() -> Unit)? {
+        if (msg.role != "assistant") return null
+        return {
+            val sid = currentSessionId()
+            if (sid != null) {
+                val all = mergeHistoryPages(olderMessages(), messages())
+                val idx = all.indexOfFirst { it.id == msg.id }
+                val prevUser = if (idx > 0) {
+                    all.subList(0, idx).lastOrNull { it.role == "user" }
+                } else {
+                    null
+                }
+                val prompt = prevUser?.text?.takeIf { it.isNotBlank() }
+                if (prompt.isNullOrBlank()) {
+                    setComposerError(L.cannotFindUserMessageToRegenerate)
+                } else {
+                    setComposerError(null)
+                    scope.launch(Dispatchers.IO) {
+                        try {
+                            client.sendPrompt(sid, prompt, mode = resolvePromptMode(isRunning(), busyEnter()))
+                            withContext(Dispatchers.Main) { refreshSessions() }
+                        } catch (e: Exception) {
+                            withContext(Dispatchers.Main) {
+                                setComposerError(L.regenerateFailed.format(e.message ?: L.unknownError))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fun onFeedback(msg: MobileMessage): (() -> Unit)? {
+        if (msg.role != "assistant") return null
+        return { setComposerText(insertFeedbackCommand(composerText())) }
+    }
+
+    fun feedbackRating(msg: MobileMessage): String? =
+        if (isFeedbackSupported()) feedbackFor(msg.id)?.first else null
+
+    fun onRate(msg: MobileMessage): ((String) -> Unit)? {
+        if (msg.role != "assistant" || !isFeedbackSupported()) return null
+        return { rating ->
+            val sid = currentSessionId()
+            if (sid != null) {
+                val current = feedbackFor(msg.id)
+                scope.launch(Dispatchers.IO) {
+                    try {
+                        val root = client.putMessageFeedback(sid, msg.id, rating, current?.second)
+                        val ver = root.optJSONObject("value")?.optString("version").orEmpty()
+                        withContext(Dispatchers.Main) {
+                            updateFeedback { it + (msg.id to (rating to ver)) }
+                        }
+                    } catch (_: Exception) {
+                    }
+                }
+            }
+        }
+    }
+
+    fun onRetract(msg: MobileMessage): (() -> Unit)? {
+        if (msg.role != "assistant" || !isFeedbackSupported()) return null
+        return {
+            val sid = currentSessionId()
+            val current = feedbackFor(msg.id)
+            if (sid != null && current != null) {
+                scope.launch(Dispatchers.IO) {
+                    try {
+                        client.deleteMessageFeedback(sid, msg.id, current.second)
+                        withContext(Dispatchers.Main) {
+                            updateFeedback { it - msg.id }
+                        }
+                    } catch (_: Exception) {
+                    }
+                }
+            }
+        }
+    }
+
+    fun onFetchProducedFile(msg: MobileMessage): ((String) -> Pair<String, ByteArray>)? {
+        if (msg.role != "produced_files") return null
+        return { path ->
+            val sid = currentSessionId() ?: throw IllegalStateException(L.unknownError)
+            client.getSessionFile(sid, path)
+        }
+    }
+}
+
+/**
+ * 消息列表渲染（从 WorkspaceScreen 的 LazyColumn 抽出，COM-001 拆解）。
+ * 纯展示 + 通过 [actions] 触发副作用。
+ */
+internal fun LazyListScope.chatMessageItems(
+    visibleGroups: List<MessageGroup>,
+    sweepingId: String?,
+    actions: ChatFeedActions,
+    isRunning: Boolean = false,
+    pinnedChangesSeq: Long? = null,
+) {
+    val groups = if (pinnedChangesSeq == null) {
+        visibleGroups
+    } else {
+        visibleGroups.filterNot { group ->
+            group is MessageGroup.Single &&
+                group.msg.role == ROLE_WORKSPACE_CHANGES &&
+                group.msg.changes?.seq == pinnedChangesSeq
+        }
+    }
+    val turnEnds = turnEndAssistantIds(groups, isRunning)
+    val folded = foldToolCalls(groups, viewMode = "chat")
+    // v4 4.2：本轮改动卡挂到轮末回复下面（改动 → 元信息 → 按钮），不再单独成行
+    val turnChanges = turnChangesByAssistant(folded, turnEnds)
+    val attached = turnChanges.values.mapTo(HashSet()) { it.id }
+    val foldedGroups = if (attached.isEmpty()) folded else folded.filterNot { (it as? MessageGroup.Single)?.msg?.id in attached }
+    // 轮尾元信息的模型名（4.3）：只认本轮出现过的模型切换标记，不伪造逐条模型字段
+    val turnModelById = turnEndModelLabels(foldedGroups, turnEnds)
+    val rows = chatFeedRows(foldedGroups, isRunning)
+    items(
+        items = rows,
+        key = { it.key },
+        contentType = { row: ChatFeedRow ->
+            when {
+                row.group is MessageGroup.ToolGroup -> "toolgroup"
+                row.group is MessageGroup.ToolSummary -> "toolsummary"
+                row.partCount > 1 -> "assistant-part"
+                else -> "single"
+            }
+        },
+    ) { row: ChatFeedRow ->
+        val group = row.group
+        // 入场只交给 animateItem：AnimatedVisibility(visible = true) 首帧即可见，enter 永远不会播。
+        // 仅本机刚收到的消息（entrance）淡入；历史分页、切会话载入的消息直接出现。
+        val live = group is MessageGroup.Single && group.msg.entrance
+        Box(
+            modifier = Modifier.animateItem(
+                fadeInSpec = if (live) tween(motionDuration(DshDuration.normal), easing = DshEasing.out) else null,
+                fadeOutSpec = null,
+            ),
+        ) {
+            when (group) {
+                is MessageGroup.Single -> {
+                    MessageItem(
+                        msg = group.msg,
+                        running = sweepingId != null && group.msg.id == sweepingId,
+                        onCopy = actions.onCopy(group.msg),
+                        onQuote = actions.onQuote(group.msg),
+                        onFork = actions.onFork(),
+                        onRegenerate = actions.onRegenerate(group.msg),
+                        onFeedback = actions.onFeedback(group.msg),
+                        feedbackRating = actions.feedbackRating(group.msg),
+                        onRate = actions.onRate(group.msg),
+                        onRetract = actions.onRetract(group.msg),
+                        onFetchProducedFile = actions.onFetchProducedFile(group.msg),
+                        onOpenChanges = actions.openChanges,
+                        showActions = group.msg.id in turnEnds,
+                        turnModelLabel = turnModelById[group.msg.id],
+                        isTurnEnd = row.isTurnEnd,
+                        textPart = row.part,
+                        isLastPart = row.partIndex == row.partCount - 1,
+                        turnChanges = turnChanges[group.msg.id],
+                    )
+                }
+                is MessageGroup.ToolGroup -> ToolGroupHeader(
+                    group = group,
+                    sweepingId = sweepingId,
+                    showActions = false,
+                )
+                is MessageGroup.ToolSummary -> ToolSummaryCard(summary = group, onOpenTrace = actions.openTrace)
+            }
+        }
+    }
+}
+/** 消息流里的一行：普通分组原样一行；长助手回复按 Markdown 块拆成多行（各自独立测量）。 */
+internal data class ChatFeedRow(
+    val group: MessageGroup,
+    val key: String,
+    val isTurnEnd: Boolean,
+    val part: String? = null,
+    val partIndex: Int = 0,
+    val partCount: Int = 1,
+)
+
+private val chatSplitCache = MarkdownSplitCache()
+
+internal fun chatFeedRows(foldedGroups: List<MessageGroup>, isRunning: Boolean): List<ChatFeedRow> {
+    val rows = ArrayList<ChatFeedRow>(foldedGroups.size)
+    foldedGroups.forEachIndexed { idx, group ->
+        val turnEnd = isTurnEnd(foldedGroups, idx, isRunning)
+        val msg = (group as? MessageGroup.Single)?.msg
+        val parts = if (msg != null && splittableAssistant(msg)) chatSplitCache.parts(msg.id, msg.text) else null
+        if (parts == null || parts.size <= 1) {
+            rows += ChatFeedRow(group, group.groupKey, turnEnd)
+        } else {
+            parts.forEachIndexed { i, part ->
+                // 第 0 段沿用消息 id 作 key：滚动锚点 / 加载更早恢复仍能按 id 找到它
+                val key = if (i == 0) group.groupKey else "${group.groupKey}#p$i"
+                rows += ChatFeedRow(group, key, turnEnd, part, i, parts.size)
+            }
+        }
+    }
+    return rows
+}
+
+private fun splittableAssistant(msg: MobileMessage): Boolean =
+    msg.role == "assistant" && !isRawFallback(msg) &&
+        !isContextInjectionText(msg.text) && !isModelChangedNotice(msg.text)
+
+/** 每条轮末助手回复 → 本轮最近一次模型切换的模型名（util.isModelChangedNotice 口径）。 */
+internal fun turnEndModelLabels(
+    foldedGroups: List<MessageGroup>,
+    turnEnds: Set<String>,
+): Map<String, String> {
+    if (turnEnds.isEmpty()) return emptyMap()
+    val out = mutableMapOf<String, String>()
+    var current: String? = null
+    for (group in foldedGroups) {
+        val msg = (group as? MessageGroup.Single)?.msg ?: continue
+        when {
+            msg.role == "user" -> current = null
+            msg.role == "system_notice" || isModelChangedNotice(msg.text) ->
+                current = dev.deeplinks.native.util.modelChangedFrom(msg.text) ?: current
+            msg.role == "assistant" && msg.id in turnEnds ->
+                current?.let { out[msg.id] = it }
+        }
+    }
+    return out
+}
+
+/** 轮末回复 id → 同一轮里紧随其后的改动摘要（中间没有新的用户消息）。 */
+internal fun turnChangesByAssistant(foldedGroups: List<MessageGroup>, turnEnds: Set<String>): Map<String, MobileMessage> {
+    if (turnEnds.isEmpty()) return emptyMap()
+    val out = mutableMapOf<String, MobileMessage>()
+    var lastEnd: String? = null
+    for (group in foldedGroups) {
+        val msg = (group as? MessageGroup.Single)?.msg ?: continue
+        when {
+            msg.role == "user" -> lastEnd = null
+            msg.role == "assistant" && msg.id in turnEnds -> lastEnd = msg.id
+            msg.role == ROLE_WORKSPACE_CHANGES && msg.changes != null -> lastEnd?.let { if (it !in out) out[it] = msg }
+        }
+    }
+    return out
+}

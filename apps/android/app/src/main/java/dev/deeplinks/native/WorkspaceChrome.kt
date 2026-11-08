@@ -1,0 +1,697 @@
+package dev.deeplinks.native
+
+import dev.deeplinks.native.DshIconSize
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.getValue
+import dev.deeplinks.native.ui.DshErrorState
+import dev.deeplinks.core.tabularNums
+import dev.deeplinks.core.DshType
+import dev.deeplinks.core.DshS
+
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
+import androidx.compose.foundation.background
+import dev.deeplinks.native.ui.v4.DlSize
+import dev.deeplinks.native.ui.v4.DlLabelStrong
+import dev.deeplinks.native.ui.v4.DlOverlayColor
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.lazy.LazyListScope
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.Icon
+import dev.deeplinks.native.ui.ChatLoadingSkeleton
+import dev.deeplinks.native.util.ChatCanvasKind
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import dev.deeplinks.core.Dsh
+import androidx.compose.foundation.layout.Arrangement
+import dev.deeplinks.native.util.MessageGroup
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.text.font.FontWeight
+import dev.deeplinks.core.dshRipple
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.semantics.stateDescription
+import dev.deeplinks.native.util.compactTokens
+import dev.deeplinks.core.L
+import dev.deeplinks.native.ui.DshTag
+import dev.deeplinks.native.ui.HostStatusDot
+import dev.deeplinks.native.ui.v4.DlDiffStat
+import dev.deeplinks.native.ui.v4.DlTopBar
+import dev.deeplinks.native.ui.v4.DlTopBarAction
+import dev.deeplinks.native.ui.v4.DlTopBarNav
+import dev.deeplinks.native.NewChatOutline16
+import dev.deeplinks.native.ListPenOutline16
+import dev.deeplinks.native.AgentPresetOutline16
+import androidx.compose.foundation.layout.defaultMinSize
+import androidx.compose.ui.draw.shadow
+
+/**
+ * Workspace 主界面抽出的独立 chrome（COM-001 拆解）。
+ * 与 WorkspaceScreen 同包，通过 internal 复用；不持有业务状态。
+ */
+
+@Composable
+private fun QuietStatusLine(
+    text: String,
+    alert: Boolean,
+    contentDescription: String,
+    actions: @Composable () -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = COMPOSER_SIDE_CLEARANCE, vertical = DshSpace.s4)
+            .semantics { this.contentDescription = contentDescription },
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text,
+            color = if (alert) Dsh.error else Dsh.labelSecondary,
+            style = DshType.captionRelaxed,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f),
+        )
+        actions()
+    }
+}
+
+@Composable
+private fun QuietStatusAction(label: String, onClick: () -> Unit) {
+    Box(
+        modifier = Modifier
+            .heightIn(min = 48.dp)
+            .clickable(role = Role.Button, onClick = onClick)
+            .padding(horizontal = DshSpace.s8)
+            .semantics {
+                role = Role.Button
+                this.contentDescription = label
+            },
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(
+            label,
+            color = Dsh.labelPrimary,
+            style = DshType.captionRelaxed,
+            fontWeight = FontWeight.Medium,
+        )
+    }
+}
+
+@Composable
+internal fun ChatHistoryError(
+    message: String?,
+    onRetry: () -> Unit,
+    title: String = DshS.loadConversationFailed,
+    hint: String? = null,
+    compact: Boolean = true,
+) {
+    // 兜底文案常与标题相同（「加载失败 / 加载失败」），这种不算细节
+    val detail = message?.takeUnless { it.isBlank() || it == title }
+    // 错误态：错误图标 + 简短错误 + 重试，不挂欢迎插画（docs/visual-rules.md 第五节）
+    DshErrorState(
+        title = title,
+        // 有提示语时它是主说明，原始错误（常是 timeout 这类技术文本）降为脚注
+        message = hint ?: detail,
+        footnote = detail.takeIf { hint != null },
+        actionLabel = DshS.retry,
+        onAction = onRetry,
+        compact = compact,
+    )
+}
+
+/** 工具搜索失败：一行字加文字重试，不另做色块按钮。 */
+@Composable
+internal fun SearchStatusBanner(message: String, onRetry: () -> Unit) {
+    QuietStatusLine(text = message, alert = false, contentDescription = message) {
+        QuietStatusAction(L.retry, onRetry)
+    }
+}
+
+@Composable
+internal fun ContextMeterButton(
+    stats: MobileSessionStats,
+    running: Boolean = false,
+    showPercent: Boolean = true,
+    onOpenUsage: (() -> Unit)? = null,
+) {
+    var statsOpen by remember { mutableStateOf(false) }
+    val used = stats.contextPressureTokens
+    val window = stats.contextWindow
+    if (window <= 0) return
+    val percent = ((used * 100) / window).toFloat().coerceIn(0f, 100f)
+
+    // 环形按钮（DSH：28px trigger，14px viewBox 圆环，2px stroke，后面跟百分比）。
+    // E8：百分比此前没有任何说明，TalkBack 只读到「上下文已用」不知道数值；现在
+    // contentDescription 直接把数值带上（「上下文已用 46%」），点按打开「会话用量」
+    // 面板（面板里的「上下文占用」与此环同一口径：contextPressureTokens/contextWindow，
+    // 两处都改成同一份样例数据后截图不会再出现 46% vs 19% 的矛盾）。
+    val interaction = remember { MutableInteractionSource() }
+    val borderL3Color = Dsh.borderStrong
+    val fillColor = if (running) Dsh.labelTertiary.copy(alpha = 0.55f) else Dsh.labelTertiary
+    Row(
+        modifier = Modifier
+            .height(48.dp)
+            .clip(RoundedCornerShape(DshRadius.control))
+            .semantics {
+                role = Role.Button
+                contentDescription = L.contextUsedPercent.format(percent.toInt())
+            }
+            .clickable(interactionSource = interaction, indication = dshRipple()) {
+                if (onOpenUsage != null) onOpenUsage() else statsOpen = true
+            }
+            .padding(horizontal = DshSpace.s8),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(DshSpace.s4),
+    ) {
+        Canvas(modifier = Modifier.size(14.dp)) {
+            val stroke = 2.dp.toPx()
+            val arcSize = androidx.compose.ui.geometry.Size(size.width - stroke, size.height - stroke)
+            drawArc(
+                color = borderL3Color,
+                startAngle = 0f,
+                sweepAngle = 360f,
+                useCenter = false,
+                style = Stroke(width = stroke),
+                topLeft = androidx.compose.ui.geometry.Offset(stroke / 2, stroke / 2),
+                size = arcSize
+            )
+            if (used > 0) {
+                drawArc(
+                    color = fillColor,
+                    startAngle = -90f,
+                    sweepAngle = 360f * percent / 100f,
+                    useCenter = false,
+                    style = Stroke(width = stroke, cap = androidx.compose.ui.graphics.StrokeCap.Round),
+                    topLeft = androidx.compose.ui.geometry.Offset(stroke / 2, stroke / 2),
+                    size = arcSize
+                )
+            }
+        }
+        if (showPercent) {
+            Text(
+                text = "${percent.toInt()}%",
+                color = Dsh.labelTertiary,
+                style = DshType.caption,
+                lineHeight = 20.sp,
+                maxLines = 1,
+            )
+        }
+    }
+
+    if (onOpenUsage == null && statsOpen) {
+        UsageSheet(stats = stats, onDismiss = { statsOpen = false })
+    }
+}
+
+@Composable
+internal fun ContextMeterRow(label: String, value: String, swatchColor: Color) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Box(
+            modifier = Modifier
+                .size(8.dp)
+                .clip(RoundedCornerShape(DshRadius.control))
+                .background(swatchColor)
+        )
+        Spacer(Modifier.width(DshSpace.s8))
+        Text(label, color = Dsh.labelSecondary, style = DshType.captionRelaxed, modifier = Modifier.weight(1f))
+        Text(value, color = Dsh.labelPrimary, style = DshType.captionRelaxed.tabularNums(),)
+    }
+}
+
+/** 命令图标：按 trigger 映射到自有图标集（模型层保持纯数据，便于 JVM 单测）。 */
+private fun paletteIcon(command: PaletteCommand): ImageVector = when (command.trigger) {
+    "/plan" -> ListPenOutline16
+    "/goal" -> GoalOutline16
+    "/subagent" -> BranchOutline16
+    "/skills" -> SkillOutline16
+    "/pause" -> PauseOutline16
+    "/resume" -> PlayOutline16
+    "/clear" -> EraserOutline16
+    "/feedback" -> FeedbackOutline16
+    "/new-session" -> NewChatOutline16
+    "/search" -> SearchOutline16
+    "/model" -> SparkleOutline16
+    "/permission" -> ShieldOutline16
+    "/chat" -> MessageOutline16
+    "/trace" -> ChecklistOutline16
+    "/settings" -> SettingsOutline16
+    else -> CodeOutline16
+}
+
+/**
+ * 斜杠命令面板：从输入框上方浮起的卡片，最多约半屏，对话仍然看得见。
+ * 每行「图标块 · 中文名 + 灰色 trigger · 一句说明」；没输入时按分组展示，
+ * 输入后只留匹配项并高亮第一条（它就是点「发送」时最可能想要的那条）。
+ */
+@Composable
+internal fun CommandSuggestions(
+    query: String,
+    onPick: (PaletteCommand) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val filtering = query.length > 1
+    // 过滤时不再分组：拍平后「trigger 以输入开头」的排前面（/c → 清除上下文、对话视图，再到 /feedback）
+    val grouped = remember(query) {
+        val raw = filterPalette(DSH_PALETTE, query)
+        if (!filtering) raw else {
+            val needle = query.removePrefix("/").lowercase()
+            val flat = raw.flatMap { it.second }.sortedByDescending { it.command.trigger.removePrefix("/").lowercase().startsWith(needle) }
+            if (flat.isEmpty()) emptyList() else listOf(flat.first().group to flat)
+        }
+    }
+    if (grouped.isEmpty()) return
+    val first = grouped.first().second.first().command
+    Box(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(horizontal = COMPOSER_SIDE_CLEARANCE, vertical = DshSpace.s8),
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .heightIn(max = 340.dp)
+                .clip(RoundedCornerShape(DshRadius.block))
+                .background(DlOverlayColor)
+                .border(1.dp, Dsh.outline, RoundedCornerShape(DshRadius.block))
+                .verticalScroll(rememberScrollState())
+                .padding(vertical = DshSpace.s8),
+        ) {
+            grouped.forEach { (group, entries) ->
+                if (!filtering) {
+                    Text(
+                        group.displayName,
+                        color = Dsh.labelSecondary,
+                        style = DlLabelStrong,
+                        modifier = Modifier.padding(start = DshSpace.s16, top = DshSpace.s8, bottom = DshSpace.s4),
+                    )
+                }
+                entries.forEach { entry ->
+                    PaletteRow(
+                        command = entry.command,
+                        highlighted = filtering && entry.command == first,
+                        onClick = { onPick(entry.command) },
+                    )
+                }
+            }
+        }
+    }
+}
+
+/** 5.1 指令行：图标 + 「/trigger 名称」+ 一行说明；过滤时第一条用品牌浅底高亮（回车即选）。 */
+@Composable
+private fun PaletteRow(command: PaletteCommand, highlighted: Boolean, onClick: () -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(min = DlSize.rowSingle)
+            .background(if (highlighted) Dsh.primarySoft else Color.Transparent)
+            .clickable(role = Role.Button, onClick = onClick)
+            .padding(horizontal = DshSpace.s16, vertical = DshSpace.s8),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(DshSpace.s12),
+    ) {
+        Icon(
+            paletteIcon(command),
+            contentDescription = null,
+            tint = if (highlighted) Dsh.brand400 else Dsh.labelSecondary,
+            modifier = Modifier.size(DshIconSize.md),
+        )
+        Column(Modifier.weight(1f)) {
+            Row(verticalAlignment = Alignment.Bottom, horizontalArrangement = Arrangement.spacedBy(DshSpace.s8)) {
+                Text(command.trigger, color = Dsh.labelPrimary, style = DshType.bodyStrong, maxLines = 1)
+                if (command.title != command.trigger) {
+                    Text(
+                        command.title,
+                        color = Dsh.labelPrimary,
+                        style = DshType.body,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
+            Text(
+                command.description,
+                color = Dsh.labelSecondary,
+                style = DshType.supporting,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+    }
+}
+
+/** 导出会话为纯文本（分享用；无独立 log 下载 API 时的替代方案）。 */
+internal fun loadSessionMessagesForExport(client: MobileApiClient, sessionId: String): List<MobileMessage> {
+    val pages = mutableListOf<MobileMessage>()
+    var before: Long? = null
+    repeat(20) {
+        val page = client.getSessionHistory(sessionId, beforeSeq = before, maxMessages = 80)
+        pages.addAll(0, page.messages)
+        before = page.nextBeforeSeq
+        if (!page.hasMore || before == null) return@repeat
+    }
+    return pages
+}
+
+internal fun exportSessionTranscript(client: MobileApiClient, sessionId: String, title: String): String {
+    val body = loadSessionMessagesForExport(client, sessionId).mapNotNull { msg ->
+        val role = when (msg.role) {
+            "user" -> L.userRole
+            "assistant" -> L.assistantRole
+            "reasoning" -> L.reasoningRole
+            "tool_call" -> "${L.tools}:${msg.toolName ?: "?"}"
+            "tool_result" -> L.resultRole
+            else -> msg.role
+        }
+        val text = msg.text.ifBlank { msg.toolArgs.orEmpty() }.trim()
+        if (text.isBlank()) null else "## $role\n$text"
+    }.joinToString("\n\n")
+    return "# $title\n\n$body"
+}
+
+/** 聚合 header：轻量行（对齐思考条），默认收起；展开后左侧细轨 + 明细。 */
+@Composable
+internal fun ToolGroupHeader(
+    group: MessageGroup.ToolGroup,
+    sweepingId: String?,
+    showActions: Boolean = false,
+) {
+    var expanded by remember(group.groupKey) { mutableStateOf(false) }
+    val interaction = remember { MutableInteractionSource() }
+    val first = group.items.first()
+    val last = group.items.last()
+    val totalDuration = if (first.time > 0 && last.time >= first.time) last.time - first.time else null
+    val groupRunning = sweepingId != null && group.items.any { it.id == sweepingId }
+    val rail = Dsh.borderStrong
+    val summaryTitle = dev.deeplinks.native.util.toolGroupRowLabel(
+        items = group.items,
+        running = groupRunning,
+    )
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Row(
+            modifier = Modifier
+                .heightIn(min = DshTouch.min)
+                // C2：去掉灰底胶囊，只留一行小字；热区仍 48dp，按压显示极淡中性色
+                .clickable(interactionSource = interaction, indication = dshRipple()) { expanded = !expanded }
+                .semantics {
+                    role = Role.Button
+                    contentDescription = summaryTitle.ifBlank { L.executing }
+                    stateDescription = if (expanded) L.collapse else L.expand
+                }
+                .padding(horizontal = DshSpace.s8),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            if (groupRunning) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(DshIconSize.xs),
+                    color = Dsh.brand400,
+                    trackColor = Dsh.primarySoft,
+                    strokeWidth = 1.5.dp,
+                )
+                Spacer(Modifier.width(DshSpace.s8))
+            } else {
+                // 已结束用「带勾文档」（阶段 1 补的图标），与首页「最近」分组的完成态同一符号；
+                // 原先的 CodeOutline16 只表示「这是代码」，不带状态语义
+                Icon(
+                    DocumentCheckOutline16,
+                    contentDescription = null,
+                    tint = Dsh.labelSecondary,
+                    modifier = Modifier.size(DshIconSize.xs),
+                )
+                Spacer(Modifier.width(DshSpace.s8))
+            }
+            Text(
+                summaryTitle,
+                color = Dsh.labelSecondary,
+                style = DshType.supporting,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f, fill = false),
+            )
+            Spacer(Modifier.width(DshSpace.s8))
+            if (groupRunning) {
+                ShimmerLabel(text = L.executing.trimEnd('…', '.'), working = true)
+                Spacer(Modifier.width(DshSpace.s8))
+            } else if (totalDuration != null) {
+                Text(
+                    formatTraceDuration(totalDuration),
+                    color = Dsh.labelTertiary,
+                    style = DshType.caption.tabularNums(),
+                )
+                Spacer(Modifier.width(DshSpace.s8))
+            }
+            Icon(
+                if (expanded) ChevronUpOutline16 else ChevronDownOutline16,
+                // 展开状态已在行的 stateDescription 里播报，图标不再重复报一遍
+                contentDescription = null,
+                tint = Dsh.labelTertiary,
+                modifier = Modifier.size(DshIconSize.xs),
+            )
+        }
+        AnimatedVisibility(
+            visible = expanded,
+            enter = expandVertically(animationSpec = tween(motionDuration(200), easing = FastOutSlowInEasing)) + fadeIn(animationSpec = tween(motionDuration(150))),
+            exit = shrinkVertically(animationSpec = tween(motionDuration(180), easing = FastOutSlowInEasing)) + fadeOut(animationSpec = tween(motionDuration(150))),
+        ) {
+            Box(
+                modifier = Modifier
+                    .padding(start = DshSpace.s8, top = DshSpace.s4)
+                    .drawBehind {
+                        val x = 0.5.dp.toPx()
+                        drawLine(rail, Offset(x, 0f), Offset(x, size.height), 1.dp.toPx())
+                    }
+                    .padding(start = DshSpace.s16, top = DshSpace.s4, bottom = DshSpace.s4),
+            ) {
+                Column(verticalArrangement = Arrangement.spacedBy(DshSpace.s8)) {
+                    group.items.forEach { item ->
+                        MessageItem(
+                            msg = item,
+                            running = sweepingId != null && item.id == sweepingId,
+                            onCopy = {},
+                            onQuote = {},
+                            onFork = {},
+                            showActions = false,
+                            isTurnEnd = showActions,
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * 会话顶栏（v4 4.1）：返回 + 标题 + 副标题（工作区 · 状态 · 第 N 步）+ diff 角标 + ⋯。
+ * ⋯ 打开 [SessionMenuSheet]（4.9）；菜单为空（草稿态）时不显示 ⋯。
+ */
+@Composable
+internal fun WorkspaceTopBar(
+    title: String,
+    subtitle: String? = null,
+    onNavigate: () -> Unit,
+    menuExpanded: Boolean,
+    onMenuExpandedChange: (Boolean) -> Unit,
+    menu: SessionMenu,
+    diff: DlDiffStat? = null,
+) {
+    DlTopBar(
+        title = title,
+        subtitle = subtitle?.takeIf { it.isNotBlank() },
+        nav = DlTopBarNav.Back,
+        onNav = onNavigate,
+        diff = diff,
+        actions = if (menu.isEmpty) emptyList() else listOf(DlTopBarAction(EllipsisOutline16, L.moreActions, { onMenuExpandedChange(true) })),
+    )
+    if (menuExpanded && !menu.isEmpty) SessionMenuSheet(menu) { onMenuExpandedChange(false) }
+}
+
+/**
+ * 空会话画布（从 WorkspaceScreen 的 LazyColumn 抽出，COM-001 拆解）：
+ * 加载 / 运行 / 失败 / 空态四选一，属于 LazyListScope 所以做成扩展。
+ */
+internal fun LazyListScope.chatEmptyCanvas(
+    kind: ChatCanvasKind,
+    elapsedSec: Long,
+    historyLoadError: String?,
+    onRetry: () -> Unit,
+) {
+    when (kind) {
+        ChatCanvasKind.Loading -> item(key = "chat-loading-skeleton") {
+            ChatLoadingSkeleton()
+        }
+        ChatCanvasKind.Working -> item(key = "turn-status") {
+            ThinkingStatusRow(elapsedSec)
+        }
+        ChatCanvasKind.Error -> item(key = "chat-load-error") {
+            // 与空态 hero 同一骨架：整屏居中，而不是贴在顶部
+            Box(
+                modifier = Modifier
+                    .fillParentMaxSize()
+                    .padding(horizontal = DshSpace.s8),
+                contentAlignment = Alignment.Center,
+            ) {
+                ChatHistoryError(
+                    message = historyLoadError,
+                    hint = DshS.loadConversationFailedHint,
+                    onRetry = onRetry,
+                    compact = false,
+                )
+            }
+        }
+        // 空会话只留白：起点是输入框占位句，不放标语和品牌标志
+        ChatCanvasKind.Empty, ChatCanvasKind.Content -> item(key = "empty-hero") {
+            Box(Modifier.fillParentMaxSize())
+        }
+    }
+}
+
+/**
+ * 悬浮「回到底部」：40dp 圆形 + 阴影，盖在消息流右下角，不占布局高度。
+ * 位置与原生聊天 App 一致（右下角），出现/消失不会让消息流串位；
+ * 用户停在历史时新到达的消息条数挂在右上角。
+ */
+@Composable
+internal fun ScrollToBottomButton(unread: Int, onClick: () -> Unit) {
+    val interaction = remember { MutableInteractionSource() }
+    Box(
+        modifier = Modifier
+            .size(48.dp)
+            .clickable(interactionSource = interaction, indication = dshRipple(), onClick = onClick)
+            .semantics {
+                role = Role.Button
+                contentDescription = L.scrollToBottom
+            },
+        contentAlignment = Alignment.Center,
+    ) {
+        Box(
+            modifier = Modifier
+                .size(40.dp)
+                .shadow(6.dp, CircleShape)
+                .clip(CircleShape)
+                .background(Dsh.bgCard),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(
+                ChevronDownOutline16,
+                contentDescription = null,
+                tint = Dsh.labelPrimary,
+                modifier = Modifier.size(DshIconSize.md),
+            )
+        }
+        if (unread > 0) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .defaultMinSize(minWidth = 18.dp)
+                    .clip(CircleShape)
+                    .background(Dsh.labelPrimary)
+                    .padding(horizontal = DshSpace.s4, vertical = DshSpace.s4),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    if (unread > 99) "99+" else unread.toString(),
+                    color = Dsh.bgBase,
+                    style = DshType.microRelaxed,
+                    fontWeight = FontWeight.Medium,
+                )
+            }
+        }
+    }
+}
+
+/** 会话累计用量的一行摘要「7 轮 · 223 步 · 23.5M 令牌」；没有可显示的数时返回 null。 */
+@Composable
+internal fun sessionStatsSummary(stats: MobileSessionStats?): String? {
+    val s = stats ?: return null
+    val strings = DshS
+    val totalTokens = s.uncachedInputTokens + s.cacheReadTokens + s.outputTokens
+    return buildList {
+        if (s.turns > 0 || s.steps > 0) add(strings.statsTurnsSteps.format(s.turns, s.steps))
+        if (totalTokens > 0) add("${compactTokens(totalTokens)} ${strings.tokenUnitShort}")
+    }.joinToString(" · ").ifEmpty { null }
+}
+
+/**
+ * 输入卡上方的上下文条：离线提示 + 最近改动入口。
+ *
+ * - 离线时显示「电脑离线」；
+ * - 有改动时显示改动数量标签。
+ * - 原先的会话用量统计、工作区名、浏览文件入口均已移除。
+ */
+@Composable
+internal fun ComposerContextStrip(
+    online: Boolean,
+    changes: WorkspaceChangesSummary?,
+    onOpenChanges: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val showOffline = !online
+    val showChanges = changes != null && changes.total > 0
+    if (!showOffline && !showChanges) return
+
+    Row(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(horizontal = DshSpace.s16, vertical = DshSpace.s4),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        if (showOffline) {
+            HostStatusDot(false)
+            Spacer(Modifier.width(DshSpace.s8))
+            Text(
+                text = L.hostOffline,
+                color = Dsh.labelSecondary,
+                style = DshType.label,
+                maxLines = 1,
+            )
+        }
+        Spacer(Modifier.weight(1f))
+        if (showChanges) {
+            DshTag(
+                text = ChangesL.viewChanges.format(changes.total),
+                modifier = Modifier.clickable(role = Role.Button, onClick = onOpenChanges),
+            )
+        }
+    }
+}

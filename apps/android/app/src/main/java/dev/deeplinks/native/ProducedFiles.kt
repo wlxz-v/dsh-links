@@ -1,0 +1,268 @@
+package dev.deeplinks.native
+
+import dev.deeplinks.native.DshIconSize
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.getValue
+import dev.deeplinks.core.DshType
+
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.Icon
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
+import dev.deeplinks.core.dshRipple
+import dev.deeplinks.core.Dsh
+import dev.deeplinks.core.L
+import dev.deeplinks.native.util.ProducedFileKind
+import dev.deeplinks.native.util.decodeProducedText
+import dev.deeplinks.native.util.isProducedTextMime
+import dev.deeplinks.native.util.producedFileKind
+import dev.deeplinks.native.util.producedFileName
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+
+private const val PREVIEW_MAX_EDGE = 2048
+
+internal fun decodeSampledBitmap(bytes: ByteArray, maxEdge: Int = PREVIEW_MAX_EDGE): Bitmap? {
+    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+    BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+    val width = bounds.outWidth
+    val height = bounds.outHeight
+    if (width <= 0 || height <= 0) return null
+    var sample = 1
+    while (width / sample > maxEdge || height / sample > maxEdge) sample *= 2
+    val opts = BitmapFactory.Options().apply { inSampleSize = sample }
+    return BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts)
+}
+
+internal sealed interface ProducedPreview {
+    data class Image(val bitmap: Bitmap) : ProducedPreview
+    data class Text(val path: String, val body: String) : ProducedPreview
+}
+
+/**
+ * 本轮产出：对标 DSH 0.1.5 侧栏打开文件。
+ * 图片/文本点击预览，失败可重试；其它文件点按或长按复制路径。
+ */
+@OptIn(ExperimentalLayoutApi::class, ExperimentalFoundationApi::class)
+@Composable
+internal fun ProducedFilesRow(
+    files: List<String>,
+    onFetchFile: ((String) -> Pair<String, ByteArray>)? = null,
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var preview by remember { mutableStateOf<ProducedPreview?>(null) }
+    var loadingPath by remember { mutableStateOf<String?>(null) }
+    var errorPath by remember { mutableStateOf<String?>(null) }
+    var copiedPath by remember { mutableStateOf<String?>(null) }
+
+    LaunchedEffect(copiedPath) {
+        if (copiedPath == null) return@LaunchedEffect
+        delay(1_400)
+        copiedPath = null
+    }
+
+    fun copyPath(path: String) {
+        val clipboard = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE)
+            as android.content.ClipboardManager
+        clipboard.setPrimaryClip(android.content.ClipData.newPlainText("workspace path", path))
+        copiedPath = path
+        errorPath = null
+    }
+
+    fun openPath(path: String) {
+        val fetch = onFetchFile
+        val kind = producedFileKind(path)
+        if (fetch == null || kind == ProducedFileKind.OTHER) {
+            copyPath(path)
+            return
+        }
+        loadingPath = path
+        errorPath = null
+        scope.launch(Dispatchers.IO) {
+            val result = runCatching { fetch(path) }
+            withContext(Dispatchers.Main) {
+                loadingPath = null
+                result.fold(
+                    onSuccess = { (mime, bytes) ->
+                        when {
+                            kind == ProducedFileKind.IMAGE || mime.startsWith("image/") -> {
+                                val bmp = decodeSampledBitmap(bytes)
+                                if (bmp != null) preview = ProducedPreview.Image(bmp)
+                                else errorPath = path
+                            }
+                            kind == ProducedFileKind.TEXT || isProducedTextMime(mime) -> {
+                                preview = ProducedPreview.Text(path, decodeProducedText(bytes))
+                            }
+                            else -> copyPath(path)
+                        }
+                    },
+                    onFailure = { errorPath = path },
+                )
+            }
+        }
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(DshRadius.container))
+            .background(Dsh.bgInput)
+            .padding(horizontal = DshSpace.s12, vertical = DshSpace.s12),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(
+                FileOutline16,
+                contentDescription = null,
+                tint = Dsh.labelTertiary,
+                modifier = Modifier.size(DshIconSize.sm),
+            )
+            Spacer(Modifier.width(DshSpace.s12))
+            Text(
+                L.producedFiles,
+                color = Dsh.labelPrimary,
+                style = DshType.title,
+                fontWeight = FontWeight(500),
+                lineHeight = 24.sp,
+            )
+        }
+        if (files.isEmpty()) return@Column
+        Spacer(Modifier.height(DshSpace.s8))
+        FlowRow(
+            horizontalArrangement = Arrangement.spacedBy(DshSpace.s8),
+            verticalArrangement = Arrangement.spacedBy(DshSpace.s8),
+        ) {
+            files.forEach { path ->
+                val name = producedFileName(path)
+                val loading = loadingPath == path
+                val failed = errorPath == path
+                val copied = copiedPath == path
+                val label = when {
+                    loading -> L.loadingFile
+                    failed -> L.retry
+                    copied -> L.copied
+                    else -> name
+                }
+                Box(
+                    modifier = Modifier
+                        .heightIn(min = 48.dp)
+                        .clip(RoundedCornerShape(DshRadius.full))
+                        .background(Dsh.bgTrack)
+                        .semantics {
+                            role = Role.Button
+                            contentDescription = when {
+                                failed -> L.openFileFailed
+                                else -> "${L.producedFiles}: $name"
+                            }
+                        }
+                        .combinedClickable(
+                            onClick = { if (!loading) openPath(path) },
+                            onLongClick = { copyPath(path) },
+                        )
+                        .padding(horizontal = DshSpace.s12, vertical = DshSpace.s8),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        if (loading) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(14.dp),
+                                strokeWidth = 1.5.dp,
+                                color = Dsh.labelSecondary,
+                            )
+                            Spacer(Modifier.width(DshSpace.s8))
+                        }
+                        Text(
+                            label,
+                            color = if (failed) Dsh.error else Dsh.labelPrimary,
+                            style = DshType.body,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    preview?.let { current -> ProducedPreviewDialog(current, onDismiss = { preview = null }) }
+}
+
+/** 图片 / 文本预览对话框（本轮产出与工作区文件浏览共用）。 */
+@Composable
+internal fun ProducedPreviewDialog(
+    current: ProducedPreview,
+    onDismiss: () -> Unit,
+    onQuote: ((String) -> Unit)? = null,
+) {
+    when (current) {
+        is ProducedPreview.Image -> Dialog(onDismissRequest = { onDismiss() }) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .navigationBarsPadding()
+                    .semantics {
+                        role = Role.Button
+                        contentDescription = L.close
+                    }
+                    .clickable(
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = dshRipple(),
+                    ) { onDismiss() }
+                    .padding(DshSpace.s16),
+                contentAlignment = Alignment.Center,
+            ) {
+                Image(
+                    bitmap = current.bitmap.asImageBitmap(),
+                    contentDescription = L.producedFiles,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(DshRadius.container)),
+                )
+            }
+        }
+        is ProducedPreview.Text -> FilePreviewDialog(current.path, current.body, onDismiss, onQuote)
+    }
+}

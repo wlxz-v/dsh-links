@@ -1,0 +1,22 @@
+<resources>
+    <!-- ================================================
+         与 Compose DarkDshColors 对齐（2026-09-30 第四轮）。
+         没人引用的旧色名已删除。见 docs/visual-rules.md。
+         ================================================ -->
+    <color name="dsh_bg_base">#121214</color>
+    <color name="dsh_bg_card">#1C1D21</color>
+    <color name="dsh_bg_secondary">#2A2B30</color>
+
+    <color name="dsh_label_primary">#EDEDEF</color>
+    <color name="dsh_label_secondary">#A3A7AE</color>
+    <color name="dsh_label_muted">#8B8F96</color>
+
+    <color name="dsh_brand">#8B9DFF</color>
+    <color name="dsh_on_brand">#121214</color>
+
+    <color name="dsh_avatar_bg">#2A2B30</color>
+    <color name="dsh_avatar_text">#EDEDEF</color>
+
+    <!-- Splash: 与深色画布一致 -->
+    <color name="splash_field">#121214</color>
+</resources>

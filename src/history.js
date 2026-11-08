@@ -1,0 +1,340 @@
+import { classifyUserMessage } from "./context-injection.js"
+import { mutationPath, toolResultContent, toolResultIsError, toolResultMeta, uniquePaths } from "./produced-files.js"
+import { MAX_EMBEDDED_CHANGED_FILES, projectChangesSummary } from "./workspace-changes.js"
+
+/** session.history 单页消息数上限（客户端 maxMessages 不得突破）。 */
+export const MAX_HISTORY_MESSAGES = 200
+
+function approvalOutcomeOf(event) {
+  return event?.data?.outcome ?? event?.data?.decision ?? event?.data?.result ?? null
+}
+
+export function approvalUiStatus(outcome) {
+  if (!outcome) return "pending"
+  if (outcome === "allowed-once" || outcome === "rejected") return "resolved"
+  if (outcome === "cancelled") return "cancelled"
+  if (outcome === "unavailable") return "expired"
+  return "unknown"
+}
+
+export function clampHistoryMaxMessages(raw) {
+  const n = Number(raw)
+  if (!Number.isInteger(n) || n <= 0) return undefined
+  return Math.min(n, MAX_HISTORY_MESSAGES)
+}
+
+/**
+ * 历史页投影（纯函数，WI-001）
+ *
+ * 把一页 session.history 的原始事件投影为移动端消息列表。规则：
+ *
+ * - 每条消息带稳定 id 与数值 seq：id 以事件 seq 为键（msg-<seq> / reason-<seq> /
+ *   tool-<seq> / …），跨页重复由客户端按 id 去重（保留更旧页位置）。
+ * - reasoning 只合并到覆盖其 seq 范围的页面：来自会话文件的补全块按 block-end
+ *   事件 seq 归属窗口 [页首 seq, 页尾 seq]，并按 seq 插到紧随其后的消息之前；
+ *   投影已自带文本的 reasoning（子会话未剥除）不再从文件重复合并。
+ * - assistant/message 的文本块通过 sourceEventSeqs 定位同页 text block-end，
+ *   共享同一 id，避免同页重复；block-end 不在本页时（分页边界）仍以 block-end
+ *   seq 为 id，客户端按 id 去重。
+ * - workspace/changes 只带轮号：changesSummary(seq) 从 Host 取该宣告的摘要，内嵌为
+ *   role "workspace_changes"。同轮后一条宣告取代前一条（含取代为空列表）；Host 已取不到
+ *   摘要时不出卡片。跨页的同轮取代由客户端按 turn 保留最大 seq。
+ */
+export function projectHistoryPage({ events, reasoningBySeq = new Map(), hasMore = false, changesSummary = null }) {
+  const messages = []
+  // 页窗口：本页最早/最晚事件的 seq（reasoning 归属边界）
+  const firstEvent = events[0]?.event ?? null
+  const lastEvent = events[events.length - 1]?.event ?? null
+  const pageFirstSeq = firstEvent?.seq
+  const pageLastSeq = lastEvent?.seq
+
+  // 原始事件按 seq 索引（assistant/message 的 sourceEventSeqs 定位用）
+  const eventBySeq = new Map()
+  for (const item of events) {
+    const e = item?.event
+    if (e && typeof e.seq === "number") eventBySeq.set(e.seq, e)
+  }
+
+  let pendingReasoning = null // { seq, time, text }
+  const flushReasoning = (time) => {
+    if (pendingReasoning) {
+      const text = (pendingReasoning.text ?? "").trim()
+      if (text) {
+        push({
+          id: `reason-${pendingReasoning.seq}`,
+          seq: pendingReasoning.seq,
+          role: "reasoning",
+          text,
+          time: pendingReasoning.time || time,
+          type: "reasoning",
+          ...(pendingReasoning.running ? { running: true } : {}),
+        })
+      }
+      pendingReasoning = null
+    }
+  }
+  const emittedIds = new Set()
+  const push = (m) => {
+    // 每条消息都带 kind：用户消息由 classifyUserMessage 给出，其余与 role 相同
+    if (!m.kind) m.kind = m.role
+    if (!emittedIds.has(m.id)) {
+      emittedIds.add(m.id)
+      messages.push(m)
+    }
+  }
+
+  // tool/result 耗时：同 callId 的 tool/call 到 result 时差
+  const toolCalls = new Map()
+  const mutationCalls = new Map()
+  const producedByTurn = new Map()
+  let lastTurnEndReason = null
+  const decidedById = new Map()
+  const askedIds = new Set()
+  for (const item of events) {
+    const ev = item?.event
+    if (ev?.type === "approval/decided" && ev.data?.id) decidedById.set(ev.data.id, ev)
+    if (ev?.type === "approval/asked" && ev.data?.id) askedIds.add(ev.data.id)
+  }
+
+  for (const item of events) {
+    const e = item?.event
+    if (!e || typeof e.seq !== "number") continue
+    if (e.type === "user/message") {
+      flushReasoning(e.time)
+      const text = (e.data?.content ?? []).map((c) => c.text || "").join("")
+      // 三种来源分清楚：上下文注入 / 模型切换提示 / 用户本人
+      const cls = classifyUserMessage(text)
+      // role 保持旧值给老 App；新 App 只看 kind
+      const role =
+        cls.kind === "goal_round" || cls.kind === "injection"
+          ? "context_injection"
+          : cls.kind === "model_changed"
+            ? "system_notice"
+            : "user"
+      push({ id: `msg-${e.seq}`, seq: e.seq, role, text, time: e.time, type: "text", ...cls })
+    } else if (e.type === "assistant/chunk" || e.type === "assistant/message") {
+      const chunk = e.data?.chunk
+      if (chunk?.type === "reasoning-delta") {
+        const piece = String(chunk.text ?? "")
+        if (piece) {
+          if (pendingReasoning) pendingReasoning.text += piece
+          else pendingReasoning = { seq: e.seq, time: e.time, text: piece }
+          pendingReasoning.running = true
+        }
+      }
+      if (chunk?.type === "block-end" && chunk.block?.text) {
+        if (chunk.block.type === "reasoning") {
+          // 连续 reasoning block-end 追加文本，保留首块 seq/time（与文件侧分组一致）
+          const piece = chunk.block.text || reasoningBySeq.get(e.seq)?.text || ""
+          if (pendingReasoning) {
+            const current = pendingReasoning.text || ""
+            if (piece) {
+              if (!current) pendingReasoning.text = piece
+              else if (piece === current || piece.startsWith(current) || current.startsWith(piece)) {
+                // delta 累积与 block-end 定稿是同一段：取更长全文，seq 对齐文件，避免双「已思考」
+                if (piece.length > current.length) pendingReasoning.text = piece
+                pendingReasoning.seq = e.seq
+              } else {
+                pendingReasoning.text = current + "\n" + piece
+              }
+            }
+            pendingReasoning.running = false
+          } else {
+            pendingReasoning = { seq: e.seq, time: e.time, text: piece, running: false }
+          }
+        } else {
+          flushReasoning(e.time)
+          if (chunk.block.type === "text") {
+            push({ id: `msg-${e.seq}`, seq: e.seq, role: "assistant", text: chunk.block.text, time: e.time, type: "text" })
+          }
+        }
+      }
+      const message = e.data?.message
+      if (message) {
+        flushReasoning(e.time)
+        // 本消息内 text block-end 的 seq（sourceEventSeqs 定位；跨页时以该 seq 为 id，客户端去重）
+        const textBlockEndSeqs = []
+        for (const s of e.sourceEventSeqs ?? []) {
+          const se = eventBySeq.get(s)
+          const c = se?.data?.chunk
+          if (c?.type === "block-end" && c.block?.type === "text") textBlockEndSeqs.push(s)
+        }
+        let ti = 0
+        for (const block of message.content ?? []) {
+          const blockText = String(block?.text ?? "").trim()
+          if (block?.type !== "text" || !blockText) continue
+          const blockEndSeq = textBlockEndSeqs[ti]
+          ti++
+          // 与同页 text block-end 共享 id；block-end 已产出时跳过（不重复渲染）
+          const id = blockEndSeq !== undefined ? `msg-${blockEndSeq}` : `msg-${e.seq}-${ti}`
+          push({ id, seq: blockEndSeq ?? e.seq, role: "assistant", text: blockText, time: e.time, type: "text" })
+        }
+      }
+    } else if (e.type === "approval/asked") {
+      flushReasoning(e.time)
+      const approvalId = e.data?.id ?? ""
+      const decided = approvalId ? decidedById.get(approvalId) : null
+      const outcome = decided ? approvalOutcomeOf(decided) : null
+      push({
+        id: `approval-${approvalId || e.seq}`,
+        seq: e.seq,
+        role: "approval",
+        text: e.data?.reason || `请求授权执行 ${e.data?.toolName || "工具"}`,
+        toolName: e.data?.toolName || "tool",
+        approvalId,
+        callId: e.data?.callId ?? "",
+        requestStatus: decided ? approvalUiStatus(outcome) : "pending",
+        outcome,
+        time: e.time,
+        type: "approval",
+      })
+    } else if (e.type === "approval/decided") {
+      flushReasoning(e.time)
+      const approvalId = e.data?.id ?? ""
+      if (approvalId && askedIds.has(approvalId)) continue
+      const outcome = approvalOutcomeOf(e)
+      push({
+        id: `approval-${approvalId || e.seq}`,
+        seq: e.seq,
+        role: "approval",
+        text: e.data?.reason || `请求授权执行 ${e.data?.toolName || "工具"}`,
+        toolName: e.data?.toolName || "tool",
+        approvalId,
+        callId: e.data?.callId ?? "",
+        requestStatus: approvalUiStatus(outcome),
+        outcome,
+        time: e.time,
+        type: "approval",
+      })
+    } else if (e.type === "tool/call") {
+      flushReasoning(e.time)
+      toolCalls.set(e.data?.callId, { time: e.time })
+      const path = mutationPath(e.data?.name, e.data?.arguments)
+      if (path) mutationCalls.set(String(e.data?.callId ?? ""), { path, turn: e.data?.turn })
+      push({
+        id: `tool-${e.seq}`,
+        seq: e.seq,
+        role: "tool_call",
+        name: e.data?.name || "tool",
+        args: typeof e.data?.arguments === "string" ? e.data.arguments : JSON.stringify(e.data?.arguments || {}),
+        callId: e.data?.callId,
+        turn: e.data?.turn,
+        step: e.data?.step,
+        time: e.time,
+        type: "tool_call",
+      })
+    } else if (e.type === "tool/result") {
+      flushReasoning(e.time)
+      const content = toolResultContent(e).map((c) => c.text || JSON.stringify(c)).join("\n")
+      const callId = toolResultMeta(e)?.callId ?? null
+      const start = toolCalls.get(callId)?.time
+      const mutation = callId != null ? mutationCalls.get(String(callId)) : null
+      if (!toolResultIsError(e) && mutation) {
+        const turn = e.data?.turn ?? mutation.turn
+        const list = producedByTurn.get(turn) ?? []
+        list.push({ path: mutation.path, seq: e.seq })
+        producedByTurn.set(turn, list)
+      }
+      push({
+        id: `tool-res-${e.seq}`,
+        seq: e.seq,
+        role: "tool_result",
+        text: content,
+        callId,
+        turn: e.data?.turn,
+        step: e.data?.step,
+        durationMs: Number.isFinite(start) ? e.time - start : undefined,
+        time: e.time,
+        type: "tool_result",
+      })
+    } else if (e.type === "compaction/start") {
+      flushReasoning(e.time)
+      push({ id: `compact-${e.seq}`, seq: e.seq, role: "compaction", text: "", running: true, time: e.time, type: "compaction" })
+    } else if (e.type === "compaction/summary") {
+      const summaryText = (e.data?.summary ?? []).map((c) => c.text || "").join("\n").trim()
+      const last = messages[messages.length - 1]
+      if (last?.role === "compaction") {
+        last.text = summaryText
+        last.running = false
+      } else {
+        push({ id: `compact-${e.seq}`, seq: e.seq, role: "compaction", text: summaryText, running: false, time: e.time, type: "compaction" })
+      }
+    } else if (e.type === "compaction/end") {
+      const last = messages[messages.length - 1]
+      if (last?.role === "compaction") last.running = false
+    } else if (e.type === "todo/write") {
+      flushReasoning(e.time)
+      push({ id: `todo-${e.seq}`, seq: e.seq, role: "todo", todos: Array.isArray(e.data?.todos) ? e.data.todos : [], time: e.time, type: "todo" })
+    } else if (e.type === "workspace/changes") {
+      const turn = e.data?.turn
+      const previous = messages.findIndex((m) => m.role === "workspace_changes" && m.turn === turn)
+      if (previous >= 0) messages.splice(previous, 1)
+      let summary
+      try { summary = changesSummary?.(e.seq) } catch { summary = undefined }
+      const changes = projectChangesSummary(summary, { maxFiles: MAX_EMBEDDED_CHANGED_FILES })
+      if (changes) {
+        flushReasoning(e.time)
+        push({
+          id: `changes-${e.seq}`,
+          seq: e.seq,
+          role: "workspace_changes",
+          text: "",
+          turn,
+          changes,
+          time: e.time,
+          type: "workspace_changes",
+        })
+      }
+    } else if (e.type === "turn/end") {
+      lastTurnEndReason = e.data?.reason?.kind ?? null
+      const files = uniquePaths(producedByTurn.get(e.data?.turn))
+      if (files.length) {
+        flushReasoning(e.time)
+        push({
+          id: `files-${e.seq}`,
+          seq: e.seq,
+          role: "produced_files",
+          text: "",
+          files,
+          time: e.time,
+          type: "produced_files",
+        })
+      }
+    }
+  }
+  flushReasoning(messages.length ? messages[messages.length - 1].time : 0)
+
+  // 文件补全：只合并 seq 落在本页窗口内的 reasoning 块，按 seq 逆序插入
+  // （插到紧随其后的消息之前；页尾没有后继消息时留在页尾，客户端按 id 去重）
+  if (reasoningBySeq.size > 0 && typeof pageFirstSeq === "number" && typeof pageLastSeq === "number") {
+    const emittedReasoningTexts = new Set(
+      messages.filter((m) => m.role === "reasoning").map((m) => String(m.text ?? "").trim()).filter(Boolean),
+    )
+    const inWindow = [...reasoningBySeq.values()]
+      .filter((r) => r && typeof r.seq === "number" && r.seq >= pageFirstSeq && r.seq <= pageLastSeq && !emittedIds.has(`reason-${r.seq}`))
+      .sort((a, b) => a.seq - b.seq)
+    for (const r of inWindow.reverse()) {
+      const text = String(r.text ?? "").trim()
+      if (!text) continue
+      if (emittedReasoningTexts.has(text)) continue
+      let idx = messages.findIndex((m) => m.seq > r.seq)
+      if (idx < 0) idx = messages.length
+      messages.splice(idx, 0, {
+        id: `reason-${r.seq}`,
+        seq: r.seq,
+        role: "reasoning",
+        text,
+        time: r.time ?? 0,
+        type: "reasoning",
+      })
+    }
+  }
+
+  return {
+    messages,
+    hasMore: Boolean(hasMore),
+    nextBeforeSeq: typeof firstEvent?.seq === "number" ? firstEvent.seq : null,
+    maxSeq: typeof lastEvent?.seq === "number" ? lastEvent.seq : null,
+    stoppedReason: lastTurnEndReason !== null && lastTurnEndReason !== "completed" ? lastTurnEndReason : null,
+  }
+}

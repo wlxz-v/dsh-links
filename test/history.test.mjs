@@ -1,0 +1,462 @@
+/**
+ * 历史投影契约测试（WI-001）：reasoning 只属于覆盖其 sequence 范围的页面；
+ * 消息 id 以事件 seq 为键，跨页稳定；assistant/message 与同页 text block-end 去重。
+ * 运行：node --test dsh-links/test/history.test.mjs
+ */
+import { test } from "node:test"
+import assert from "node:assert/strict"
+import { projectHistoryPage, clampHistoryMaxMessages, MAX_HISTORY_MESSAGES } from "../src/history.js"
+
+const T = 1_700_000_000_000
+
+function ev(seq, type, data, extra = {}) {
+  return { event: { seq, type, time: T + seq, data, ...extra } }
+}
+
+function userMsg(seq, text) {
+  return ev(seq, "user/message", { content: [{ type: "text", text }] })
+}
+
+function blockEnd(seq, blockType, text = "") {
+  return ev(seq, "assistant/chunk", { chunk: { type: "block-end", index: 0, block: { type: blockType, text } } })
+}
+
+function assistantMsg(seq, text, sourceEventSeqs) {
+  return ev(seq, "assistant/message", { message: { role: "assistant", content: [{ type: "text", text }] } }, { sourceEventSeqs })
+}
+
+function toolCall(seq, callId, name) {
+  return ev(seq, "tool/call", { callId, name, arguments: "{}", turn: 1, step: 1 })
+}
+
+function toolResult(seq, callId) {
+  return ev(seq, "tool/result", { turn: 1, step: 1, message: { source: { callId }, content: [{ type: "text", text: "ok" }] } })
+}
+
+function todoWrite(seq, items) {
+  return ev(seq, "todo/write", { todos: items })
+}
+
+test("runtime context user message projects as context_injection", () => {
+  const text = "Current runtime context:\n- Host OS: macOS\n- Current DSH file policy: danger-full-access"
+  const { messages } = projectHistoryPage({
+    events: [userMsg(10, text), blockEnd(11, "text", "ok"), assistantMsg(12, "ok", [11])],
+    reasoningBySeq: new Map(),
+    hasMore: false,
+  })
+  assert.equal(messages[0].role, "context_injection")
+  assert.equal(messages[1].role, "assistant")
+})
+
+test("plain user message stays user role", () => {
+  const { messages } = projectHistoryPage({
+    events: [userMsg(10, "测试")],
+    reasoningBySeq: new Map(),
+    hasMore: false,
+  })
+  assert.equal(messages[0].role, "user")
+})
+
+test("尾页只合并本页 seq 窗口内的 reasoning，页外早期 reasoning 不混入", () => {
+  // 页窗口 [100, 103]；文件里 reasoning 块 seq=50（早期）与 seq=101（本页）
+  const events = [
+    userMsg(100, "问题"),
+    blockEnd(101, "reasoning"), // 投影剥掉文本，需文件补全
+    blockEnd(102, "text", "回答"),
+    assistantMsg(103, "回答", [102]),
+  ]
+  const reasoningBySeq = new Map([
+    [50, { seq: 50, time: T + 50, text: "早期思考（不应出现）" }],
+    [101, { seq: 101, time: T + 101, text: "本页思考" }],
+  ])
+  const { messages } = projectHistoryPage({ events, reasoningBySeq, hasMore: false })
+
+  const ids = messages.map((m) => m.id)
+  assert.deepEqual(ids, ["msg-100", "reason-101", "msg-102"])
+  assert.equal(messages[1].role, "reasoning")
+  assert.equal(messages[1].text, "本页思考")
+  assert.equal(messages[1].seq, 101)
+  assert.ok(!messages.some((m) => m.text.includes("早期思考")))
+})
+
+test("assistant/message 文本块与同页 text block-end 共享 id（按 sourceEventSeqs 定位）", () => {
+  const events = [
+    blockEnd(201, "text", "第一段"),
+    blockEnd(203, "text", "第二段"),
+    assistantMsg(204, "第一段", [200, 201]),
+    assistantMsg(205, "第二段", [202, 203]),
+  ]
+  const { messages } = projectHistoryPage({ events, reasoningBySeq: new Map(), hasMore: false })
+  const texts = messages.map((m) => `${m.id}:${m.text}`)
+  assert.deepEqual(texts, ["msg-201:第一段", "msg-203:第二段"])
+})
+
+test("连续 reasoning 块追加而非覆盖，id 用首块 seq", () => {
+  const events = [
+    blockEnd(10, "reasoning", "第一段思考"),
+    blockEnd(11, "reasoning", "第二段思考"),
+    blockEnd(12, "text", "回答"),
+  ]
+  const { messages } = projectHistoryPage({ events, reasoningBySeq: new Map(), hasMore: false })
+  const reasons = messages.filter((m) => m.role === "reasoning")
+  assert.equal(reasons.length, 1)
+  assert.equal(reasons[0].id, "reason-10")
+  assert.equal(reasons[0].seq, 10)
+  assert.equal(reasons[0].text, "第一段思考\n第二段思考")
+})
+
+test("投影已带文本的 reasoning（子会话未剥除）不再从文件重复合并", () => {
+  const events = [
+    blockEnd(301, "reasoning", "事件自带思考"),
+    blockEnd(302, "text", "回答"),
+  ]
+  const reasoningBySeq = new Map([[301, { seq: 301, time: T + 301, text: "文件重复思考（不应出现）" }]])
+  const { messages } = projectHistoryPage({ events, reasoningBySeq, hasMore: false })
+  assert.deepEqual(messages.map((m) => m.id), ["reason-301", "msg-302"])
+  assert.equal(messages.filter((m) => m.role === "reasoning").length, 1)
+  assert.equal(messages[0].text, "事件自带思考")
+})
+
+test("更早页（beforeSeq 窗口）只带窗口内的 reasoning，且按 seq 插在正确位置", () => {
+  // 更早页窗口 [400, 405]；reasoning 401 属于本页（其文本 402 也在本页）；reasoning 500 属于更晚页，排除
+  const events = [
+    userMsg(400, "旧问题"),
+    blockEnd(401, "reasoning"),
+    blockEnd(402, "text", "旧回答"),
+    assistantMsg(405, "旧回答", [402]),
+  ]
+  const reasoningBySeq = new Map([
+    [401, { seq: 401, time: T + 401, text: "旧思考" }],
+    [500, { seq: 500, time: T + 500, text: "更新页思考（不应出现在本页）" }],
+  ])
+  const { messages } = projectHistoryPage({ events, reasoningBySeq, hasMore: true })
+  assert.deepEqual(messages.map((m) => m.id), ["msg-400", "reason-401", "msg-402"])
+  assert.equal(messages[1].text, "旧思考")
+})
+
+test("页面最早事件是 reasoning 且其文本在更晚页时，reasoning 落在页首（其实际位置之上）", () => {
+  const events = [
+    blockEnd(601, "reasoning"), // 页窗口第一事件；文本 block-end 602 在本页之外（更晚页）
+    userMsg(610, "问题"),
+  ]
+  const reasoningBySeq = new Map([[601, { seq: 601, time: T + 601, text: "跨页思考" }]])
+  const { messages } = projectHistoryPage({ events, reasoningBySeq, hasMore: false })
+  assert.deepEqual(messages.map((m) => m.id), ["reason-601", "msg-610"])
+})
+
+test("工具事件、todo、compaction 保持稳定 id 与顺序", () => {
+  const events = [
+    userMsg(700, "做一下"),
+    toolCall(701, "call-1", "bash"),
+    toolResult(702, "call-1"),
+    todoWrite(703, [{ content: "第一步", status: "pending" }]),
+    blockEnd(704, "reasoning"),
+    blockEnd(705, "text", "结果"),
+    ev(706, "compaction/start", {}),
+    ev(707, "compaction/summary", { summary: [{ type: "text", text: "摘要" }] }),
+  ]
+  const reasoningBySeq = new Map([[704, { seq: 704, time: T + 704, text: "思考" }]])
+  const { messages } = projectHistoryPage({ events, reasoningBySeq, hasMore: false })
+  assert.deepEqual(
+    messages.map((m) => m.id),
+    ["msg-700", "tool-701", "tool-res-702", "todo-703", "reason-704", "msg-705", "compact-706"],
+  )
+  const compact = messages.find((m) => m.role === "compaction")
+  assert.equal(compact.text, "摘要")
+  assert.equal(compact.running, false)
+  // 全部消息必须带稳定 seq
+  for (const m of messages) assert.equal(typeof m.seq, "number")
+})
+
+test("reasoning-delta + block-end + 文件补全只产出一行，不重复已思考", () => {
+  const events = [
+    userMsg(10, "问题"),
+    ev(11, "assistant/chunk", { chunk: { type: "reasoning-delta", text: "先看" } }),
+    ev(12, "assistant/chunk", { chunk: { type: "reasoning-delta", text: "一下" } }),
+    blockEnd(13, "reasoning", "先看一下"),
+    blockEnd(14, "text", "回答"),
+    assistantMsg(15, "回答", [14]),
+  ]
+  const reasoningBySeq = new Map([[13, { seq: 13, time: T + 13, text: "先看一下" }]])
+  const { messages } = projectHistoryPage({ events, reasoningBySeq, hasMore: false })
+  const reasons = messages.filter((m) => m.role === "reasoning")
+  assert.equal(reasons.length, 1)
+  assert.equal(reasons[0].id, "reason-13")
+  assert.equal(reasons[0].text, "先看一下")
+  assert.equal(reasons[0].running, undefined)
+})
+
+test("进行中的 reasoning-delta 投影为 running 思考行", () => {
+  const events = [
+    userMsg(10, "问题"),
+    ev(11, "assistant/chunk", { chunk: { type: "reasoning-delta", text: "先看" } }),
+    ev(12, "assistant/chunk", { chunk: { type: "reasoning-delta", text: "一下" } }),
+  ]
+  const { messages } = projectHistoryPage({ events, reasoningBySeq: new Map(), hasMore: false })
+  assert.equal(messages.length, 2)
+  assert.equal(messages[0].role, "user")
+  assert.equal(messages[1].role, "reasoning")
+  assert.equal(messages[1].text, "先看一下")
+  assert.equal(messages[1].running, true)
+})
+
+test("重复请求同一页：结果与 id 完全一致（幂等）", () => {
+  const events = [
+    userMsg(800, "问题"),
+    blockEnd(801, "reasoning"),
+    blockEnd(802, "text", "回答"),
+  ]
+  const reasoningBySeq = new Map([[801, { seq: 801, time: T + 801, text: "思考" }]])
+  const a = projectHistoryPage({ events, reasoningBySeq, hasMore: true })
+  const b = projectHistoryPage({ events, reasoningBySeq, hasMore: true })
+  assert.deepEqual(a, b)
+})
+
+test("缺少可选字段时响应仍稳定（无 sourceEventSeqs / 空 events / reasoning 无文本）", () => {
+  const noSource = [
+    blockEnd(900, "text", "回答"),
+    assistantMsg(901, "回答"), // 无 sourceEventSeqs
+  ]
+  const { messages: m1 } = projectHistoryPage({ events: noSource, reasoningBySeq: new Map(), hasMore: false })
+  assert.equal(m1.length, 2) // 保留事件顺序，不抛错
+
+  const { messages: m2, hasMore: h2, nextBeforeSeq: n2, maxSeq: x2 } = projectHistoryPage({
+    events: [], reasoningBySeq: new Map(), hasMore: false,
+  })
+  assert.equal(m2.length, 0)
+  assert.equal(h2, false)
+  assert.equal(n2, null)
+  assert.equal(x2, null)
+
+  // 文件里 reasoning 无文本（压缩已丢弃）：跳过，不产出空壳 reasoning
+  const emptyText = [blockEnd(910, "reasoning"), blockEnd(911, "text", "回答")]
+  const { messages: m3 } = projectHistoryPage({
+    events: emptyText,
+    reasoningBySeq: new Map([[910, { seq: 910, time: T + 910, text: "" }]]),
+    hasMore: false,
+  })
+  assert.deepEqual(m3.map((m) => m.id), ["msg-911"])
+})
+
+test("同页 asked 与 decided 投影为带终态的一张审批卡", () => {
+  const events = [
+    ev(10, "approval/asked", { id: "ap-1", toolName: "bash", reason: "运行命令", callId: "c1" }),
+    ev(11, "approval/decided", { id: "ap-1", outcome: "allowed-once", callId: "c1" }),
+  ]
+  const { messages } = projectHistoryPage({ events, reasoningBySeq: new Map(), hasMore: false })
+  assert.equal(messages.length, 1)
+  assert.equal(messages[0].id, "approval-ap-1")
+  assert.equal(messages[0].approvalId, "ap-1")
+  assert.equal(messages[0].requestStatus, "resolved")
+  assert.equal(messages[0].outcome, "allowed-once")
+})
+
+test("decided 在本页、asked 不在时仍输出不可再提交的终态卡", () => {
+  const events = [
+    ev(20, "approval/decided", { id: "ap-2", outcome: "rejected", toolName: "bash" }),
+  ]
+  const { messages } = projectHistoryPage({ events, reasoningBySeq: new Map(), hasMore: true })
+  assert.equal(messages[0].requestStatus, "resolved")
+  assert.equal(messages[0].outcome, "rejected")
+  assert.equal(messages[0].approvalId, "ap-2")
+})
+
+test("只有 asked 时保持 pending，倒序重复 decided 不回滚", () => {
+  const events = [
+    ev(31, "approval/decided", { id: "ap-3", outcome: "cancelled" }),
+    ev(30, "approval/asked", { id: "ap-3", toolName: "bash" }),
+    ev(32, "approval/decided", { id: "ap-3", outcome: "cancelled" }),
+  ]
+  const { messages } = projectHistoryPage({ events, reasoningBySeq: new Map(), hasMore: false })
+  assert.equal(messages.length, 1)
+  assert.equal(messages[0].requestStatus, "cancelled")
+  assert.equal(messages[0].outcome, "cancelled")
+})
+
+test("失败的 write 不投影产出文件", () => {
+  const events = [
+    userMsg(1, "写个文件"),
+    ev(2, "tool/call", {
+      callId: "c1",
+      name: "write",
+      arguments: JSON.stringify({ file_path: "notes/hi.md", content: "hi" }),
+      turn: 1,
+      step: 1,
+    }),
+    ev(3, "tool/result", {
+      turn: 1,
+      step: 1,
+      message: { source: { callId: "c1" }, content: [{ type: "text", text: "fail", isError: true }] },
+    }),
+    ev(4, "turn/end", { turn: 1, reason: { kind: "completed" } }),
+  ]
+  const { messages } = projectHistoryPage({ events, reasoningBySeq: new Map(), hasMore: false })
+  assert.equal(messages.filter((m) => m.role === "produced_files").length, 0)
+})
+
+test("成功的 write 在 turn/end 投影为本轮产出文件", () => {
+  const events = [
+    userMsg(1, "写个文件"),
+    ev(2, "tool/call", {
+      callId: "c1",
+      name: "write",
+      arguments: JSON.stringify({ file_path: "notes/hi.md", content: "hi" }),
+      turn: 1,
+      step: 1,
+    }),
+    ev(3, "tool/result", {
+      turn: 1,
+      step: 1,
+      message: { source: { callId: "c1" }, content: [{ type: "text", text: "ok" }] },
+    }),
+    ev(4, "turn/end", { turn: 1, reason: { kind: "completed" } }),
+  ]
+  const { messages } = projectHistoryPage({ events, reasoningBySeq: new Map(), hasMore: false })
+  const files = messages.filter((m) => m.role === "produced_files")
+  assert.equal(files.length, 1)
+  assert.deepEqual(files[0].files, ["notes/hi.md"])
+})
+
+test("V4 一等 tool 消息仍能关联 callId：产出文件 + 工具耗时", () => {
+  const events = [
+    userMsg(1, "写个文件"),
+    ev(2, "tool/call", {
+      callId: "c1",
+      name: "write",
+      arguments: JSON.stringify({ file_path: "notes/v4.md", content: "hi" }),
+      turn: 1,
+      step: 1,
+    }),
+    // DSH 0.1.7 起的 V4 形状：role=tool，toolCallId/isError 在 message 上
+    ev(3, "tool/result", {
+      turn: 1,
+      step: 1,
+      message: {
+        role: "tool",
+        source: { kind: "tool", callId: "c1" },
+        toolCallId: "c1",
+        content: [{ type: "text", text: "written" }],
+      },
+    }),
+    ev(4, "turn/end", { turn: 1, reason: { kind: "completed" } }),
+  ]
+  const { messages } = projectHistoryPage({ events, reasoningBySeq: new Map(), hasMore: false })
+  const files = messages.filter((m) => m.role === "produced_files")
+  assert.equal(files.length, 1)
+  assert.deepEqual(files[0].files, ["notes/v4.md"])
+  const result = messages.find((m) => m.role === "tool_result")
+  assert.equal(result.callId, "c1")
+  assert.equal(result.text, "written")
+  assert.equal(result.durationMs, 1)
+})
+
+test("V4 失败的 write（message.isError）不投影产出文件", () => {
+  const events = [
+    userMsg(1, "写个文件"),
+    ev(2, "tool/call", {
+      callId: "c1",
+      name: "write",
+      arguments: JSON.stringify({ file_path: "notes/v4.md", content: "hi" }),
+      turn: 1,
+      step: 1,
+    }),
+    ev(3, "tool/result", {
+      turn: 1,
+      step: 1,
+      message: {
+        role: "tool",
+        source: { kind: "tool", callId: "c1" },
+        toolCallId: "c1",
+        content: [{ type: "text", text: "fail" }],
+        isError: true,
+      },
+    }),
+    ev(4, "turn/end", { turn: 1, reason: { kind: "completed" } }),
+  ]
+  const { messages } = projectHistoryPage({ events, reasoningBySeq: new Map(), hasMore: false })
+  assert.equal(messages.filter((m) => m.role === "produced_files").length, 0)
+})
+
+test("V3 真实包装块取内层正文，不把 ToolResultBlock 序列化出来", () => {
+  const events = [
+    userMsg(1, "写个文件"),
+    ev(2, "tool/call", {
+      callId: "c1",
+      name: "write",
+      arguments: JSON.stringify({ file_path: "notes/v3.md", content: "hi" }),
+      turn: 1,
+      step: 1,
+    }),
+    ev(3, "tool/result", {
+      turn: 1,
+      step: 1,
+      message: {
+        role: "user",
+        source: { kind: "tool", callId: "c1" },
+        content: [{
+          type: "tool-result",
+          toolCallId: "c1",
+          content: [{ type: "text", text: "first" }, { type: "text", text: "second" }],
+        }],
+      },
+    }),
+    ev(4, "turn/end", { turn: 1, reason: { kind: "completed" } }),
+  ]
+  const { messages } = projectHistoryPage({ events, reasoningBySeq: new Map(), hasMore: false })
+  const result = messages.find((m) => m.role === "tool_result")
+  assert.equal(result.text, "first\nsecond")
+  assert.equal(result.callId, "c1")
+  assert.deepEqual(
+    messages.filter((m) => m.role === "produced_files").map((m) => m.files),
+    [["notes/v3.md"]],
+  )
+})
+
+test("clampHistoryMaxMessages caps and rejects non-positive", () => {
+  assert.equal(clampHistoryMaxMessages(20), 20)
+  assert.equal(clampHistoryMaxMessages(MAX_HISTORY_MESSAGES + 999), MAX_HISTORY_MESSAGES)
+  assert.equal(clampHistoryMaxMessages(0), undefined)
+  assert.equal(clampHistoryMaxMessages(-8), undefined)
+  assert.equal(clampHistoryMaxMessages("x"), undefined)
+})
+
+test("模型切换提示归入 system_notice，不当成用户消息", () => {
+  const { messages } = projectHistoryPage({
+    events: [
+      userMsg(30, "继续吧"),
+      userMsg(31, "[model changed: assistant turns above this point were generated by step-3.7-flash]"),
+    ],
+    reasoningBySeq: new Map(),
+    hasMore: false,
+  })
+  assert.equal(messages[0].role, "user")
+  assert.equal(messages[1].role, "system_notice")
+})
+
+test("v4 R2.3：每条消息都带 kind，用户消息由插件分类", () => {
+  const { messages } = projectHistoryPage({
+    events: [
+      userMsg(40, "帮我改一下 CLAUDE.md"),
+      userMsg(41, "Current runtime context:\n- Host OS: macOS"),
+      userMsg(42, "<goal_round>\nObjective: \"ship it\"\nRound: 3/8\n</goal_round>"),
+      userMsg(43, "[model changed: assistant turns above this point were generated by step-3.7-flash]"),
+      blockEnd(44, "text", "ok"),
+      assistantMsg(45, "ok", [44]),
+    ],
+    reasoningBySeq: new Map(),
+    hasMore: false,
+  })
+  const byId = Object.fromEntries(messages.map((m) => [m.id, m]))
+  assert.equal(byId["msg-40"].kind, "user")
+  assert.equal(byId["msg-40"].role, "user")
+  assert.equal(byId["msg-41"].kind, "injection")
+  assert.equal(byId["msg-41"].role, "context_injection")
+  assert.deepEqual(byId["msg-41"].labels, ["runtime"])
+  assert.equal(byId["msg-42"].kind, "goal_round")
+  assert.equal(byId["msg-42"].role, "context_injection")
+  assert.deepEqual(byId["msg-42"].goal, { round: 3, maxRounds: 8, objective: "ship it" })
+  assert.equal(byId["msg-43"].kind, "model_changed")
+  assert.equal(byId["msg-43"].role, "system_notice")
+  for (const m of messages) assert.ok(m.kind, `${m.id} 缺 kind`)
+  assert.equal(messages.find((m) => m.role === "assistant").kind, "assistant")
+})

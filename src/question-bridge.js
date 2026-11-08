@@ -1,0 +1,339 @@
+/**
+ * 把本机 apiproxy 的 mux 帧转发给手机 SSE：
+ * - `question/requested|resolved`：澄清卡不在 session.history 事件流里，只能走 mux。
+ * - `session/event`：与 web 同源的实时推送，绕开"轮询 session.history"的秒级延迟。
+ * 答案由 host 面 `user-questions/request` waterfall 代回，不再 POST 已删除的 `/api/respond`。
+ *
+ * 传输：0.1.2 起 mux 在 /api/remote.mux（逻辑流 $events）；旧版 /api/events.mux
+ * 只接受 WebSocket 升级（SSE GET 返回 426）。两条都实现，首次连接失败就换另一条。
+ */
+import { request as httpRequest } from "node:http"
+import { randomBytes } from "node:crypto"
+import { sseBacklogExceeded, sseMessageFrame } from "./stream-cursor.js"
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms))
+}
+
+function flushSse(res) {
+  try { res.flush?.() } catch {}
+}
+
+function writeSse(writers, frame) {
+  for (const conn of [...writers]) {
+    try {
+      const ok = conn.res.write(frame)
+      flushSse(conn.res)
+      if (ok === false && sseBacklogExceeded(conn.res)) {
+        writers.delete(conn)
+        try { conn.res.destroy() } catch {}
+      }
+    } catch {
+      writers.delete(conn)
+      try { conn.res.destroy() } catch {}
+    }
+  }
+}
+
+/**
+ * 补历史期间 mux 事件排队的容量上限。正常补历史是短窗口（10 页 × 50 条封顶），
+ * 队列打到上限说明补历史异常拖长；此时丢新事件、保留 missedWhileSeeding，
+ * 由补历史结束后的强制轮询兜底补洞，不让内存无限涨。
+ */
+export const SEED_QUEUE_MAX = 2000
+
+function parseSseBlocks(buf, onBlock) {
+  let rest = buf
+  let idx
+  while ((idx = rest.indexOf("\n\n")) >= 0) {
+    const raw = rest.slice(0, idx)
+    rest = rest.slice(idx + 2)
+    onBlock(raw)
+  }
+  return rest
+}
+
+/**
+ * mux 上的 `session/event` 与 session.history 里的事件同构（seq/type/time/data），
+ * 直接按 SSE 帧下推。只走连号快路径：一旦发现空洞就交给 pollSession 补，
+ * 否则 conn.lastSeq 会跳号，被跳过的事件永远补不回来。
+ */
+function handleSessionEvent(payload, rt, requestPoll) {
+  const sessionId = payload.sessionId
+  const event = payload.event
+  if (!sessionId || !event) return
+  try { rt.previewDetect?.observe(sessionId, event) } catch {}
+  if (typeof event.seq !== "number") return
+  const writers = rt.sessionStreams.get(sessionId)
+  if (!writers || writers.size === 0) return
+  let needsPoll = false
+  for (const conn of [...writers]) {
+    if (!conn.seeded) {
+      conn.missedWhileSeeding = true
+      if (!Array.isArray(conn.seedQueue)) conn.seedQueue = []
+      if (conn.seedQueue.length < SEED_QUEUE_MAX) conn.seedQueue.push(event)
+      else conn.seedOverflow = true
+      continue
+    }
+    if (event.seq <= conn.lastSeq) continue
+    if (event.seq > conn.lastSeq + 1) {
+      needsPoll = true
+      continue
+    }
+    try {
+      const ok = conn.res.write(sseMessageFrame(event))
+      flushSse(conn.res)
+      conn.lastSeq = event.seq
+      if (ok === false && sseBacklogExceeded(conn.res)) {
+        writers.delete(conn)
+        try { conn.res.destroy() } catch {}
+      }
+    } catch {
+      writers.delete(conn)
+      try { conn.res.destroy() } catch {}
+    }
+  }
+  if (needsPoll) requestPoll?.(sessionId)
+}
+
+/** SSE 块 → 帧。WebSocket 那条直接拿到帧对象，走 handleMuxFrame。 */
+export function handleMuxBlock(block, rt, logger, requestPoll) {
+  const data = block
+    .split("\n")
+    .filter((line) => line.startsWith("data:"))
+    .map((line) => line.slice(5).replace(/^ /, ""))
+    .join("\n")
+    .trim()
+  if (!data || data.startsWith(":")) return
+  let frame
+  try {
+    frame = JSON.parse(data)
+  } catch {
+    return
+  }
+  return handleMuxFrame(frame, rt, logger, requestPoll)
+}
+
+/** 补历史结束后把排队的 mux 事件按序补发，避免思考中的 delta 被丢掉。 */
+export function flushSeedQueue(conn, sessionId, requestPoll) {
+  const queued = conn.seedQueue ?? []
+  conn.seedQueue = []
+  conn.seeded = true
+  queued.sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0))
+  const overflow = Boolean(conn.seedOverflow)
+  conn.seedOverflow = false
+  for (const event of queued) {
+    if (typeof event?.seq !== "number" || event.seq <= conn.lastSeq) continue
+    if (event.seq > conn.lastSeq + 1) {
+      requestPoll?.(sessionId)
+      return
+    }
+    try {
+      const ok = conn.res.write(sseMessageFrame(event))
+      flushSse(conn.res)
+      conn.lastSeq = event.seq
+      if (ok === false && sseBacklogExceeded(conn.res)) {
+        try { conn.res.destroy() } catch {}
+        return
+      }
+    } catch {
+      try { conn.res.destroy() } catch {}
+      return
+    }
+  }
+  if (overflow) requestPoll?.(sessionId)
+}
+
+export function handleMuxFrame(frame, rt, logger, requestPoll) {
+  const payload = frame?.payload
+  const type = payload?.type
+  if (type === "session/event") return handleSessionEvent(payload, rt, requestPoll)
+  if (type !== "question/requested" && type !== "question/resolved") return
+  const sessionId = payload.sessionId
+  if (!sessionId) return
+  const writers = rt.sessionStreams.get(sessionId)
+  if (!writers || writers.size === 0) return
+
+  if (type === "question/requested") {
+    const body = JSON.stringify({
+      rpcId: frame.rpcId,
+      sessionId,
+      questions: payload.questions ?? [],
+    })
+    writeSse(writers, `event: question\ndata: ${body}\n\n`)
+    logger?.info?.(`dsh-links: question → mobile session=${String(sessionId).slice(0, 8)} rpc=${String(frame.rpcId).slice(0, 8)}`)
+  } else {
+    const body = JSON.stringify({
+      rpcId: payload.questionRpcId ?? frame.rpcId,
+      sessionId,
+      outcome: payload.outcome ?? "cancelled",
+    })
+    writeSse(writers, `event: question-resolved\ndata: ${body}\n\n`)
+  }
+}
+
+/** 0.1.2 `/api/remote.mux` 逻辑流帧。澄清卡已由 host waterfall 接管，这里只识别旧式 payload。 */
+export function handleRemoteEventItem(value, rt, logger, requestPoll) {
+  if (!value || typeof value !== "object") return
+  if (value.type === "item" && value.value) return handleRemoteEventItem(value.value, rt, logger, requestPoll)
+  if (value.payload?.type) return handleMuxFrame(value, rt, logger, requestPoll)
+}
+
+/**
+ * 常驻订阅本机 events.mux；断线自动重连。
+ * @returns {{ stop: () => void }}
+ */
+export function startMuxQuestionBridge({ targetPort, rt, logger, requestPoll }) {
+  let stopped = false
+  let activeReq = null
+  let activeWs = null
+  // 0.1.2 走 /api/remote.mux；旧版 /api/events.mux。首连失败会翻到另一条
+  let muxPath = "/api/remote.mux"
+  let useWs = typeof globalThis.WebSocket === "function"
+
+  function connectWs() {
+    return new Promise((resolve, reject) => {
+      let ws
+      try {
+        ws = new globalThis.WebSocket(`ws://127.0.0.1:${targetPort}${muxPath}`)
+      } catch (err) {
+        reject(err)
+        return
+      }
+      activeWs = ws
+      let opened = false
+      let done = false
+      const handshakeTimer = setTimeout(() => {
+        if (opened || done) return
+        done = true
+        try { ws.close() } catch {}
+        reject(new Error("mux ws 握手超时"))
+      }, 5_000)
+      handshakeTimer.unref?.()
+      const settle = (fn, arg) => {
+        if (done) return
+        done = true
+        clearTimeout(handshakeTimer)
+        fn(arg)
+      }
+      ws.addEventListener("open", () => {
+        opened = true
+        clearTimeout(handshakeTimer)
+        logger?.info?.(`dsh-links: mux 桥已连接（WebSocket ${muxPath}）`)
+        if (muxPath === "/api/remote.mux") {
+          try {
+            ws.send(JSON.stringify({
+              type: "open",
+              streamId: "events",
+              endpoint: "$events",
+              payload: { args: {} },
+            }))
+          } catch {}
+        }
+      })
+      ws.addEventListener("message", (ev) => {
+        if (done && !opened) return
+        if (typeof ev.data !== "string") return
+        let frame
+        try {
+          frame = JSON.parse(ev.data)
+        } catch {
+          return
+        }
+        if (frame?.type === "item" && frame.value) {
+          handleRemoteEventItem(frame.value, rt, logger, requestPoll)
+          return
+        }
+        handleMuxFrame(frame, rt, logger, requestPoll)
+      })
+      ws.addEventListener("error", () => {})
+      ws.addEventListener("close", (ev) => {
+        if (opened) settle(resolve)
+        else settle(reject, new Error(`mux ws 未能建立（code ${ev?.code ?? "?"}）`))
+      })
+    })
+  }
+
+  function connectSse() {
+    return new Promise((resolve, reject) => {
+      const req = httpRequest(
+        {
+          host: "127.0.0.1",
+          port: targetPort,
+          path: "/api/events.mux",
+          method: "GET",
+          headers: {
+            host: "127.0.0.1:" + targetPort,
+            origin: "http://127.0.0.1:" + targetPort,
+            accept: "text/event-stream",
+          },
+        },
+        (res) => {
+          clearTimeout(connectTimer)
+          if (res.statusCode !== 200) {
+            reject(new Error("mux HTTP " + res.statusCode))
+            res.resume()
+            return
+          }
+          logger?.info?.("dsh-links: mux 桥已连接（SSE）")
+          let buf = ""
+          res.on("data", (chunk) => {
+            buf += chunk.toString("utf8")
+            buf = parseSseBlocks(buf, (block) => handleMuxBlock(block, rt, logger, requestPoll))
+          })
+          res.on("end", () => resolve())
+          res.on("error", reject)
+        },
+      )
+      activeReq = req
+      req.on("error", (err) => {
+        clearTimeout(connectTimer)
+        reject(err)
+      })
+      // 建流后不设读超时（SSE 本来就长时间静默），但握手阶段必须有超时
+      req.setTimeout(0)
+      const connectTimer = setTimeout(() => {
+        req.destroy(new Error("mux sse 握手超时"))
+      }, 5_000)
+      connectTimer.unref?.()
+      req.end()
+    })
+  }
+
+  ;(async () => {
+    let everConnected = false
+    while (!stopped) {
+      try {
+        await (useWs ? connectWs() : connectSse())
+        everConnected = true
+      } catch (err) {
+        if (!stopped) {
+          logger?.warn?.(`dsh-links: mux 桥（${useWs ? "ws " + muxPath : "sse"}）：${err?.message ?? err}`)
+          if (!everConnected) {
+            if (useWs && muxPath === "/api/remote.mux") muxPath = "/api/events.mux"
+            else if (typeof globalThis.WebSocket === "function") useWs = !useWs
+          }
+        }
+      }
+      activeReq = null
+      activeWs = null
+      if (stopped) break
+      await sleep(2_000)
+    }
+  })()
+
+  return {
+    stop() {
+      stopped = true
+      try { activeReq?.destroy() } catch {}
+      try { activeWs?.close() } catch {}
+      activeReq = null
+      activeWs = null
+    },
+  }
+}
+
+/** 生成调试 id（未使用时可忽略）。 */
+export function ephemeralId() {
+  return randomBytes(6).toString("hex")
+}

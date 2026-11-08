@@ -1,0 +1,73 @@
+{
+  "name": "dsh-links",
+  "version": "0.1.0-beta.19",
+  "description": "DSH 手机插件：局域网配对 + 设备管理 + 18640 接入代理 + 手机 API（纯后端，无页面布局注入）",
+  "type": "module",
+  "main": "./src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./client": "./src/client.js",
+    "./package.json": "./package.json"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lunaship/dsh-links.git"
+  },
+  "homepage": "https://github.com/lunaship/dsh-links#readme",
+  "bugs": {
+    "url": "https://github.com/lunaship/dsh-links/issues"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "android",
+    "lan",
+    "mobile",
+    "plugin"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build:client": "node build-client.mjs",
+    "test": "node --test test/*.mjs",
+    "prepack": "node build-client.mjs && node --test test/*.mjs",
+    "test:dlp1-e2e": "node scripts/dlp1-e2e.mjs"
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "3.18.2",
+    "qrcode": "1.5.4",
+    "selfsigned": "5.5.0",
+    "ws": "^8"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-layout",
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
+    }
+  },
+  "files": [
+    "src",
+    "cordis.patch.yml",
+    "package.json",
+    "pnpm-lock.yaml",
+    "README.md",
+    "SECURITY.md",
+    "PRIVACY.md",
+    "REMOTE_ACCESS.md",
+    "THIRD_PARTY_NOTICES.md",
+    "docs/*.md",
+    "docs/images/*-latest*.png",
+    "LICENSE"
+  ]
+}

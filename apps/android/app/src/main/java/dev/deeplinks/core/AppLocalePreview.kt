@@ -1,0 +1,23 @@
+package dev.deeplinks.core
+
+/** 预览端口文案。表在 AppLocaleZh / AppLocaleEn。不往 AppLocale 加 getter。 */
+val DshStrings.previewTitle: String get() = translation("previewTitle")
+val DshStrings.previewEmpty: String get() = translation("previewEmpty")
+val DshStrings.previewLimit: String get() = translation("previewLimit")
+val DshStrings.previewRefresh: String get() = translation("previewRefresh")
+val DshStrings.previewOpenBrowser: String get() = translation("previewOpenBrowser")
+val DshStrings.previewCopied: String get() = translation("previewCopied")
+val DshStrings.previewExit: String get() = translation("previewExit")
+val DshStrings.previewDetected: String get() = translation("previewDetected")
+val DshStrings.fileCopyPath: String get() = translation("fileCopyPath")
+val DshStrings.fileShare: String get() = translation("fileShare")
+val DshStrings.fileQuote: String get() = translation("fileQuote")
+val DshStrings.filePathCopied: String get() = translation("filePathCopied")
+val DshStrings.fileQuotePrefill: String get() = translation("fileQuotePrefill")
+val DshStrings.fileTreeReadOnly: String get() = translation("fileTreeReadOnly")
+val DshStrings.previewVia: String get() = translation("previewVia")
+val DshStrings.previewCopyAddress: String get() = translation("previewCopyAddress")
+val DshStrings.previewMore: String get() = translation("previewMore")
+val DshStrings.previewEmptyTitle: String get() = translation("previewEmptyTitle")
+val DshStrings.previewEmptyBody: String get() = translation("previewEmptyBody")
+val DshStrings.fileTreeFolder: String get() = translation("fileTreeFolder")

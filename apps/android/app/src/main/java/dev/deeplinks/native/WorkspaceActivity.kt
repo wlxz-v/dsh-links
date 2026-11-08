@@ -1,0 +1,2996 @@
+package dev.deeplinks.native
+import dev.deeplinks.native.util.workspaceDisplayName
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.getValue
+import androidx.activity.result.contract.ActivityResultContracts
+import dev.deeplinks.core.Dsh
+import dev.deeplinks.core.CrashRecorder
+import dev.deeplinks.core.Host
+import dev.deeplinks.core.fileQuotePrefill
+import dev.deeplinks.core.L
+import dev.deeplinks.native.MobileSession
+import dev.deeplinks.native.MobileMessage
+import dev.deeplinks.native.AgentPresetOutline16
+import dev.deeplinks.core.DshNotifier
+import dev.deeplinks.core.HostStore
+import dev.deeplinks.core.LastOnlineStore
+import dev.deeplinks.core.stableIdentity
+import androidx.activity.ComponentActivity
+import android.Manifest
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Bundle
+import android.widget.Toast
+import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.*
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.animation.togetherWith
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
+import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.scrollBy
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.material3.*
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
+import androidx.compose.runtime.derivedStateOf
+import androidx.compose.material3.pulltorefresh.rememberPullToRefreshState
+import androidx.compose.runtime.*
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.lifecycle.compose.LifecycleResumeEffect
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInRoot
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
+import android.util.Log
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.io.File
+import java.util.*
+import dev.deeplinks.native.ui.ChatLoadingSkeleton
+import dev.deeplinks.native.util.legacyRoleForKind
+import dev.deeplinks.native.util.resolvedMessageKind
+import dev.deeplinks.native.util.optNullableString
+import dev.deeplinks.native.util.parseStoppedReason
+import dev.deeplinks.native.util.WorkspaceAccount
+import dev.deeplinks.native.util.runReachabilityLoop
+import dev.deeplinks.native.util.chatTopSubtitle
+import dev.deeplinks.native.util.sessionMillis
+import dev.deeplinks.native.util.normalizeWorkspacePath
+import dev.deeplinks.native.util.reconcileDeletedWorkspaces
+import dev.deeplinks.native.util.workspaceGroupKey
+import dev.deeplinks.native.util.chatCanvasKind
+import dev.deeplinks.native.ui.v4.DlTone
+import dev.deeplinks.native.ui.v4.DlDiffStat
+import dev.deeplinks.native.util.composerSuggestionVisible
+import dev.deeplinks.native.util.lastGroupEndedAssistant
+import dev.deeplinks.native.util.ChatCanvasKind
+import dev.deeplinks.native.util.localHideAfterRemote
+import dev.deeplinks.native.util.forkAccepted
+import dev.deeplinks.native.util.streamBannerKind
+import dev.deeplinks.native.util.ParkedRestoreKind
+import dev.deeplinks.native.util.ParkedSend
+import dev.deeplinks.native.util.parkSendForPersistence
+import dev.deeplinks.native.util.parkedSendRestoreKind
+import dev.deeplinks.native.util.parkedRestoreComposerError
+import dev.deeplinks.native.util.ComposerDraft
+import dev.deeplinks.native.util.appendComposerImage
+import dev.deeplinks.native.util.composerDraftKey
+import dev.deeplinks.native.util.mergeComposerText
+import dev.deeplinks.native.util.putComposerDraft
+import dev.deeplinks.native.util.liveOrParkedComposerError
+import dev.deeplinks.native.util.stashComposerDraft
+import dev.deeplinks.native.util.switchComposerErrors
+
+/**
+ * DeepSeek Harness 工作台 —— 1:1 复刻 DSH Web (127.0.0.1:3080) 设计语言。
+ * 设计 token 取自 dsw 暗色主题：neutral-bluish 色阶 / deepseek 品牌蓝 / 22px 气泡与输入卡。
+ */
+
+// --- DSH 设计系统常量由 DshTheme.kt 统一提供 ---
+
+/** LazyColumn 中非消息条目的 key（锚点计算时排除，不能当作消息索引）。 */
+private val NON_MESSAGE_ITEM_KEYS = setOf("load-older", "turn-status", "stopped-badge", "session-header")
+
+/**
+ * 兼容壳：本类只作为外部入口（系统分享 / 通知）的中转，把 extras 原样交给
+ * MainActivity 的 workspace 目的地。语音识别、安全窗口等生命周期都在 MainActivity。
+ */
+class WorkspaceActivity : ComponentActivity() {
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        startActivity(
+            Intent(this, MainActivity::class.java)
+                .putExtra(MainActivity.EXTRA_START_ROUTE, AppRoute.WORKSPACE)
+                .putExtras(intent)
+                .addFlags(Intent.FLAG_ACTIVITY_REORDER_TO_FRONT),
+        )
+        finish()
+    }
+}
+
+/** 手机 / Medium 上的目的地。宽屏常驻侧栏时忽略，列表和聊天同时在。 */
+private enum class PhoneDest { Sessions, Chat }
+
+@OptIn(ExperimentalMaterial3Api::class, androidx.compose.foundation.ExperimentalFoundationApi::class)
+@Composable
+fun WorkspaceScreen(
+    host: Host,
+    initialSessionId: String? = null,
+    restoreSessionId: String? = null,
+    initialShareText: String? = null,
+    initialShareImages: List<String> = emptyList(),
+    initialShareSeq: Long = 0L,
+    /** 通知动作带进来的意图（方案 8）：看改动 / 聚焦输入。 */
+    initialIntentAction: String? = null, initialIntentActionRequestId: Long = 0L,
+    initialShareNotice: String? = null,
+    /** 打开设备（配对）页；authNotice 非空时在设备页顶部说明原因。 */
+    onOpenDevice: (authNotice: String?) -> Unit,
+    onOpenSettings: () -> Unit,
+    onStartVoiceInput: ((String) -> Unit, () -> Unit, (String) -> Unit) -> Unit,
+    onStopVoiceInput: () -> Unit
+) {
+    val scope = rememberCoroutineScope()
+    val context = androidx.compose.ui.platform.LocalContext.current
+    StartupFirstFrameMark()
+    val launchIntoChat = !initialSessionId.isNullOrBlank() ||
+        !initialShareText.isNullOrBlank() ||
+        initialShareImages.isNotEmpty() ||
+        !initialShareNotice.isNullOrBlank()
+    var phoneDest by rememberSaveable {
+        mutableStateOf(if (launchIntoChat) PhoneDest.Chat.name else PhoneDest.Sessions.name)
+    }
+    fun showPhoneChat() { phoneDest = PhoneDest.Chat.name }
+    fun showPhoneSessions() { phoneDest = PhoneDest.Sessions.name }
+    val hostIdentity = remember(host) { host.stableIdentity() }
+    // 进入工作区即记录「最近使用设备」；设备重命名不影响该身份。
+    LaunchedEffect(hostIdentity) { HostStore.rememberLastHost(context, host) }
+    val workspaceViewModel: WorkspaceViewModel = viewModel(
+        key = "workspace:${host.slotKey}",
+        factory = WorkspaceViewModel.factory(host),
+    )
+    val client = workspaceViewModel.client
+
+    var sessions by workspaceViewModel.sessions
+    var currentSessionId by workspaceViewModel.currentSessionId
+    var messages by workspaceViewModel.messages
+    var olderMessages by workspaceViewModel.olderMessages
+    var sessionStats by workspaceViewModel.sessionStats
+    var hasMoreMessages by workspaceViewModel.hasMoreMessages
+    var nextBeforeSeq by workspaceViewModel.nextBeforeSeq
+    var stoppedReason by workspaceViewModel.stoppedReason
+    var isLoadingOlder by workspaceViewModel.isLoadingOlder
+
+    // 助手消息的赞/踩反馈：messageId -> (rating, version)。
+    // feedbackSupported=false 时（插件未提供 /feedback 路由）隐藏赞踩，避免死按钮。
+    var messageFeedback by remember { mutableStateOf(emptyMap<String, Pair<String, String>>()) }
+    var feedbackSupported by remember { mutableStateOf(false) }
+    LaunchedEffect(currentSessionId) {
+        val sid = currentSessionId
+        if (sid == null) {
+            messageFeedback = emptyMap()
+            feedbackSupported = false
+            return@LaunchedEffect
+        }
+        // 打开会话时订阅可能还没注册（插件对活跃订阅有校验），短暂重试；
+        // 路由不存在（404）则立即放弃并隐藏赞踩。
+        var result: Map<String, Pair<String, String>>? = null
+        var attempt = 0
+        while (result == null && attempt < 6) {
+            attempt++
+            val outcome: Pair<Map<String, Pair<String, String>>?, Boolean> = withContext(Dispatchers.IO) {
+                try {
+                    val root = client.getMessageFeedback(sid)
+                    val items = root.optJSONObject("value")?.optJSONArray("items") ?: org.json.JSONArray()
+                    val map = buildMap<String, Pair<String, String>> {
+                        for (i in 0 until items.length()) {
+                            val o = items.optJSONObject(i) ?: continue
+                            val id = o.optString("messageId")
+                            val rating = o.optString("rating")
+                            val ver = o.optString("version")
+                            if (id.isNotBlank() && rating.isNotBlank()) put(id, rating to ver)
+                        }
+                    }
+                    map to false
+                } catch (e: Exception) {
+                    val msg = e.message.orEmpty()
+                    null to (msg.contains("404") || msg.contains("not found"))
+                }
+            }
+            val map = outcome.first
+            if (map != null) {
+                result = map
+                break
+            }
+            if (outcome.second) break
+            kotlinx.coroutines.delay(1200)
+        }
+        messageFeedback = result ?: emptyMap()
+        feedbackSupported = result != null
+    }
+    var loadOlderFailed by workspaceViewModel.loadOlderFailed
+    // 首次加载（当前会话有内容前的第一条 history 请求 in-flight）：驱动 ChatLoadingSkeleton
+    var initialLoadInFlight by workspaceViewModel.initialLoadInFlight
+    var historyLoadError by workspaceViewModel.historyLoadError
+    var sessionsLoadError by workspaceViewModel.sessionsLoadError
+    var sessionsInitialLoad by workspaceViewModel.sessionsInitialLoad
+    var workspacesLoadError by workspaceViewModel.workspacesLoadError
+    var workspacesInitialLoad by workspaceViewModel.workspacesInitialLoad
+    var modelCatalog by workspaceViewModel.modelCatalog
+    var modelCatalogLoading by workspaceViewModel.modelCatalogLoading
+    var modelCatalogError by workspaceViewModel.modelCatalogError
+    var isSending by workspaceViewModel.isSending
+    var composerDrafts by workspaceViewModel.composerDrafts
+    var composerDraftErrors by workspaceViewModel.composerDraftErrors
+    var composerActionError by workspaceViewModel.composerActionError
+    var sessionPermissionOverrides by remember { mutableStateOf<Map<String, String>>(emptyMap()) }
+    var inputText by workspaceViewModel.inputText
+    var pendingImages by workspaceViewModel.pendingImages
+    var isListening by remember { mutableStateOf(false) }
+    // composer 焦点请求器：本地 Insertable（如 /plan /goal /subagent）picker 选中后重新聚焦输入框
+    val composerFocusRequester = remember { androidx.compose.ui.focus.FocusRequester() }
+    val composerKeyboardController = androidx.compose.ui.platform.LocalSoftwareKeyboardController.current
+    var showModelPicker by remember { mutableStateOf(false) }
+    var showAddWorkspace by remember { mutableStateOf(false) }
+    var showPermissionPicker by remember { mutableStateOf(false) }
+    val localStore = workspaceViewModel.local
+    var archivedIds by localStore.archivedSessionIds
+    var deletedIds by localStore.deletedSessionIds
+    fun setDeleted(id: String) {
+        localStore.addDeletedSession(id)
+        workspaceViewModel.repo.historyCache.remove(id)
+    }
+    fun setArchived(id: String) = localStore.setArchivedSessionIds(
+        if (id in archivedIds) archivedIds - id else archivedIds + id,
+    )
+    val workspacePrefs = localStore.prefs
+    // 第 2 步 B2：会话级远程图片策略。滚出屏幕不丢失放行记录，切会话换一个实例；
+    // 设置页开关改动后由 LifecycleResumeEffect 回前台刷入，Compose 状态立即重组。
+    val imagePolicy = remember(currentSessionId) { RemoteImagePolicy(workspacePrefs.autoLoadRemoteImages) }
+    LifecycleResumeEffect(Unit) {
+        imagePolicy.autoLoad = workspacePrefs.autoLoadRemoteImages
+        onPauseOrDispose { }
+    }
+    // 记录该设备最近打开的会话（下次冷启动恢复；失效时由 boot 校验回退）。
+    LaunchedEffect(hostIdentity, currentSessionId) {
+        val sid = currentSessionId ?: return@LaunchedEffect
+        workspacePrefs.rememberLastSession(hostIdentity, sid)
+    }
+    // 当前会话被本地删除/归档时清掉最近会话指针，避免下次启动去拉一个不存在的会话。
+    LaunchedEffect(hostIdentity, currentSessionId, deletedIds, archivedIds) {
+        val sid = currentSessionId ?: return@LaunchedEffect
+        if (sid in deletedIds || sid in archivedIds) {
+            workspacePrefs.forgetLastSession(hostIdentity, sid)
+        }
+    }
+    var pendingSessionCwd by remember { mutableStateOf<String?>(null) }
+    /** 用户点了「新建会话」、尚未发首条消息时为 true；此期间 refreshSessions 不得抢绑旧会话。 */
+    var composeNewSession by remember { mutableStateOf(false) }
+    var pendingAttachOwnerKey by rememberSaveable { mutableStateOf<String?>(null) }
+    fun composerOwnerKey(): String =
+        composerDraftKey(if (composeNewSession) null else currentSessionId)
+    fun liveComposerDraft() = ComposerDraft(inputText, pendingImages)
+    fun applyLiveComposer(draft: ComposerDraft) {
+        inputText = draft.text
+        pendingImages = draft.images
+    }
+    // S6：布局与目标推导（chatVisible 决定首页阶段是否预加载）。
+    val chrome = rememberWorkspaceChrome(
+        phoneDest = phoneDest,
+        currentSessionId = currentSessionId,
+        composeNewSession = composeNewSession,
+        chatDest = PhoneDest.Chat.name,
+        sessionsDest = PhoneDest.Sessions.name,
+        onCollapseToChat = { phoneDest = PhoneDest.Chat.name },
+    )
+    val dshLayout = chrome.layout
+    val containerWidthDp = chrome.containerWidthDp
+    val displayDest = chrome.displayDest
+    val showSessionHome = chrome.showSessionHome
+    val chatVisible = chrome.chatVisible
+    PersistComposerDrafts(
+        prefs = workspacePrefs,
+        slotKey = host.slotKey,
+        drafts = workspaceViewModel.composerDrafts,
+        ownerKey = ::composerOwnerKey,
+        live = ::liveComposerDraft,
+        deletedSessionIds = { deletedIds },
+        fillLiveText = { inputText = it },
+    )
+    fun restoreComposerToOwner(ownerKey: String, draft: ComposerDraft) {
+        if (composerOwnerKey() == ownerKey) applyLiveComposer(draft)
+        else composerDrafts = putComposerDraft(composerDrafts, ownerKey, draft)
+    }
+    fun switchComposer(toSessionId: String?, composingNew: Boolean) {
+        val fromKey = composerOwnerKey()
+        val toKey = composerDraftKey(if (composingNew) null else toSessionId)
+        if (fromKey != toKey && isListening) {
+            onStopVoiceInput()
+            isListening = false
+        }
+        val (next, loaded) = stashComposerDraft(composerDrafts, fromKey, toKey, liveComposerDraft())
+        val (nextErrors, parkedError) = switchComposerErrors(
+            composerDraftErrors,
+            fromKey,
+            toKey,
+            composerActionError,
+        )
+        composerDrafts = next
+        composerDraftErrors = nextErrors
+        applyLiveComposer(loaded)
+        composerActionError = parkedError
+        composeNewSession = composingNew
+        currentSessionId = toSessionId
+    }
+    fun reportComposerOwnerError(ownerKey: String, message: String) {
+        val (next, live) = liveOrParkedComposerError(
+            composerDraftErrors,
+            ownerKey,
+            composerOwnerKey(),
+            message,
+        )
+        composerDraftErrors = next
+        if (live != null) composerActionError = live
+    }
+    /** 首条消息 createSession 后立即切 sid 时，保留已乐观插入的消息，避免 LaunchedEffect 清空。 */
+    var preserveMessagesSessionId by remember { mutableStateOf<String?>(null) }
+    var pendingAgentPreset by remember { mutableStateOf("") }
+    var agentPresets by workspaceViewModel.agentPresets
+    var agentPresetsLoading by workspaceViewModel.agentPresetsLoading
+    var agentPresetsError by workspaceViewModel.agentPresetsError
+    var showAgentPresetPicker by remember { mutableStateOf(false) }
+    var showSubagentSheet by remember { mutableStateOf(false) }
+    /** 新会话阶段的默认模型（create 后 selectModel）。 */
+    var pendingModel by remember { mutableStateOf<Triple<String, String, String?>?>(null) }
+    // 新任务改为对话页草稿态（N1）：工作区选择器仍由状态驱动，「+ 新任务」不再开面板。
+    var showDraftWorkspacePicker by remember { mutableStateOf(false) }
+    var showArchivedSheet by remember { mutableStateOf(false) }
+    val hostLabel = dev.deeplinks.native.util.hostDisplayLabel(workspacePrefs.hostAlias, host.name, host.baseUrl)
+    // K3 聚焦令牌：需要聚焦时只自增；真正的 requestFocus 在 InputBar 内部、下一帧执行。
+    var composerFocusToken by remember { mutableStateOf(0) }
+    // S2 冷启动去重：记录 bootstrap+getWorkspaces 成功的时间与进行中标志，回前台 10 秒内不重复下载。
+    val coldStartSync = remember { androidx.compose.runtime.mutableLongStateOf(0L) }
+    val coldStartSyncing = remember { mutableStateOf(false) }
+
+    var deleteWorkspaceTarget by remember { mutableStateOf<String?>(null) } // 待删除的工作区路径
+    var deleteWorkspaceError by remember { mutableStateOf<String?>(null) }
+    var deleteWorkspaceSaving by remember { mutableStateOf(false) }
+    var deleteSessionTarget by remember { mutableStateOf<MobileSession?>(null) } // 待删除的会话
+    var deleteSessionError by remember { mutableStateOf<String?>(null) }
+    var deleteSessionSaving by remember { mutableStateOf(false) }
+    fun openDeleteSession(session: MobileSession) {
+        deleteSessionError = null
+        deleteSessionSaving = false
+        deleteSessionTarget = session
+    }
+    fun openDeleteWorkspace(path: String) {
+        deleteWorkspaceError = null
+        deleteWorkspaceSaving = false
+        deleteWorkspaceTarget = path
+    }
+    /** 服务端已注册工作区（含 sessionIds；侧栏 / 选择器以此为准）。 */
+    var workspaceCatalogItems by remember { mutableStateOf<List<MobileWorkspace>>(emptyList()) }
+    val workspaceRegistry = workspaceCatalogItems.map { normalizeWorkspacePath(it.path) }.filter { it.isNotBlank() }
+    val workspaceAccounts = remember(workspaceCatalogItems) {
+        workspaceCatalogItems.map { WorkspaceAccount(it.path, it.sessionIds) }
+    }
+    /** 是否已成功拉取过工作区注册表；未就绪前侧栏可临时回退到会话 cwd。 */
+    var workspaceRegistryReady by remember { mutableStateOf(false) }    // 本地已删除工作区（本机乐观隐藏；服务端重新注册后会自动解除）
+    var deletedWorkspaces by localStore.deletedWorkspacePaths
+    fun persistDeletedWorkspaces(next: Set<String>) = localStore.setDeletedWorkspaces(next)
+    fun setDeletedWorkspace(path: String) {
+        persistDeletedWorkspaces(deletedWorkspaces + normalizeWorkspacePath(path))
+    }
+    var renameTarget by remember { mutableStateOf<MobileSession?>(null) }
+    var renameError by remember { mutableStateOf<String?>(null) }
+    var renameSaving by remember { mutableStateOf(false) }
+    fun openRename(session: MobileSession) {
+        renameError = null
+        renameSaving = false
+        renameTarget = session
+    }
+    // viewMode：chat / trace（全局；持久化，仅 tab 切回记忆上次）
+    // v4 4.7：轨迹是 ⋯ 菜单进入的二级页，每次打开都从对话开始，不再记住上次的视图
+    var viewMode by remember { mutableStateOf("chat") }
+    fun selectViewMode(mode: String) {
+        viewMode = if (mode == "trace") "trace" else "chat"
+    }
+    // searchQuery：侧边栏搜索文本（持久化文本，不持久化结果）
+    var searchQuery by remember { mutableStateOf(localStore.historyQuery) }
+    var sidebarSearchOpen by remember { mutableStateOf(localStore.historyQuery.isNotBlank()) }
+    // 任务首页的工作区筛选属于 Workspace 状态，不能留在侧栏内部；否则旋转、分屏或
+    // 全屏首页 / 常驻侧栏互换时会回到「全部」。路径失效时由 WorkspaceSidebar 回退全部。
+    var selectedHomeWorkspace by rememberSaveable { mutableStateOf<String?>(null) }
+    // WI-R2/R3：搜索结果与状态机、网络任务句柄（sessions/workspaces/history）
+    // 一律由 WorkspaceViewModel 持有，组合重建不再中断数据流
+    var searchResults by workspaceViewModel.searchResults
+    var searchState by workspaceViewModel.searchState
+    var cropBitmap by remember { mutableStateOf<android.graphics.Bitmap?>(null) }
+    var captureUri by remember { mutableStateOf<android.net.Uri?>(null) }
+    /** 固定的拍照输出文件。Activity 被系统重建时 ${captureUri} 会丢，回调里用同一路径兜底重建。 */
+    fun captureFileUri(): android.net.Uri {
+        val dir = java.io.File(context.cacheDir, "capture").apply { mkdirs() }
+        val file = java.io.File(dir, "photo.jpg")
+        return androidx.core.content.FileProvider.getUriForFile(
+            context,
+            "${context.packageName}.fileprovider",
+            file,
+        )
+    }
+    fun addPendingBitmap(bmp: android.graphics.Bitmap, ownerKey: String = pendingAttachOwnerKey ?: composerOwnerKey()) {
+        scope.launch(Dispatchers.IO) {
+            try {
+                val pair = ImageAttach.toPending(bmp)
+                withContext(Dispatchers.Main) {
+                    if (composerOwnerKey() == ownerKey) {
+                        applyLiveComposer(appendComposerImage(liveComposerDraft(), pair))
+                        // 新图落到当前输入槽即是对上一次失败的修正，清掉槽里停着的旧错误。
+                        composerActionError = null
+                    } else {
+                        val stored = composerDrafts[ownerKey] ?: ComposerDraft()
+                        composerDrafts = putComposerDraft(composerDrafts, ownerKey, appendComposerImage(stored, pair))
+                    }
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    val msg = if (e.message?.contains("8 MiB") == true) L.imageTooLargeSkipped
+                    else L.readImageFailed.format(e.message ?: L.unknownError)
+                    reportComposerOwnerError(ownerKey, msg)
+                }
+            } finally {
+                if (!bmp.isRecycled) bmp.recycle()
+            }
+        }
+    }
+    val imagePickerLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.PickVisualMedia()
+    ) { uri: android.net.Uri? ->
+        if (uri != null) {
+            scope.launch(Dispatchers.IO) {
+                try {
+                    val bmp = ImageAttach.decode(context, uri)
+                    addPendingBitmap(bmp)
+                } catch (e: Exception) {
+                    withContext(Dispatchers.Main) {
+                        reportComposerOwnerError(
+                            pendingAttachOwnerKey ?: composerOwnerKey(),
+                            L.readImageFailed.format(e.message ?: L.unknownError),
+                        )
+                    }
+                }
+            }
+        }
+    }
+    val takePictureLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.TakePicture()
+    ) { ok ->
+        // Activity 在相机返回时可能被系统重建（HyperOS 常见），remember 的 captureUri 会丢；
+        // 用固定的 cache/capture/photo.jpg 兜底重建，否则照片被静默丢弃、缩略图不出现。
+        val uri = captureUri ?: captureFileUri()
+        if (ok) {
+            scope.launch(Dispatchers.IO) {
+                try {
+                    val bmp = ImageAttach.decode(context, uri)
+                    withContext(Dispatchers.Main) { cropBitmap = bmp }
+                } catch (e: Exception) {
+                    withContext(Dispatchers.Main) {
+                        reportComposerOwnerError(
+                            pendingAttachOwnerKey ?: composerOwnerKey(),
+                            L.readImageFailed.format(e.message ?: L.unknownError),
+                        )
+                    }
+                }
+            }
+        }
+    }
+    val cameraPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) {
+            val uri = captureFileUri()
+            captureUri = uri
+            takePictureLauncher.launch(uri)
+        } else {
+            Toast.makeText(context, L.cameraPermissionRequired, Toast.LENGTH_SHORT).show()
+        }
+    }
+    fun launchCamera() {
+        pendingAttachOwnerKey = composerOwnerKey()
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+            cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
+            return
+        }
+        val uri = captureFileUri()
+        captureUri = uri
+        takePictureLauncher.launch(uri)
+    }
+    val listState = rememberLazyListState()
+    var elapsedSec by remember { mutableStateOf(0L) }
+    // WI-003：尾部定位请求（每次自增触发一次"等待布局后再滚底"）；0 表示无请求
+    var tailRequestId by remember { mutableStateOf(0) }
+    var lastTailRequestId by remember { mutableStateOf(0) }
+    // 用户上翻阅读时新消息到达 → 显示"回到底部"（不强行拉回尾部）
+    var showScrollToBottom by remember { mutableStateOf(false) }
+    // 悬浮「回到底部」上的未读数：以离开底部那一刻的消息条数为基线
+    var scrollAnchorCount by remember { mutableStateOf(0) }
+    var unreadWhileScrolled by remember { mutableStateOf(0) }
+    LaunchedEffect(showScrollToBottom, messages.size) {
+        if (!showScrollToBottom) {
+            scrollAnchorCount = messages.size
+            unreadWhileScrolled = 0
+        } else {
+            unreadWhileScrolled = (messages.size - scrollAnchorCount).coerceAtLeast(0)
+        }
+    }
+    var showFileBrowser by remember { mutableStateOf(false) }
+    val changesPanel = remember { ChangesPanelState() }
+    LaunchedEffect(currentSessionId) { changesPanel.reset() }
+    val historyForChanges = remember(olderMessages, messages) { mergeHistoryPages(olderMessages, messages) }
+    val changeSummaries = remember(historyForChanges) { sessionChangeSummaries(historyForChanges) }
+    val pinnedChanges = remember(historyForChanges) { pinnedTurnChanges(historyForChanges) }
+    /** 停稳时是否贴在底部：web/SSE 新消息据此决定是否自动跟尾（比瞬时 isNearBottom 更稳）。 */
+    var stickToBottom by remember { mutableStateOf(true) }
+    // WI-004：服务端设置为配置源（默认 Agent 预设/权限等），启动与回前台时刷新
+    var appSettings by workspaceViewModel.appSettings
+    fun refreshAppSettings() = workspaceViewModel.refreshAppSettings()
+
+    // ===== SSE 实时流（当前会话；VM 持有，Activity 重建不断流） =====
+    // S6：停在首页（对话页不可见）时不为当前会话建立推送流；进入对话页再建。
+    val streamClient = currentSessionId?.takeIf { chatVisible }?.let { workspaceViewModel.acquireStream(it) }
+    var streamEverConnected by remember(currentSessionId) { mutableStateOf(false) }
+    var streamQuietElapsed by remember(currentSessionId) { mutableStateOf(false) }
+    // 最近一次 SSE 活动（任意事件帧）；看门狗用它识别「连接看似健康但事件停流」的半开状态。
+    var lastStreamEventAt by remember(currentSessionId) { mutableLongStateOf(0L) }
+    LaunchedEffect(currentSessionId) {
+        streamQuietElapsed = false
+        delay(1_500)
+        streamQuietElapsed = true
+    }
+    LaunchedEffect(streamClient?.connectionState) {
+        val streamState = streamClient?.connectionState
+        CrashRecorder.breadcrumb("stream", streamState?.name ?: "none")
+        if (streamState == SessionStreamClient.ConnectionState.CONNECTED) {
+            streamEverConnected = true
+        }
+    }
+    // SSE 事件驱动的执行状态（turn/start→true，turn/end→false；与 session.list 的 running 取或）
+    var liveRunning by workspaceViewModel.liveRunning
+    // 乐观 liveRunning：若长时间收不到 turn/end 且会话也不再 running，收回以免永久卡死轮询
+    LaunchedEffect(liveRunning, currentSessionId) {
+        if (!liveRunning) return@LaunchedEffect
+        delay(90_000)
+        if (liveRunning && sessions.find { it.sessionId == currentSessionId }?.running != true && !isSending) {
+            liveRunning = false
+        }
+    }
+    // 最近一次全量刷新覆盖到的最大事件 seq（ready 时用于检测服务端游标领先）
+    var seedMaxSeq by workspaceViewModel.seedMaxSeq
+    var lastResyncAt by remember { mutableStateOf(0L) }
+    // 增量构建状态：tool/call 时间（算 tool/result 耗时）、流式 tool_call 消息 id → callId
+    val toolCallTimes = remember(currentSessionId) { mutableMapOf<String, Long>() }
+    val streamToolCallIds = remember(currentSessionId) { mutableMapOf<String, String>() }
+
+    LaunchedEffect(appSettings.agentPreset) {
+        if (composeNewSession || currentSessionId == null) {
+            pendingAgentPreset = appSettings.agentPreset
+        }
+    }
+
+    // Agent 预设（WI-R2：网络迁入 VM）
+    fun loadAgentPresets() = workspaceViewModel.loadAgentPresets()
+
+    LaunchedEffect(host) {
+        sessionPermissionOverrides = emptyMap()
+        loadAgentPresets()
+    }
+
+    fun selectSession(sessionId: String) {
+        CrashRecorder.breadcrumb("session", "select ${sessionId.take(8)}")
+        switchComposer(sessionId, composingNew = false)
+    }
+
+    // singleTask + 通知 deep-link：intent.sessionId 变化时切入目标会话
+    LaunchedEffect(initialSessionId) {
+        val target = initialSessionId?.takeIf { it.isNotBlank() } ?: return@LaunchedEffect
+        if (target != currentSessionId) selectSession(target)
+        showPhoneChat()
+    }
+
+    var appliedShareSeq by rememberSaveable { mutableStateOf(0L) }
+    var appliedShareOwner by rememberSaveable { mutableStateOf("") }
+    var shareConsumed by rememberSaveable { mutableStateOf(false) }
+    /**
+     * 外部分享带入的、以 `/` 开头的文本：系统分享不可信，不能让它直接变成可一键触发的命令入口，
+     * 只有用户手动编辑（不再等于该快照）后才恢复命令候选。
+     */
+    var shareCommandGuard by remember { mutableStateOf<String?>(null) }
+    val shareOwnerKey = composerOwnerKey()
+    LaunchedEffect(initialIntentAction, initialIntentActionRequestId, initialSessionId, currentSessionId) {
+        if (!initialSessionId.isNullOrBlank() && currentSessionId != initialSessionId) return@LaunchedEffect
+        when (initialIntentAction) {
+            dev.deeplinks.core.DshNotifier.INTENT_ACTION_CHANGES -> changesPanel.open()
+            dev.deeplinks.core.DshNotifier.INTENT_ACTION_REPLY -> {
+                if (composerFocusShouldEmit(ComposerFocusSource.NotificationReply)) composerFocusToken++
+            }
+        }
+    }
+    fun startComposeSession(cwd: String? = null) {
+        CrashRecorder.breadcrumb("draft", "enter")
+        switchComposer(null, composingNew = true)
+        pendingSessionCwd = cwd
+        pendingAgentPreset = appSettings.agentPreset
+        pendingModel = null
+        messages = emptyList()
+        olderMessages = emptyList()
+        sessionStats = null
+        historyLoadError = null
+        stoppedReason = null
+        liveRunning = false
+        seedMaxSeq = 0L
+        isLoadingOlder = false
+        loadOlderFailed = false
+        initialLoadInFlight = false
+    }
+
+    /**
+     * 点「+ 新任务」：进对话页草稿态（N1），复用对话页输入栏；可带工作区与预填文本。
+     * 草稿态下先重置模型目录（N2）再拉「无会话」目录，避免显示上一个会话的旧列表。
+     */
+    fun openNewTaskDraft(cwd: String? = null, prefill: String? = null) {
+        startComposeSession(cwd)
+        if (!prefill.isNullOrBlank()) inputText = prefill
+        workspaceViewModel.resetModelCatalog()
+        workspaceViewModel.loadModelCatalog(null, null)
+        showPhoneChat()
+        // N1/K3：进入草稿态且对话页可见时才请求聚焦（经 InputBar 内部的令牌处理）。
+        if (composerFocusShouldEmit(ComposerFocusSource.NewTaskDraft)) composerFocusToken++
+    }
+    LaunchedEffect(initialShareSeq, initialShareText, initialShareImages, initialShareNotice, shareOwnerKey) {
+        if (initialShareText.isNullOrBlank() && initialShareImages.isEmpty() && initialShareNotice.isNullOrBlank()) return@LaunchedEffect
+        openNewTaskDraft() // 分享进来的内容落在草稿态输入框里预填（N1）
+        val token = if (initialShareSeq != 0L) {
+            initialShareSeq
+        } else {
+            (initialShareText.orEmpty() + "\u0000" + initialShareImages.joinToString("\u0000") + "\u0000" + initialShareNotice.orEmpty()).hashCode().toLong()
+        }
+        // 已消费的分享不再重复应用；但冷启动时分享先落在「新会话」owner，会话列表随后加载并
+        // switchComposer 会清空输入框——因此 owner 从空变为真实会话时需要再应用一次。
+        if (shareConsumed && appliedShareSeq == token) return@LaunchedEffect
+        if (appliedShareSeq == token && appliedShareOwner == shareOwnerKey) return@LaunchedEffect
+        appliedShareSeq = token
+        appliedShareOwner = shareOwnerKey
+        if (shareOwnerKey.isNotEmpty()) shareConsumed = true
+        val text = initialShareText?.trim().orEmpty()
+        if (text.isNotEmpty()) {
+            inputText = if (inputText.isBlank()) text else "$inputText\n$text"
+            if (text.startsWith("/")) shareCommandGuard = inputText
+        }
+        var failed = 0
+        for (uriString in initialShareImages) {
+            try {
+                val bmp = withContext(Dispatchers.IO) { ImageAttach.decode(context, android.net.Uri.parse(uriString)) }
+                addPendingBitmap(bmp)
+            } catch (e: Exception) {
+                failed += 1
+                if (initialShareImages.size == 1) {
+                    composerActionError = L.readImageFailed.format(e.message ?: L.unknownError)
+                }
+            }
+        }
+        if (failed > 0 && initialShareImages.size > 1) {
+            composerActionError = L.readImageFailed.format(L.unknownError)
+        } else if (!initialShareNotice.isNullOrBlank()) {
+            composerActionError = initialShareNotice
+        }
+    }
+
+    LaunchedEffect(host.slotKey, currentSessionId, isSending) {
+        if (isSending) return@LaunchedEffect
+        val parked = workspacePrefs.parkedSend ?: return@LaunchedEffect
+        when (parkedSendRestoreKind(parked, host.slotKey, currentSessionId)) {
+            ParkedRestoreKind.None -> Unit
+            ParkedRestoreKind.SelectSession -> {
+                val target = parked.sessionId ?: return@LaunchedEffect
+                selectSession(target)
+                showPhoneChat()
+            }
+            ParkedRestoreKind.IntoCurrent -> {
+                val filledText = inputText.isBlank() && parked.text.isNotBlank()
+                val filledImages = pendingImages.isEmpty() && parked.images.isNotEmpty()
+                if (filledText) inputText = parked.text
+                if (filledImages) pendingImages = parked.images
+                workspacePrefs.parkedSend = null
+                if (parkedRestoreComposerError(parked.droppedImages)) {
+                    composerActionError = L.sendParkedImagesDropped
+                }
+                showPhoneChat()
+            }
+        }
+    }
+
+    var authExpired by remember { mutableStateOf(false) }
+    fun onAuthExpired(error: Throwable? = null) {
+        if (authExpired) return
+        authExpired = true
+        // S1：凭据失效即清掉本主机的列表缓存，避免下次冷启动铺出已经不能用的数据。
+        workspaceViewModel.clearSessionListCache()
+        val message = error?.let(::mobileAuthUserMessage) ?: L.connectionAuthExpired
+        // 设备 token / 证书失效（插件在内层 TLS 上的明确答复）时丢掉本机配对；中继的拒绝码不算
+        if (error != null && shouldDropLocalHostOnOpenAuth(error)) {
+            runCatching { HostStore.remove(context, host) }
+                .onFailure { Log.w("WorkspaceActivity", "onAuthExpired: remove revoked host failed: ${it.message}") }
+        }
+        onOpenDevice(message)
+        // WorkspaceScreen 现宿主于 MainActivity；旧独立 Activity 时代的 finish() 会关掉整个 app
+    }
+    // VM 内的周期性请求遇到认证失效时走同一条退出路径（WI-R2）
+    workspaceViewModel.authListener = { error -> onAuthExpired(error) }
+
+    fun applySessionList(list: List<MobileSession>, selectLatest: Boolean = false): String? {
+        val previousSessionId = currentSessionId
+        sessions = list
+        val nextSessionId = reconciledSessionId(
+            currentSessionId = previousSessionId,
+            sessions = list,
+            hiddenSessionIds = archivedIds + deletedIds,
+            preserveEmptySelection = composeNewSession,
+            selectLatest = selectLatest,
+        )
+        if (nextSessionId != previousSessionId) {
+            // A Web-side archive/delete can remove the currently open session while its
+            // SSE connection is still alive. Move away from that stale stream immediately.
+            liveRunning = list.any { it.sessionId == nextSessionId && it.running }
+            switchComposer(nextSessionId, composingNew = nextSessionId == null && composeNewSession)
+        } else if (list.any { it.sessionId == nextSessionId && it.running }) {
+            liveRunning = true
+        }
+        return nextSessionId
+    }
+
+    fun applySessionSnapshot(snapshot: MobileSessionSnapshot, selectLatest: Boolean = false): String? {
+        if (snapshot.archiveSnapshotAvailable) {
+            val restored = workspacePrefs.restoredSessionIds
+            val nextRestored = restored intersect snapshot.archivedSessionIds
+            if (nextRestored != restored) {
+                workspacePrefs.restoredSessionIds = nextRestored
+            }
+            val nextArchivedIds = reconcileArchivedSessionIds(snapshot.archivedSessionIds, nextRestored)
+            if (nextArchivedIds != archivedIds) {
+                localStore.setArchivedSessionIds(nextArchivedIds)
+            }
+        }
+        return applySessionList(snapshot.sessions, selectLatest)
+    }
+
+    fun refreshSessions(selectLatest: Boolean = false, reportFailure: Boolean = true) {
+        // WI-R2：单飞/代际去重/取消都在 VM（viewModelScope），屏幕只做调和
+        workspaceViewModel.refreshSessions(selectLatest, reportFailure) { snapshot ->
+            applySessionSnapshot(snapshot, selectLatest)
+            // 被动信号（R4）：列表刷新成功但界面还认为离线时，让探测循环立刻复核（不直接置在线）。
+            if (dev.deeplinks.native.util.HostConnectivity.online == false) dev.deeplinks.native.util.HostConnectivity.requestProbe()
+        }
+    }
+
+    fun applyWorkspaceCatalog(catalog: MobileWorkspaceCatalog) {
+        val nextItems = catalog.workspaces.map { ws ->
+            ws.copy(path = normalizeWorkspacePath(ws.path))
+        }.filter { it.path.isNotBlank() }
+        val nextPaths = nextItems.map { it.path }
+        val nextSet = nextPaths.toSet()
+        workspaceCatalogItems = nextItems
+        workspaceRegistryReady = true
+        val reconciled = reconcileDeletedWorkspaces(nextPaths, deletedWorkspaces)
+        if (reconciled != deletedWorkspaces) {
+            persistDeletedWorkspaces(reconciled)
+        }
+        if (pendingSessionCwd?.let(::normalizeWorkspacePath)?.let { it !in nextSet || it in reconciled } == true) {
+            pendingSessionCwd = null
+        }
+        val last = workspacePrefs.lastSelectedWorkspace?.let(::normalizeWorkspacePath)
+        if (last != null && (last !in nextSet || last in reconciled)) {
+            workspacePrefs.lastSelectedWorkspace = null
+        }
+        if (catalog.archiveSnapshotAvailable) {
+            val restored = workspacePrefs.restoredSessionIds
+            val nextRestored = restored intersect catalog.archivedSessionIds
+            if (nextRestored != restored) {
+                workspacePrefs.restoredSessionIds = nextRestored
+            }
+            val nextArchivedIds = reconcileArchivedSessionIds(catalog.archivedSessionIds, nextRestored)
+            if (nextArchivedIds != archivedIds) {
+                localStore.setArchivedSessionIds(nextArchivedIds)
+                // workspace.archiveSession is the Web "delete" contract. session.list still
+                // contains archived rows, so the archive set must invalidate the selection.
+                applySessionList(sessions)
+            }
+        }
+    }
+
+    fun refreshWorkspaces() {
+        // WI-R2：网络在 VM；目录为空时才把失败升级为可见错误（与旧实现一致）
+        workspaceViewModel.refreshWorkspaces(
+            onApplied = { catalog -> applyWorkspaceCatalog(catalog) },
+            onError = { message ->
+                if (workspaceCatalogItems.isEmpty()) workspacesLoadError = message
+            },
+        )
+    }
+
+    /** 归档到服务端成功后再本机隐藏（对标 web archive；失败时列表保持原样）。 */
+    fun applyLocalArchive(session: MobileSession, asDeleted: Boolean) {
+        workspacePrefs.rememberSessionSnapshot(
+            sessionId = session.sessionId,
+            title = session.title,
+            cwd = session.cwd,
+            updatedAt = session.updatedAt,
+        )
+        if (session.sessionId in workspacePrefs.restoredSessionIds) {
+            workspacePrefs.restoredSessionIds = workspacePrefs.restoredSessionIds - session.sessionId
+        }
+        if (session.sessionId in workspacePrefs.settingsHiddenSessionIds) {
+            workspacePrefs.settingsHiddenSessionIds = workspacePrefs.settingsHiddenSessionIds - session.sessionId
+        }
+        if (asDeleted) {
+            setDeleted(session.sessionId)
+        }
+        if (session.sessionId !in archivedIds) {
+            localStore.setArchivedSessionIds(archivedIds + session.sessionId)
+        }
+        if (currentSessionId == session.sessionId) {
+            // K3：归档/删除当前会话会进入草稿态，但可能在首页（对话页不可见）——
+            // 这里**不**发聚焦令牌，避免历史上直接 requestFocus 的闪退。
+            startComposeSession(pendingSessionCwd)
+        }
+        refreshSessions()
+    }
+
+    // 归档防抖：服务端确认前行不消失，重复右滑/长按只提交一次，避免叠一摞撤销条
+    val archiveInFlight = remember { java.util.Collections.synchronizedSet(mutableSetOf<String>()) }
+
+    fun archiveSessionNow(
+        session: MobileSession,
+        asDeleted: Boolean = false,
+        onDone: ((String?) -> Unit)? = null,
+    ) {
+        if (!archiveInFlight.add(session.sessionId)) return
+        scope.launch(Dispatchers.IO) {
+            try {
+                client.archiveSession(session.sessionId)
+                withContext(Dispatchers.Main) {
+                    if (localHideAfterRemote(accepted = true)) {
+                        applyLocalArchive(session, asDeleted)
+                    }
+                    onDone?.invoke(null)
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    val message = L.archiveFailed.format(e.message ?: L.fallbackRetryLater)
+                    if (onDone != null) onDone(message)
+                    else sessionsLoadError = message
+                }
+            } finally {
+                // 失败后放行重试；成功则行已本机隐藏，不会再来
+                archiveInFlight.remove(session.sessionId)
+            }
+        }
+    }
+
+    fun forkNow(sessionId: String, closeDrawer: Boolean = false) {
+        scope.launch(Dispatchers.IO) {
+            try {
+                val newId = client.forkSession(sessionId)
+                withContext(Dispatchers.Main) {
+                    if (!forkAccepted(newId) || newId == null) {
+                        val message = L.forkFailed.format(L.unknownError)
+                        if (closeDrawer) sessionsLoadError = message
+                        else composerActionError = message
+                        return@withContext
+                    }
+                    selectSession(newId)
+                    refreshSessions()
+                    if (closeDrawer) showPhoneChat()
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    val message = L.forkFailed.format(e.message ?: L.unknownError)
+                    if (closeDrawer) sessionsLoadError = message
+                    else composerActionError = message
+                }
+            }
+        }
+    }
+
+    /** 用户是否停留在列表底部附近（用于决定是否跟随新消息 / 显示回到底部）。 */
+    fun isNearBottom(): Boolean {
+        val info = listState.layoutInfo
+        val total = info.totalItemsCount
+        if (total == 0) return true
+        val lastVisible = info.visibleItemsInfo.lastOrNull() ?: return true
+        if (lastVisible.index < total - 2) return false
+        if (lastVisible.index >= total - 1) {
+            // 叠层后视口末端包含底部 chrome 的 contentPadding，可见内容的下沿要减去它
+            val overflow = (lastVisible.offset + lastVisible.size) - (info.viewportEndOffset - info.afterContentPadding)
+            return overflow <= 120
+        }
+        return true
+    }
+
+    /** 请求一次"等待布局完成后滚动到尾部"（并发合并为一次）。 */
+    fun requestTailPosition() {
+        tailRequestId++
+    }
+
+    /** 把列表真正贴到底（含长回复溢出补偿），见 ChatTailPositioning.kt。 */
+    suspend fun alignListToBottom() = listState.alignToBottom()
+
+    /** 立即滚到列表末尾；失败写入可检索日志。 */
+    fun scrollToTail(tag: String) {
+        if (listState.layoutInfo.totalItemsCount == 0) return
+        scope.launch {
+            try {
+                alignListToBottom()
+            } catch (e: Exception) {
+                Log.w("WorkspaceActivity", "scrollToTail($tag) failed: ${e.message}")
+            }
+        }
+    }
+
+    /**
+     * 用户停在底部附近时跟随新消息（WI-003）；已上翻阅读时不强行拉回尾部，
+     * 而是显示"回到底部"。发送等用户主动操作传 [force]=true 强制贴底。
+     *
+     * [stickToBottom]：滚动中一旦离开底部即清掉；跟滚时优先看它，避免追加瞬间
+     * isNearBottom 误判。轮询跟滚不传 force，避免读历史时被拽回。
+     */
+    fun followIfNearBottom(force: Boolean = false) {
+        if (viewMode != "chat") return
+        if (messages.isEmpty() && listState.layoutInfo.totalItemsCount == 0) return
+        if (!force && listState.isScrollInProgress) return
+        if (force || stickToBottom || isNearBottom()) {
+            stickToBottom = true
+            showScrollToBottom = false
+            requestTailPosition()
+        } else {
+            showScrollToBottom = true
+        }
+    }
+
+    fun refreshMessages(autoScroll: Boolean = false, replaceInFlight: Boolean = false, onDone: (() -> Unit)? = null) {
+        // WI-R2：拉取/合并/SSE 种子游标/代际去重都在 VM（viewModelScope），
+        // 屏幕只负责滚动回调（贴底跟随是纯 UI 行为）
+        workspaceViewModel.refreshMessages(
+            autoScroll = autoScroll,
+            replaceInFlight = replaceInFlight,
+            onDone = onDone,
+            onHistoryApplied = { appliedAutoScroll, changed ->
+                if (appliedAutoScroll && changed) followIfNearBottom()
+            },
+        )
+    }
+
+    /** 加载更早（DSH loadOlder：按 beforeSeq 向前翻一页，prepend 到消息流，并恢复阅读锚点）。 */
+    fun loadOlderMessages() {
+        val sid = currentSessionId ?: return
+        val before = nextBeforeSeq ?: return
+        if (isLoadingOlder) return
+        isLoadingOlder = true
+        loadOlderFailed = false
+        // 锚点：当前第一个可见"消息"（排除加载行/状态行）的 id 与视口偏移
+        val anchor = listState.layoutInfo.visibleItemsInfo
+            .firstOrNull { it.key !in NON_MESSAGE_ITEM_KEYS }
+            ?.let { info -> (info.key as? String) to info.offset }
+        scope.launch(Dispatchers.IO) {
+            try {
+                val result = client.getSessionHistory(sid, beforeSeq = before, maxMessages = 100)
+                val older = result.messages
+                val anchorOffset = anchor?.second ?: 0
+                withContext(Dispatchers.Main) {
+                    if (currentSessionId != sid) return@withContext
+                    // 更旧页必须插到现有 olderMessages 前面（WI-002），按稳定 id 去重
+                    olderMessages = mergeHistoryPages(older, olderMessages)
+                    hasMoreMessages = result.hasMore
+                    nextBeforeSeq = result.nextBeforeSeq
+                    // 恢复锚点：新页插入后，同一消息回到原偏移
+                    val anchorIndex = anchor?.first?.let { id ->
+                        (olderMessages + messages).indexOfFirst { it.id == id }
+                    } ?: -1
+                    if (anchorIndex >= 0 && !listState.isScrollInProgress) {
+                        try {
+                            listState.scrollToItem(anchorIndex, anchorOffset)
+                        } catch (e: Exception) {
+                            Log.w("WorkspaceActivity", "loadOlder anchor restore failed: ${e.message}")
+                        }
+                    }
+                }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.w("WorkspaceActivity", "loadOlderMessages($sid) failed: ${e.message}")
+                withContext(Dispatchers.Main) {
+                    if (currentSessionId == sid) loadOlderFailed = true
+                }
+            }
+            withContext(Dispatchers.Main) {
+                isLoadingOlder = false
+            }
+        }
+    }
+
+    fun loadModelCatalog(openPicker: Boolean = false) {
+        if (openPicker) showModelPicker = true
+        // WI-R2：拉取与状态在 VM
+        workspaceViewModel.loadModelCatalog(currentSessionId, pendingModel)
+    }
+
+    fun refreshModels() {
+        if (currentSessionId == null) return
+        loadModelCatalog(openPicker = false)
+    }
+
+    /**
+     * Debounced 搜索（WI-R2：状态机与网络整体迁入 VM，持久化经 WorkspaceLocalStore）。
+     */
+    fun runSearchDebounced(rawQuery: String) {
+        searchQuery = rawQuery
+        workspaceViewModel.runSearchDebounced(rawQuery)
+    }
+
+    // 会话筛选持久化（dsh_workspace；重启 App 后恢复上次选择）
+
+    /**
+     * 分发 palette 的本地动作。
+     * 服务端永远不会看到这些 trigger —— 只是把 picker 当作 slash 风格的快捷入口。
+     */
+    fun dispatchLocalPaletteAction(kind: LocalKind) {
+        when (kind) {
+            LocalKind.SEARCH_SESSIONS -> {
+                sidebarSearchOpen = true
+                composerKeyboardController?.hide()
+                showPhoneSessions()
+            }
+            LocalKind.NEW_SESSION -> {
+                openNewTaskDraft()
+            }
+            LocalKind.OPEN_SETTINGS -> {
+                // 与顶栏抽屉设置按钮共享入口；CONSUMED 显示可以放在 picker 选中后的 toast 中
+                onOpenSettings()
+            }
+            LocalKind.SWITCH_CHAT -> selectViewMode("chat")
+            LocalKind.SWITCH_TRACE -> selectViewMode("trace")
+            LocalKind.OPEN_MODEL_PICKER -> loadModelCatalog(openPicker = true)
+            LocalKind.OPEN_PERMISSION_PICKER -> showPermissionPicker = true
+        }
+    }
+
+    // ===== 前台状态 + 通知（审批/任务完成仅在后台打扰） + 回前台刷新 =====
+    var isForeground by remember { mutableStateOf(true) }
+    val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner, currentSessionId, streamClient) {
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            when (event) {
+                androidx.lifecycle.Lifecycle.Event.ON_START -> {
+                    isForeground = true
+                    SessionMonitorLifecycle.onForeground(currentSessionId, streamClient)
+                    dev.deeplinks.core.HostHttp.evictIdleRemote() // R5：回前台清掉空闲的远程连接（可能已被远端关掉）
+                }
+                androidx.lifecycle.Lifecycle.Event.ON_STOP -> {
+                    isForeground = false
+                    SessionMonitorLifecycle.onBackground(context, host, currentSessionId, sessions, streamClient)
+                }
+                androidx.lifecycle.Lifecycle.Event.ON_RESUME -> {
+                    dev.deeplinks.native.util.HostConnectivity.requestProbe() // R4：回前台立即重新探测
+                    // SSE 断线时立即补全消息，并刷新会话列表（移动网络切换场景）
+                    if (streamClient?.isConnected != true) refreshMessages(autoScroll = true)
+                    // 设置页可能改动了归档/删除集合，回前台重新水合（唯一所有者）
+                    localStore.reload()
+                    applySessionList(sessions)
+                    // S2：冷启动刚同步过（或同步还在跑）就跳过重复下载会话/工作区/设置
+                    if (!dev.deeplinks.native.util.shouldSkipResumeRefresh(
+                            System.currentTimeMillis(),
+                            coldStartSync.longValue,
+                            coldStartSyncing.value,
+                        )
+                    ) {
+                        refreshSessions()
+                        refreshWorkspaces()
+                        refreshAppSettings() // 设置可能在其他端修改，回前台重新读取
+                    }
+                }
+                else -> {}
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+    val notifPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { }
+    LaunchedEffect(Unit) {
+        DshNotifier.ensureChannel(context)
+        val prefs = context.getSharedPreferences("dsh_settings", android.content.Context.MODE_PRIVATE)
+        if (!prefs.getBoolean("notif_permission_asked", false) &&
+            android.os.Build.VERSION.SDK_INT >= 33 &&
+            ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            prefs.edit().putBoolean("notif_permission_asked", true).apply()
+            notifPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
+
+    fun createSessionIn(cwd: String?) {
+        openNewTaskDraft(cwd)
+    }
+
+    fun appendStreamMessage(m: MobileMessage) {
+        // 仅 SSE 流式新增的消息带入场动画；历史/全量刷新（messages = msgs 整体替换）不带，
+        // 避免会话切换、tab 切回、首屏加载时整列重放进场动画
+        messages = messages + m.copy(entrance = true)
+        followIfNearBottom()
+    }
+
+    fun updateStreamMessage(id: String, transform: (MobileMessage) -> MobileMessage) {
+        val i = messages.indexOfFirst { it.id == id }
+        if (i >= 0) {
+            messages = messages.toMutableList().apply { this[i] = transform(this[i]) }
+            // 流式变长：贴底时只轻推溢出，避免每个 delta 都重跑整段尾部定位
+            if (viewMode == "chat" && (stickToBottom || isNearBottom())) {
+                stickToBottom = true
+                showScrollToBottom = false
+                scope.launch {
+                    try {
+                        withFrameNanos { }
+                        val info = listState.layoutInfo
+                        val last = info.visibleItemsInfo.lastOrNull() ?: return@launch
+                        val overflow = (last.offset + last.size) - (info.viewportEndOffset - info.afterContentPadding)
+                        if (overflow > 0) listState.scrollBy(overflow.toFloat())
+                    } catch (_: Exception) { }
+                }
+            }
+        }
+    }
+
+    fun applyApprovalDecision(approvalId: String, outcome: String, seq: Long, time: Long) {
+        if (approvalId.isBlank()) return
+        val status = approvalUiStatus(outcome)
+        val existing = (olderMessages + messages).firstOrNull { it.approvalId == approvalId || it.id == "approval-$approvalId" }
+        if (existing != null) {
+            updateStreamMessage(existing.id) { applyRequestState(it, status, outcome) }
+            olderMessages = olderMessages.map { msg ->
+                if (msg.approvalId == approvalId || msg.id == existing.id) applyRequestState(msg, status, outcome) else msg
+            }
+        } else {
+            appendStreamMessage(
+                MobileMessage(
+                    id = "approval-$approvalId",
+                    role = "approval",
+                    text = L.approvalRequest.format(L.toolFallbackName),
+                    approvalId = approvalId,
+                    time = time,
+                    type = "approval",
+                    seq = seq,
+                    requestStatus = status,
+                    outcome = outcome,
+                ),
+            )
+        }
+    }
+
+    fun upsertStreamMessage(m: MobileMessage) {
+        val i = messages.indexOfFirst { it.id == m.id }
+        if (i >= 0) {
+            updateStreamMessage(m.id) { cur -> m.copy(entrance = cur.entrance) }
+            followIfNearBottom()
+            return
+        }
+        messages = messages.filterNot { pending ->
+            pending.id == "local-pending" && pending.role == "user" && pending.text == m.text
+        }
+        appendStreamMessage(m)
+    }
+
+    fun handleStreamChunk(item: SessionStreamClient.Item.Message) =
+        applyStreamChunk(item, messages, ::appendStreamMessage, ::updateStreamMessage, streamToolCallIds, toolCallTimes)
+
+    fun handleStreamMessage(item: SessionStreamClient.Item.Message) {
+        val data = item.data
+        when (item.type) {
+            "turn/start" -> {
+                liveRunning = true; workspaceViewModel.sessionControl.refreshQueue()
+                stoppedReason = null
+            }
+            "turn/end" -> {
+                liveRunning = false
+                // 定稿在途消息的 running，避免历史合并后长期卡住导致复制按钮不出现
+                messages = messages.map { if (it.running == true) it.copy(running = false) else it }
+                val kind = data.optJSONObject("reason")?.optNullableString("kind")
+                stoppedReason = parseStoppedReason(kind)
+                scope.launch(Dispatchers.IO) {
+                    refreshSessions()
+                    withContext(Dispatchers.Main) { refreshMessages(autoScroll = false) }
+                }
+            }
+            "user/message" -> {
+                val text = (data.optJSONArray("content") ?: org.json.JSONArray()).let { arr ->
+                    (0 until arr.length()).joinToString("") { i ->
+                        arr.optJSONObject(i)?.optString("text").orEmpty()
+                    }
+                }
+                val kind = resolvedMessageKind("user", null, text) // 实时流没有插件 kind，同规则兜底
+                val role = legacyRoleForKind(kind)
+                upsertStreamMessage(
+                    MobileMessage(
+                        id = "msg-${item.seq}",
+                        role = role,
+                        kind = kind,
+                        text = text,
+                        time = item.time,
+                        type = "text",
+                        seq = item.seq,
+                    ),
+                )
+            }
+            "assistant/chunk" -> handleStreamChunk(item)
+            "assistant/message" -> {
+                val content = data.optJSONObject("message")?.optJSONArray("content") ?: return
+                for (i in 0 until content.length()) {
+                    val block = content.optJSONObject(i) ?: continue
+                    val blockType = block.optString("type")
+                    if (blockType != "text") {
+                        // 澄清卡/结构化块等：先打日志，便于补协议；勿静默丢弃无痕迹
+                        Log.i("WorkspaceActivity", "assistant/message unhandled block type=$blockType keys=${block.keys().asSequence().toList()}")
+                        continue
+                    }
+                    val text = block.optString("text").trim()
+                    if (text.isEmpty()) continue
+                    // 优先定稿已有的流式气泡，避免再 append 出第二句
+                    val streamId = messages.indexOfLast {
+                        it.role == "assistant" && it.id.startsWith("msg-stream-")
+                    }.takeIf { it >= 0 }?.let { messages[it].id }
+                    if (streamId != null) {
+                        updateStreamMessage(streamId) {
+                            it.copy(text = text.ifBlank { it.text }, running = false, entrance = it.entrance)
+                        }
+                        continue
+                    }
+                    val lastAssist = messages.lastOrNull { it.role == "assistant" }
+                    if (lastAssist != null && (lastAssist.text == text || text.startsWith(lastAssist.text) || lastAssist.text.startsWith(text.take(32)))) {
+                        updateStreamMessage(lastAssist.id) { it.copy(text = text.ifBlank { it.text }, running = false) }
+                        continue
+                    }
+                    appendStreamMessage(
+                        MobileMessage(
+                            id = "msg-${item.seq}-$i",
+                            role = "assistant",
+                            text = text,
+                            time = item.time,
+                            type = "text",
+                        ),
+                    )
+                }
+            }
+            "tool/call" -> {
+                val callId = data.optString("callId")
+                val streamId = streamToolCallIds.entries.firstOrNull { it.value == callId }?.key
+                if (streamId != null) {
+                    updateStreamMessage(streamId) {
+                        it.copy(
+                            toolName = data.optString("name").ifBlank { it.toolName },
+                            toolArgs = data.optString("arguments").ifBlank { it.toolArgs },
+                            running = false,
+                        )
+                    }
+                } else {
+                    appendStreamMessage(MobileMessage(id = "tool-${item.seq}", role = "tool_call", text = "",
+                        toolName = data.optString("name"), toolArgs = data.optString("arguments"), time = item.time, type = "tool_call"))
+                }
+                toolCallTimes[callId] = item.time
+            }
+            "tool/result" -> {
+                val message = data.optJSONObject("message")
+                val callId = message?.optJSONObject("source")?.optString("callId")
+                val start = callId?.let { toolCallTimes[it] }
+                val content = (message?.optJSONArray("content") ?: org.json.JSONArray()).let { arr ->
+                    (0 until arr.length()).joinToString("\n") { i ->
+                        val b = arr.optJSONObject(i)
+                        val t = b?.optString("text")
+                        if (!t.isNullOrBlank()) t else b?.toString().orEmpty()
+                    }
+                }
+                appendStreamMessage(MobileMessage(id = "tool-res-${item.seq}", role = "tool_result", text = content,
+                    time = item.time, type = "tool_result",
+                    durationMs = if (start != null && item.time > start) item.time - start else null))
+            }
+            "workspace/changes" -> scope.fetchLiveWorkspaceChanges(client, currentSessionId, item.seq, item.time, { it == currentSessionId }) {
+                upsertStreamMessage(it)
+            }
+            "todo/write" -> {
+                val todosArr = data.optJSONArray("todos") ?: return
+                val todos = (0 until todosArr.length()).map { j ->
+                    val t = todosArr.getJSONObject(j)
+                    MobileTodoItem(t.optString("content", ""), t.optString("status", "pending"))
+                }
+                appendStreamMessage(MobileMessage(id = "todo-${item.seq}", role = "todo", text = "", todos = todos, time = item.time, type = "todo"))
+            }
+            "goal/write" -> {
+                val goalText = data.optString("text").ifBlank { data.optString("goal") }.trim()
+                if (goalText.isBlank()) return
+                val sid = currentSessionId ?: return
+                val lastGoalIdx = messages.indexOfLast { it.role == "goal" && it.id.startsWith("goal-$sid-") }
+                if (lastGoalIdx >= 0) {
+                    updateStreamMessage(messages[lastGoalIdx].id) {
+                        it.copy(text = goalText, goalSummary = goalText, time = item.time)
+                    }
+                } else {
+                    appendStreamMessage(MobileMessage(
+                        id = "goal-$sid-${item.seq}",
+                        role = "goal",
+                        text = goalText,
+                        goalSummary = goalText,
+                        time = item.time,
+                        type = "goal",
+                    ))
+                }
+                // 同步刷新侧栏 / 顶栏的 goal 缓存
+                workspaceViewModel.recomputeGoalSummaries()
+            }
+            "approval/asked" -> {
+                val approvalId = data.optString("id", "")
+                appendStreamMessage(MobileMessage(
+                    id = "approval-${approvalId.ifBlank { item.seq.toString() }}",
+                    role = "approval",
+                    text = data.optString("reason").ifBlank { L.approvalRequest.format(data.optString("toolName", L.toolFallbackName)) },
+                    toolName = data.optString("toolName", "tool"),
+                    approvalId = approvalId,
+                    callId = data.optNullableString("callId"),
+                    time = item.time,
+                    type = "approval",
+                    seq = item.seq,
+                    requestStatus = REQUEST_PENDING,
+                ))
+                workspaceViewModel.refreshRequestSnapshot()
+                val sid = currentSessionId
+                if (!isForeground && sid != null) {
+                    DshNotifier.notifyApproval(context, host, sid, data.optString("toolName", L.toolFallbackName))
+                }
+            }
+            "approval/decided" -> {
+                val approvalId = data.optString("id", "")
+                val outcome = data.optString("outcome").ifBlank { data.optString("decision") }.ifBlank { data.optString("result") }
+                applyApprovalDecision(approvalId, outcome, item.seq, item.time)
+                currentSessionId?.let { DshNotifier.cancelApproval(context, host, it) }
+            }
+            "compaction/start" -> {
+                appendStreamMessage(MobileMessage(id = "compact-${item.seq}", role = "compaction", text = "", running = true, time = item.time, type = "compaction"))
+            }
+            "compaction/summary" -> {
+                val summaryText = (data.optJSONArray("summary") ?: org.json.JSONArray()).let { arr ->
+                    (0 until arr.length()).joinToString("\n") { i -> arr.optJSONObject(i)?.optString("text").orEmpty() }
+                }.trim()
+                val lastIndex = messages.indexOfLast { it.role == "compaction" }
+                if (lastIndex >= 0) {
+                    updateStreamMessage(messages[lastIndex].id) { it.copy(text = summaryText, running = false) }
+                } else {
+                    appendStreamMessage(MobileMessage(id = "compact-${item.seq}", role = "compaction", text = summaryText, running = false, time = item.time, type = "compaction"))
+                }
+            }
+            "compaction/end" -> {
+                val lastIndex = messages.indexOfLast { it.role == "compaction" }
+                if (lastIndex >= 0) {
+                    updateStreamMessage(messages[lastIndex].id) { it.copy(running = false) }
+                }
+            }
+            else -> {
+                // 澄清卡 / inbox 等未适配事件：打类型与顶层 key，便于对照 Web
+                val keys = data.keys().asSequence().toList()
+                Log.i("SessionStream", "unhandled type=${item.type} seq=${item.seq} keys=$keys")
+            }
+        }
+    }
+
+    /** assistant/chunk 增量块：delta 追加到 (turn,index) 流式消息，block-end 定稿（权威全文）。 */
+    fun applyStreamItem(item: SessionStreamClient.Item) {
+        when (item) {
+            is SessionStreamClient.Item.Ready -> {
+                lastStreamEventAt = System.currentTimeMillis()
+                workspaceViewModel.refreshRequestSnapshot()
+                // 服务端 stream 游标领先本地 history 标记时补一次全量（多设备/重启）
+                if (seedMaxSeq > 0 && item.resumeSeq > seedMaxSeq) {
+                    refreshMessages(autoScroll = true)
+                }
+            }
+            // 断线不在此狂刷 history：ON_STOP/重连 finally 都会发 Disconnected，
+            // 交给下方「SSE 未就绪时」的 2s 轮询兜底，避免风暴 + 后台 binder 流量。
+            is SessionStreamClient.Item.Disconnected -> {}
+            is SessionStreamClient.Item.Stats -> {
+                lastStreamEventAt = System.currentTimeMillis()
+                sessionStats = parseMobileSessionStats(item.projections).also { workspaceViewModel.sessionControl.applyProjections(item.projections) }
+            }
+            is SessionStreamClient.Item.Question -> {
+                val questionsArr = item.data.optJSONArray("questions") ?: org.json.JSONArray()
+                val parsed = parseClarifyingQuestions(questionsArr)
+                val options = parsed.firstOrNull()?.options?.map { it.label }.orEmpty()
+                val text = questionSummaryText(parsed, L.approvalQuestion)
+                val header = parsed.firstOrNull()?.header?.takeIf { it.isNotBlank() }
+                messages = messages.filterNot { it.role == "question" && it.questionRpcId == item.rpcId }
+                appendStreamMessage(
+                    MobileMessage(
+                        id = "question-${item.rpcId}",
+                        role = "question",
+                        text = text,
+                        time = System.currentTimeMillis(),
+                        type = "question",
+                        questionRpcId = item.rpcId,
+                        questionOptions = options,
+                        questionHeader = header,
+                        questionPayloadJson = questionsArr.toString(),
+                        entrance = true,
+                        requestStatus = REQUEST_PENDING,
+                    ),
+                )
+                followIfNearBottom()
+            }
+            is SessionStreamClient.Item.QuestionResolved -> {
+                messages = messages.map { msg ->
+                    if (msg.role == "question" && msg.questionRpcId == item.rpcId) {
+                        applyRequestState(msg, REQUEST_RESOLVED, item.outcome)
+                    } else msg
+                }
+            }
+            is SessionStreamClient.Item.ResyncRequired -> {
+                val now = System.currentTimeMillis()
+                if (now - lastResyncAt < 2_000L) return
+                lastResyncAt = now
+                olderMessages = emptyList()
+                hasMoreMessages = false
+                nextBeforeSeq = null
+                workspaceViewModel.bumpHistoryGeneration()
+                streamClient?.pauseForResync()
+                refreshMessages(autoScroll = false, replaceInFlight = true)
+            }
+            is SessionStreamClient.Item.Message -> {
+                lastStreamEventAt = System.currentTimeMillis()
+                handleStreamMessage(item)
+                streamClient?.noteCommittedSeq(item.seq)
+            }
+        }
+    }
+
+    // S1：冷启动先铺本地缓存；变化后写回（VM 内 2 秒防抖）。
+    SessionListCacheEffects(
+        host = host,
+        viewModel = workspaceViewModel,
+        sessions = sessions,
+        workspaceCatalogItems = workspaceCatalogItems,
+        archivedIds = archivedIds,
+        applyWorkspaceCatalog = ::applyWorkspaceCatalog,
+        setArchivedIds = { localStore.setArchivedSessionIds(it) },
+    )
+
+    LaunchedEffect(host) {
+        // 冷启动：bootstrap（会话/归档）+ 工作区目录；S2 全程立标志供 ON_RESUME 去重。
+        coldStartSyncing.value = true
+        val outcome = workspaceViewModel.runColdStartBootstrap(
+            host = host,
+            context = context,
+            restoreSessionId = restoreSessionId,
+            composeNewSession = composeNewSession,
+            onAuthExpired = { onAuthExpired(it) },
+        )
+        if (outcome == ColdStartOutcome.AuthExpired) {
+            coldStartSyncing.value = false
+            return@LaunchedEffect
+        }
+        try {
+            val catalog = withContext(Dispatchers.IO) { client.getWorkspaces() }
+            applyWorkspaceCatalog(catalog)
+            workspacesLoadError = null
+            workspacesInitialLoad = false
+            // bootstrap + 工作区目录都拿到了：回前台 10 秒内不再重复刷新。
+            coldStartSync.longValue = System.currentTimeMillis()
+        } catch (e: Exception) {
+            if (isMobileAuthFailure(e)) {
+                onAuthExpired(e)
+                coldStartSyncing.value = false
+                return@LaunchedEffect
+            }
+            workspacesInitialLoad = false
+            if (workspaceCatalogItems.isEmpty()) {
+                workspacesLoadError = e.message?.takeIf { it.isNotBlank() } ?: L.loadWorkspaceListFailed
+            }
+        }
+        if (outcome == ColdStartOutcome.BootstrapFailed) refreshSessions(selectLatest = true)
+        refreshAppSettings()
+        coldStartSyncing.value = false
+    }
+
+    LaunchedEffect(currentSessionId, chatVisible) {
+        // WI-R2：代际去重与 history 任务归 VM；旧流由 acquireStream 切换时停止，
+        // 这里不再对新流做 stop（避免把新会话的连接打断再重连）
+        workspaceViewModel.bumpHistoryGeneration()
+        currentSessionId?.let { DshNotifier.cancelForSession(context, host, it) }
+        // S6：停在首页（对话页不可见）时不加载历史 / 模型、不建推送流；进入对话页再开始。
+        if (!chatVisible) {
+            workspaceViewModel.releaseStream()
+            return@LaunchedEffect
+        }
+        if (currentSessionId == null) {
+            // 切到「无会话」：显式释放 VM 持有的旧流，避免为过期会话维持连接
+            workspaceViewModel.releaseStream()
+            messages = emptyList()
+            olderMessages = emptyList()
+            hasMoreMessages = false
+            nextBeforeSeq = null
+            stoppedReason = null
+            liveRunning = false
+            seedMaxSeq = 0L
+            sessionStats = null
+            historyLoadError = null
+            toolCallTimes.clear()
+            streamToolCallIds.clear()
+            showScrollToBottom = false
+            stickToBottom = true
+            modelCatalog = null
+            modelCatalogError = null
+            // 切换会话时清空旧目标摘要
+            workspaceViewModel.currentGoalSummary.value = null
+            return@LaunchedEffect
+        }
+        val preserveMessages = currentSessionId == preserveMessagesSessionId
+        if (preserveMessages) preserveMessagesSessionId = null
+        // WI-003：会话切换必须清空上一会话的消息/分页/临时加载状态，
+        // 避免旧列表短暂残留或位置继承
+        if (!preserveMessages) {
+            messages = emptyList()
+            olderMessages = emptyList()
+            hasMoreMessages = false
+            nextBeforeSeq = null
+            stoppedReason = null
+            liveRunning = false
+            seedMaxSeq = 0L
+            toolCallTimes.clear()
+            streamToolCallIds.clear()
+            showScrollToBottom = false
+            stickToBottom = true
+            isLoadingOlder = false
+            loadOlderFailed = false
+            initialLoadInFlight = false
+            historyLoadError = null
+            modelCatalog = null
+            modelCatalogError = null
+            tailRequestId++
+        }
+        // 首屏 history（含本地快照被网络结果接管）到达且有变化时仍走贴底跟随：
+        // 首个尾部请求可能已超时，或快照之后网络又追加了新消息。
+        // followIfNearBottom 只在 stickToBottom / 贴底时生效，用户已上翻则不强拉。
+        refreshMessages(autoScroll = true)
+        refreshModels()
+        // SSE 实时流：订阅事件，增量更新消息列表。
+        // 流由 VM 持有（viewModelScope）：Activity 重建时组合虽销毁、流与游标仍在，
+        // 新组合重新挂上收集器即可；生命周期的 ON_STOP/ON_START 负责前后台启停。
+        val client = streamClient ?: return@LaunchedEffect
+        client.start()
+        client.items.forEachCoalesced(apply = ::applyStreamItem)
+    }
+
+    // WI-003：尾部定位必须在 Compose 提交新数据并完成布局之后执行。
+    // 注意：不要把 messages 放进 key——流式追加会反复取消本 effect，导致
+    // 「coroutine scope left the composition」且发送后看不到贴底。
+    LaunchedEffect(listState, tailRequestId) {
+        if (tailRequestId == 0 || tailRequestId == lastTailRequestId) return@LaunchedEffect
+        lastTailRequestId = tailRequestId
+        try {
+            // 不能只看 totalItemsCount > 0：messages 刚提交时 layoutInfo 仍是上一帧
+            // （加载骨架 1 项），按它 scrollToItem 会落到新列表顶部（「加载更早」行）。
+            // positionAtTail 先等一次完整布局再对齐，并在头部条目晚插入时复核。
+            listState.positionAtTail(hasContent = { messages.isNotEmpty() })
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            // 被更新的尾部请求取代 / 离开组合：正常路径，不记失败
+            throw e
+        } catch (e: Exception) {
+            Log.w("WorkspaceActivity", "tail position request-$tailRequestId failed: ${e.message}")
+        }
+    }
+
+    // 键盘顶起：只走 LazyColumn onSizeChanged 按变矮像素 scrollBy（一条路径，避免与
+    // IME inset 双补偿导致不跟手）。stickToBottom 时才上推。
+    // （IME inset 本身仍通过 bottom chrome 的 imePadding 抬起输入区。）
+
+    // 滚动中一旦离开底部立即清 stick，避免「还在上滑、stick 仍为 true」被轮询跟滚抢走
+    LaunchedEffect(listState, currentSessionId) {
+        snapshotFlow { listState.isScrollInProgress to isNearBottom() }
+            .collect { (scrolling, near) ->
+                if (scrolling) {
+                    if (!near) {
+                        stickToBottom = false
+                        if (messages.isNotEmpty()) showScrollToBottom = true
+                    }
+                } else {
+                    stickToBottom = near
+                    if (near) showScrollToBottom = false
+                }
+            }
+    }
+
+    // 前台轮询（WI-R2/R5 重构）：
+    // - SSE 未就绪：2s 拉会话 + 工作区 + 消息（回退路径）
+    // - SSE 已连接：会话探针单飞；工作区目录降频到 ~10s（会话快照已含
+    //   archivedSessionIds，归档同步不依赖 getWorkspaces 的 2s 高频轮询），
+    //   updatedAt 前进且非流式生成中时才补 history，执行中完全交给 SSE
+    // - 后台暂停，防止 excessive binder traffic；单飞/代际去重全部在 VM
+    // - 新会话编辑态也继续拉列表，保证 Web 端增删能同步到侧栏
+    LaunchedEffect(currentSessionId) {
+        var pollTick = 0
+        while (true) {
+            delay(2000)
+            pollTick++
+            val sid = currentSessionId
+            if (!isForeground) continue
+            val streamClientRef = streamClient
+            val streamReady = streamClientRef != null && streamClientRef.isConnected && streamClientRef.isSeeded
+            // Web delete/archive is represented only by workspace.archivedSessionIds;
+            // session.list intentionally keeps the underlying session log.
+            // R5：流健康时工作区目录每 5 拍（≈10s）一次，其余拍交给会话快照
+            if (!streamReady || pollTick % 5 == 0) refreshWorkspaces()
+            if (sid == null) {
+                refreshSessions(reportFailure = false)
+                continue
+            }
+            if (!streamReady) {
+                refreshSessions(reportFailure = false)
+                refreshMessages(autoScroll = true)
+                continue
+            }
+            // 看门狗：执行中 SSE 看似健康却静默超过 12s——可能是半开连接，或游标
+            // 停在错误编号空间导致事件全被去重丢弃（实机曾见 maxSeq≫stream seq）。
+            // 强制 resync（清游标 + 从历史页重播种）并刷新消息，避免视图冻结到重进会话。
+            val busyNow = liveRunning || isSending || (sessions.find { it.sessionId == sid }?.running == true)
+            if (busyNow && lastStreamEventAt > 0 && System.currentTimeMillis() - lastStreamEventAt > 12_000) {
+                Log.w("WorkspaceActivity", "stream watchdog: running but silent ${System.currentTimeMillis() - lastStreamEventAt}ms sid=${sid.take(8)}, forcing resync")
+                lastStreamEventAt = System.currentTimeMillis()
+                streamClientRef.pauseForResync()
+                refreshMessages(autoScroll = true)
+                continue
+            }
+            // 执行中仍刷新会话列表（running 标记）；history 交给 SSE，避免盖掉在途块
+            if (liveRunning || isSending) {
+                refreshSessions(reportFailure = false)
+                continue
+            }
+            val prevUpdated = sessions.find { it.sessionId == sid }?.updatedAt ?: 0L
+            // 探针在 VM 内单飞：在途时跳过本拍，慢链路不会排队
+            workspaceViewModel.probeSessions(sid) { snapshot ->
+                if (currentSessionId != sid) return@probeSessions
+                val selectedSessionId = applySessionSnapshot(snapshot)
+                if (selectedSessionId != sid) return@probeSessions
+                val nextUpdated = snapshot.sessions.find { it.sessionId == sid }?.updatedAt ?: 0L
+                if (nextUpdated > prevUpdated && !liveRunning && !isSending) {
+                    refreshMessages(autoScroll = true)
+                }
+            }
+        }
+    }
+
+    val currentSession = sessions.find { it.sessionId == currentSessionId }
+    val running = liveRunning || currentSession?.running == true
+    SessionMonitorActivation(host, currentSessionId, currentSession?.title.orEmpty(), running, currentSession?.awaitingInput == true, streamClient)
+    val activeHarnessPresetId = if (currentSessionId == null) {
+        pendingAgentPreset
+    } else {
+        currentSession?.agentPreset
+    }
+    val harnessLabel = remember(agentPresets, activeHarnessPresetId, appSettings.agentPreset) {
+        resolveHarnessLabel(agentPresets, activeHarnessPresetId, appSettings.agentPreset, L.defaultHarnessPreset)
+    }
+    // 输入条模型座内容（名称 + 推理等级拆开，DSH ModelSelect 同构）；
+    // 新会话看 pendingModel，已开聊只看该会话的目录（pending 不得跨会话泄到已有会话上）。
+    // 草稿态目录重置后（N2）座位先回落到全局默认模型，目录回来再刷新。
+    val inputModelSeat = remember(
+        pendingModel,
+        modelCatalog,
+        currentSessionId,
+        composeNewSession,
+        appSettings.defaultModel,
+        appSettings.defaultReasoningEffort,
+    ) {
+        composerModelSeatOrDefault(
+            catalog = modelCatalog,
+            pending = pendingModel.takeIf { currentSessionId == null },
+            defaultModel = appSettings.defaultModel,
+            defaultEffort = appSettings.defaultReasoningEffort,
+        )
+    }
+    // 草稿画布的「继续上次」：最近更新的一条会话（不含草稿本身）。
+    val draftLastTask = remember(sessions, composeNewSession) {
+        if (!composeNewSession) {
+            null
+        } else {
+            sessions.maxByOrNull { sessionMillis(it.updatedAt) }?.let { last ->
+                DraftLastTask(
+                    sessionId = last.sessionId,
+                    title = displaySessionTitle(last.title),
+                    workspaceLabel = last.cwd?.trimEnd('/')?.substringAfterLast('/')?.takeIf { it.isNotBlank() },
+                )
+            }
+        }
+    }
+    val activeSubagentCount = remember(sessions, currentSessionId, currentSession) {
+        resolveActiveSubagentCount(sessions, currentSessionId, currentSession?.subagentCount)
+    }
+
+    // 会话结束通知（仅后台；正常完成 → 任务完成，非正常 → 已停止）
+    var wasRunning by remember { mutableStateOf(false) }
+    LaunchedEffect(running) {
+        val sid = currentSessionId
+        if (!running && wasRunning && !isForeground && sid != null) {
+            val title = currentSession?.title?.let(::displaySessionTitle) ?: L.sessionFallbackTitle
+            val failReason = parseStoppedReason(stoppedReason)
+            if (failReason == null) {
+                DshNotifier.notifyTaskDone(context, host, sid, title)
+            } else {
+                DshNotifier.notifyTaskFailed(context, host, sid, title, failReason)
+            }
+        }
+        wasRunning = running
+    }
+
+    // 正在执行时的计时器（从 running 变 true 起算）
+    var turnStartTime by remember { mutableStateOf(0L) }
+    LaunchedEffect(running) {
+        if (running) turnStartTime = System.currentTimeMillis()
+        if (!running) {
+            elapsedSec = 0L
+            return@LaunchedEffect
+        }
+        while (true) {
+            delay(1000)
+            elapsedSec = (System.currentTimeMillis() - turnStartTime) / 1000
+        }
+    }
+
+    // ===== 整体框架：宽屏常驻侧栏；手机/Medium 是会话列表 → 聊天的返回栈 =====
+    // （布局 / displayDest / showSessionHome 已在文件前部推导，S6 起 chatVisible 供预加载判断。）
+    val changesProgress by changesPanel.progress.asState()
+    val navMotionMs = motionDuration(DshDuration.slow)
+    var sidebarCollapsed by remember { mutableStateOf(false) }
+    // 归档撤销 Snackbar + 下拉刷新/输入区测量状态。
+    // Snackbar 宿主在根 Box（DshAdaptiveShell 之外）——抽屉打开时仍可见可点（遮罩之上）；
+    // 底部让位用输入区实际 top 计算，键盘弹起时自动跟随。
+    val snackbarHostState = remember { SnackbarHostState() }
+    var rootHeightPx by remember { mutableStateOf(0) }
+    var composerTopPx by remember { mutableStateOf(-1f) }
+    var historyRefreshing by remember { mutableStateOf(false) }
+
+    fun showArchiveUndo(sessionId: String) {
+        scope.launch {
+            val result = snackbarHostState.showSnackbar(
+                message = L.sessionArchivedToast,
+                actionLabel = L.undoAction,
+            )
+            if (result == SnackbarResult.ActionPerformed) {
+                // 服务端无 unarchive：走设置页同一套本地恢复通路
+                // （restoredSessionIds 会豁免 archivedSessionIds 同步过滤，见 applySessionSnapshot）
+                localStore.restoreSession(sessionId)
+                refreshSessions()
+            }
+        }
+    }
+
+    var showShareSheet by remember { mutableStateOf(false) }
+    val sidebarActions = WorkspaceSidebarActions(
+        onOpenDevice = { onOpenDevice(null) },
+        onNewSession = { openNewTaskDraft() },
+        onSelectSession = { sid ->
+            selectSession(sid)
+            showPhoneChat()
+        },
+        onRenameSession = { openRename(it) },
+        onArchiveSession = { session ->
+            archiveSessionNow(session) { err ->
+                if (err == null) {
+                    showArchiveUndo(session.sessionId)
+                } else {
+                    sessionsLoadError = err
+                }
+            }
+        },
+        onDeleteSession = { openDeleteSession(it) },
+        onForkSession = { forkNow(it, closeDrawer = true) },
+        onCreateSessionIn = { createSessionIn(it) },
+        onDeleteWorkspace = { openDeleteWorkspace(it) },
+        onShareSession = { sid -> selectSession(sid); showPhoneChat(); showShareSheet = true },
+        onToggleSearch = {
+            sidebarSearchOpen = !sidebarSearchOpen
+            if (!sidebarSearchOpen && searchQuery.isBlank()) {
+                searchResults = emptyList()
+                searchState = SearchUiState.Idle
+            }
+        },
+        onSearchQueryChange = { q ->
+            searchQuery = q
+            localStore.historyQuery = q
+            runSearchDebounced(q)
+        },
+        onClearSearch = {
+            searchQuery = ""
+            localStore.historyQuery = ""
+            searchResults = emptyList()
+            searchState = SearchUiState.Idle
+        },
+        onRetrySearch = { runSearchDebounced(searchQuery) },
+        onRetrySessions = { refreshSessions() },
+        onAddWorkspace = { showAddWorkspace = true },
+        onOpenSettings = onOpenSettings,
+    )
+
+    // 首页顶栏连接状态（稿 01/08）：首页没有会话 SSE，在线与延迟只能来自 30s 一次的健康探测；
+    // 探测不到就按离线显示，并用 LastOnlineStore 的时间戳写「离线 · N 分钟前在线」。
+    var hostReachable by remember(host) { mutableStateOf(true) }
+    LaunchedEffect(host) {
+        // R4：连续 2 次失败才判离线、失败后快速重探；回前台 / 网络变化 / 「重试」会唤醒它立即探测。
+        runReachabilityLoop(host) { online, ms ->
+            hostReachable = online
+            dev.deeplinks.native.util.HostConnectivity.update(online, dev.deeplinks.core.HostHttp.isViaRemote(host), ms)
+            if (online) LastOnlineStore.record(context)
+        }
+    }
+    val offlineSinceLabel = if (hostReachable) null else dev.deeplinks.native.util.lastOnlineLabel(LastOnlineStore.read(context))
+
+    // 首页审批卡（D1-A）：只给手机接管的审批按钮；takenOverByPhone 见 MobileMessage 注释。
+    // 首页收件箱（2.1）：当前会话里手机能处理的审批 / 提问，与对话页决策栏同一条规则
+    val homePendingApproval = remember(messages, currentSessionId) { currentSessionId?.let { pendingDecision(messages) } }
+    // 发送主体：新任务面板与输入卡共用同一条路径（原先内联在对话页分支里）。
+    var submitComposer: () -> Unit = {}
+            submitComposer = {
+                val rawText = inputText.trim()
+                    val images = pendingImages
+                    if ((rawText.isNotBlank() || images.isNotEmpty()) && !isSending) {
+                        // DSH 里 plan / goal 是 `/plan` `/goal` 命令（命令面板里可选），
+                        // 不是输入条上的模式开关，所以这里不再自动加前缀。
+                        val textToSend = rawText
+                        val startedOnSession = currentSessionId
+                        var sendOwnerId = startedOnSession
+                        val createCwd = pendingSessionCwd ?: workspacePrefs.lastSelectedWorkspace
+                        val createWsId = workspaceCatalogItems.firstOrNull {
+                            normalizeWorkspacePath(it.path) == createCwd?.let(::normalizeWorkspacePath) &&
+                                it.workspaceId.isNotBlank()
+                        }?.workspaceId
+                        val draftText = inputText
+                        val draftImages = pendingImages
+                        workspacePrefs.parkedSend = parkSendForPersistence(
+                            ParkedSend(
+                                slotKey = host.slotKey,
+                                sessionId = startedOnSession,
+                                text = draftText,
+                                images = draftImages,
+                            ),
+                        )
+                        composerActionError = null
+                        isSending = true
+                        stoppedReason = null
+                        liveRunning = true
+                        inputText = ""
+                        pendingImages = emptyList()
+                        if (textToSend.isNotBlank()) {
+                            messages = messages.filterNot { it.id == "local-pending" }
+                            appendStreamMessage(
+                                MobileMessage(
+                                    id = "local-pending",
+                                    role = "user",
+                                    text = textToSend,
+                                    time = System.currentTimeMillis(),
+                                    type = "text",
+                                ),
+                            )
+                            // 用户主动发送：强制贴底，不看是否已上翻
+                            followIfNearBottom(force = true)
+                        }
+                        scope.launch(Dispatchers.IO) {
+                            try {
+                                var sid = startedOnSession
+                                val createdNow = sid == null
+                                if (sid == null) {
+                                    sid = client.createSession(
+                                        agentPreset = pendingAgentPreset,
+                                        cwd = createCwd,
+                                        workspaceId = createWsId,
+                                    )
+                                    pendingModel?.let { (provider, model, effort) ->
+                                        client.selectModel(sid, provider, model, effort)
+                                    } ?: run {
+                                        val provider = appSettings.defaultModelProvider
+                                        val model = appSettings.defaultModel
+                                        if (!provider.isNullOrBlank() && !model.isNullOrBlank()) {
+                                            client.selectModel(sid, provider, model, appSettings.defaultReasoningEffort)
+                                        }
+                                    }
+                                }
+                                if (sid != startedOnSession) {
+                                    sendOwnerId = sid
+                                    workspacePrefs.parkedSend = parkSendForPersistence(
+                                        ParkedSend(
+                                            slotKey = host.slotKey,
+                                            sessionId = sid,
+                                            text = draftText,
+                                            images = draftImages,
+                                        ),
+                                    )
+                                }
+                                val stillFocused = withContext(Dispatchers.Main) {
+                                    if (createdNow) {
+                                        // 创建期间用户已切到其它会话：不抢焦点、不发 prompt
+                                        if (currentSessionId != null && currentSessionId != sid) {
+                                            false
+                                        } else {
+                                            val createdId = sid
+                                            preserveMessagesSessionId = createdId
+                                            switchComposer(createdId, composingNew = false)
+                                            if (!createWsId.isNullOrBlank()) {
+                                                workspaceCatalogItems = workspaceCatalogItems.map { ws ->
+                                                    if (ws.workspaceId == createWsId && createdId !in ws.sessionIds) {
+                                                        ws.copy(sessionIds = ws.sessionIds + createdId)
+                                                    } else ws
+                                                }
+                                            }
+                                            refreshSessions()
+                                            refreshWorkspaces()
+                                            refreshModels()
+                                            true
+                                        }
+                                    } else {
+                                        currentSessionId == sid
+                                    }
+                                }
+                                if (!stillFocused) {
+                                    withContext(Dispatchers.Main) {
+                                        messages = messages.filterNot { it.id == "local-pending" }
+                                        liveRunning = sessions.any { it.sessionId == currentSessionId && it.running }
+                                        restoreComposerToOwner(composerDraftKey(sid), ComposerDraft(draftText, draftImages))
+                                        composerActionError = L.sendFailed.format(L.switchedSessionNotSent)
+                                    }
+                                    return@launch
+                                }
+                                val promptMode = resolvePromptMode(!createdNow && running, appSettings.busyEnter)
+                                client.sendPrompt(sid, textToSend, mode = promptMode, images = images)
+                                withContext(Dispatchers.Main) {
+                                    refreshSessions(); if (promptMode == "queue" && running) workspaceViewModel.sessionControl.refreshQueue()
+                                    // SSE 已连接时由流增量更新；立刻全量 refresh 容易在服务端
+                                    // 尚未写入 history 时冲掉 local-pending，造成「已发送但本机空白」
+                                    if (streamClient?.isConnected != true) {
+                                        refreshMessages(autoScroll = true)
+                                    } else {
+                                        followIfNearBottom(force = true)
+                                    }
+                                }
+                            } catch (e: Exception) {
+                                withContext(Dispatchers.Main) {
+                                    messages = messages.filterNot { it.id == "local-pending" }
+                                    restoreComposerToOwner(
+                                        composerDraftKey(sendOwnerId),
+                                        ComposerDraft(draftText, draftImages),
+                                    )
+                                    // 发送失败：若尚未真正进入 turn，收回乐观 running
+                                    if (currentSession?.running != true) liveRunning = false
+                                    composerActionError = L.sendFailed.format(e.message ?: L.unknownError)
+                                }
+                            } finally {
+                                withContext(Dispatchers.Main) {
+                                    workspacePrefs.parkedSend = null
+                                    isSending = false
+                                }
+                            }
+                        }
+                    }
+                }
+
+    // 空态起手式（W4）：带着那句话去开新任务，而不是丢掉参数只开面板。
+    val onPickStarter: (String) -> Unit = { text -> openNewTaskDraft(prefill = text) }
+
+    // 根容器：承载抽屉框架与置顶 Snackbar
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .onGloballyPositioned { rootHeightPx = it.size.height },
+    ) {
+    DshAdaptiveShell(
+        layout = dshLayout,
+        sidebarCollapsed = sidebarCollapsed,
+        sidebar = {
+            WorkspaceSidebar(
+                sessions = sessions,
+                archivedIds = archivedIds,
+                deletedIds = deletedIds,
+                currentSessionId = currentSessionId,
+                searchQuery = searchQuery,
+                searchState = searchState,
+                searchResults = searchResults,
+                sidebarSearchOpen = sidebarSearchOpen,
+                workspaceAccounts = workspaceAccounts,
+                deletedWorkspaces = deletedWorkspaces,
+                workspaceRegistry = workspaceRegistry,
+                workspaceRegistryReady = workspaceRegistryReady,
+                sessionsInitialLoad = sessionsInitialLoad,
+                sessionsLoadError = sessionsLoadError,
+                hostName = hostLabel,
+                online = hostReachable,
+                viaRemote = dev.deeplinks.native.util.HostConnectivity.viaRemote,
+                offlineSinceLabel = offlineSinceLabel,
+                selectedWorkspace = selectedHomeWorkspace,
+                onSelectWorkspace = { selectedHomeWorkspace = it },
+                onOpenArchived = { showArchivedSheet = true },
+                onPickStarter = onPickStarter,
+                activeApproval = homePendingApproval,
+                onAnswerApproval = { approvalId, outcome, onDone ->
+                    val sid = currentSessionId
+                    if (sid == null) onDone(false)
+                    else workspaceViewModel.answerApproval(sid, approvalId, outcome, onDone)
+                },
+                containerColor = Dsh.bgDrawer,
+                collapsed = sidebarCollapsed,
+                goalSummaries = workspaceViewModel.goalSummaries.value,
+                actions = sidebarActions,
+            )
+        },
+    ) {
+        BackHandler(enabled = !dshLayout.persistentSidebar && !showSessionHome && changesProgress <= 0f) {
+            showPhoneSessions()
+        }
+        AnimatedContent(
+            targetState = showSessionHome,
+            modifier = Modifier.fillMaxSize(),
+            transitionSpec = {
+                if (targetState) {
+                    slideInHorizontally(tween(navMotionMs, easing = DshEasing.out)) { -it / 5 } togetherWith
+                        slideOutHorizontally(tween(navMotionMs, easing = DshEasing.out)) { it }
+                } else {
+                    slideInHorizontally(tween(navMotionMs, easing = DshEasing.out)) { it } togetherWith
+                        slideOutHorizontally(tween(navMotionMs, easing = DshEasing.out)) { -it / 5 }
+                }
+            },
+            label = "phoneWorkspace",
+        ) { showList ->
+        if (showList) {
+            Box(
+                Modifier
+                    .fillMaxSize()
+                    .background(Dsh.bgBase)
+                    .statusBarsPadding()
+                    .navigationBarsPadding(),
+            ) {
+                WorkspaceSidebar(
+                    sessions = sessions,
+                    archivedIds = archivedIds,
+                    deletedIds = deletedIds,
+                    currentSessionId = currentSessionId,
+                    searchQuery = searchQuery,
+                    searchState = searchState,
+                    searchResults = searchResults,
+                    sidebarSearchOpen = sidebarSearchOpen,
+                    workspaceAccounts = workspaceAccounts,
+                    deletedWorkspaces = deletedWorkspaces,
+                    workspaceRegistry = workspaceRegistry,
+                    workspaceRegistryReady = workspaceRegistryReady,
+                    sessionsInitialLoad = sessionsInitialLoad,
+                    sessionsLoadError = sessionsLoadError,
+                    hostName = hostLabel,
+                    online = hostReachable,
+                    viaRemote = dev.deeplinks.native.util.HostConnectivity.viaRemote,
+                    offlineSinceLabel = offlineSinceLabel,
+                    selectedWorkspace = selectedHomeWorkspace,
+                    onSelectWorkspace = { selectedHomeWorkspace = it },
+                    onOpenArchived = { showArchivedSheet = true },
+                    onPickStarter = onPickStarter,
+                    activeApproval = homePendingApproval,
+                    onAnswerApproval = { approvalId, outcome, onDone ->
+                        val sid = currentSessionId
+                        if (sid == null) onDone(false)
+                        else workspaceViewModel.answerApproval(sid, approvalId, outcome, onDone)
+                    },
+                    containerColor = Dsh.bgBase,
+                    collapsed = false,
+                    goalSummaries = workspaceViewModel.goalSummaries.value,
+                    actions = sidebarActions,
+                )
+            }
+        } else Box(Modifier.fillMaxSize().background(Dsh.bgBase)) {
+            // 第 5 步叠层：消息流铺满，上下 chrome 悬浮其上（见 OverlayChrome.kt）
+            val chrome = rememberOverlayChromeState()
+            val topChromeDp = chrome.topDp()
+            val bottomChromeDp = chrome.bottomDp()
+            val contentUnderTop by remember { derivedStateOf { listState.canScrollBackward } }
+            // ===== 顶栏：返回或收起侧栏 + 会话名 + 溢出菜单 =====
+            var headerMenuOpen by remember { mutableStateOf(false) }
+            var showSchedules by remember { mutableStateOf(false) }
+            var showUsage by remember { mutableStateOf(false) }
+            val shareDark = Dsh.isDark
+            ScheduledTasksSheet(showSchedules, workspaceViewModel.sessionControl, currentSessionId != null) { showSchedules = false }
+            if (showUsage) UsageSheet(sessionStats) { showUsage = false }
+            if (showShareSheet) {
+                val sid = currentSessionId
+                ConversationShareSheet(
+                    preview = currentSession?.let { conversationSharePreview(displaySessionTitle(it.title), it.cwd, messages) },
+                    onDismiss = { showShareSheet = false },
+                    onShareImage = {
+                        showShareSheet = false
+                        if (sid != null) {
+                            shareConversationAsImage(
+                                scope = scope,
+                                context = context,
+                                client = client,
+                                sessionId = sid,
+                                title = currentSession?.title?.let(::displaySessionTitle) ?: L.sessionFallbackTitle,
+                                dark = shareDark,
+                                onError = { composerActionError = it },
+                            )
+                        }
+                    },
+                    onExportText = {
+                        showShareSheet = false
+                        if (sid != null) {
+                            exportConversationText(
+                                scope = scope,
+                                context = context,
+                                client = client,
+                                sessionId = sid,
+                                title = currentSession?.title ?: L.sessionFallbackTitle,
+                                onError = { composerActionError = it },
+                            )
+                        }
+                    },
+                )
+            }
+            var showPreviewSheet by remember { mutableStateOf(false) }
+            if (showPreviewSheet) PreviewEntrySheet(client, host) { showPreviewSheet = false }
+            var showGoalEdit by remember { mutableStateOf(false) }
+            GoalEditHost(showGoalEdit, workspaceViewModel.sessionControl) { showGoalEdit = false }
+            val sessionMenu = if (composeNewSession && currentSessionId == null) SessionMenu.Empty else sessionMenu(
+                onClose = { headerMenuOpen = false },
+                changes = pinnedChanges, onChanges = { pinnedChanges?.let { latest -> scope.launch { changesPanel.open(latest.seq, null) } } },
+                canBrowseFiles = workspaceViewModel.filesTreeSupported.value && currentSessionId != null, onBrowseFiles = { showFileBrowser = true },
+                viewMode = viewMode, onToggleViewMode = { selectViewMode(if (viewMode == "trace") "chat" else "trace") },
+                subagentCount = activeSubagentCount, onSubagents = { showSubagentSheet = true },
+                onUsage = { showUsage = true },
+                previewSupported = workspaceViewModel.previewSupported.value, onPreview = { showPreviewSheet = true },
+                canGoal = workspaceViewModel.sessionControl.goal.value?.manageable == true, onGoal = { showGoalEdit = true },
+                canSchedules = workspaceViewModel.sessionControl.supported.value, onSchedules = { showSchedules = true },
+                onRename = { currentSession?.let { openRename(it) } },
+                onFork = { currentSessionId?.let { forkNow(it) } },
+                onShare = { showShareSheet = true },
+            )
+            // ===== 顶部 chrome（L9：无全宽玻璃条，控件悬浮 + 边缘渐隐） =====
+            Column(Modifier.align(Alignment.TopCenter).overlayTopChrome(chrome, Dsh.bgBase, viewMode != "chat" || contentUnderTop)) {
+            Box(modifier = Modifier.fillMaxWidth()) {
+                val traceOpen = viewMode == "trace"
+                BackHandler(enabled = traceOpen) { selectViewMode("chat") }
+                WorkspaceTopBar(
+                // 草稿态标题固定「新任务」；有会话显示会话名；无会话且非草稿留空（起始块已删）
+                title = when {
+                    traceOpen -> MenuL.menuTrace
+                    composeNewSession && currentSessionId == null -> L.homeNewTask
+                    currentSessionId == null -> ""
+                    else -> currentSession?.title?.let(::displaySessionTitle) ?: L.newSession
+                },
+                // 第二行：工作区 · 电脑名，执行中换成「正在执行 · 第 N 步 · M 分钟」；草稿态只写电脑名（3.1）
+                subtitle = if (traceOpen) {
+                    remember(messages) { traceSummaryLine(messages) }
+                } else if (composeNewSession && currentSessionId == null) {
+                    hostLabel
+                } else {
+                    chatTopSubtitle(running, currentSession?.cwd?.trimEnd('/')?.substringAfterLast('/'), hostLabel, currentSession?.activity, elapsedSec)
+                },
+                onNavigate = {
+                    if (traceOpen) {
+                        selectViewMode("chat")
+                    } else if (dshLayout.persistentSidebar) {
+                        sidebarCollapsed = !sidebarCollapsed
+                    } else {
+                        showPhoneSessions()
+                    }
+                },
+                menuExpanded = headerMenuOpen,
+                onMenuExpandedChange = { headerMenuOpen = it },
+                menu = if (traceOpen) SessionMenu.Empty else sessionMenu,
+                diff = if (traceOpen) null else pinnedChanges?.takeIf { it.total > 0 }?.let { c -> DlDiffStat(c.added, c.deleted) { scope.launch { changesPanel.open(c.seq, null) } } },
+            )
+            }
+
+            // ===== 状态槽（v4 4.1 / 4.5 / 4.8）：断线 > 目标 + 计划 > 预览，一次只显示一条 =====
+            val streamState = streamClient?.connectionState
+            val streamBanner = streamBannerKind(
+                hasSession = currentSessionId != null,
+                connected = streamState == SessionStreamClient.ConnectionState.CONNECTED,
+                failed = streamState == SessionStreamClient.ConnectionState.FAILURE,
+                connecting = streamState == SessionStreamClient.ConnectionState.CONNECTING,
+                retrying = streamState == SessionStreamClient.ConnectionState.RETRYING,
+                everConnected = streamEverConnected,
+                quietElapsed = streamQuietElapsed,
+            )
+            val inChat = viewMode == "chat" && currentSessionId != null
+            val previewPorts = rememberPreviewDetections(client, currentSessionId, workspaceViewModel.previewDetect.value && viewMode == "chat")
+            val planItems = remember(messages) { latestPlanItems(messages) }
+            SessionStatusSlot(
+                status = sessionStatus(
+                    stream = streamBanner,
+                    unreachableHost = hostLabel.takeIf { !sessionsInitialLoad && sessionsLoadError != null && sessions.isEmpty() },
+                    goal = workspaceViewModel.sessionControl.goal.value.takeIf { inChat },
+                    goalSummary = workspaceViewModel.currentGoalSummary.value.takeIf { inChat },
+                    plan = if (inChat) planItems else emptyList(),
+                    running = running,
+                    previewPorts = previewPorts,
+                    onRetryStream = { streamClient?.reconnect() },
+                    onRetryHost = { refreshSessions(reportFailure = true) },
+                    onOpenDevice = { onOpenDevice(null) },
+                ),
+                control = workspaceViewModel.sessionControl,
+                modifier = Modifier.align(Alignment.CenterHorizontally).widthIn(max = dshLayout.contentMaxWidthDp.dp),
+            )
+            } // 顶部 chrome 结束
+            // 方案 A（2026-10-02）：顶 / 底 chrome 实底，不再叠边缘渐隐（实底与渐隐色不一致会出现白雾）。
+
+            // 消息流 + 悬浮「回到底部」：weight 加在容器（Column 直接子级）上，
+            // 悬浮按钮盖在列表之上；框内 LazyColumn 用 fillMaxSize 填满 Box。
+            // 下拉刷新（M3 PullToRefreshBox）：聊天/轨迹共用同一消息流数据。
+            val pullRefreshState = rememberPullToRefreshState()
+            PullToRefreshBox(
+                isRefreshing = historyRefreshing,
+                onRefresh = {
+                    historyRefreshing = true
+                    refreshMessages(replaceInFlight = true, onDone = { historyRefreshing = false })
+                },
+                state = pullRefreshState,
+                indicator = { ChromeAwareRefreshIndicator(pullRefreshState, historyRefreshing, topChromeDp) },
+                modifier = Modifier.fillMaxSize(),
+            ) {
+            // 对话与轨迹共用消息数据，只替换当前视图，避免同时测量和绘制两张长列表。
+            ChangesSwipeArea(
+                state = changesPanel,
+                enabled = changeSummaries.isNotEmpty() && dshLayout.persistentSidebar,
+                // 大屏（Medium / Expanded）把消息流封顶 760dp 居中，
+                // 而不是把手机布局无限拉宽；手机仍是全宽 16dp 边距。
+                modifier = Modifier
+                    .fillMaxSize()
+                    .widthIn(max = dshLayout.contentMaxWidthDp.dp)
+                    .wrapContentWidth(Alignment.CenterHorizontally),
+            ) {
+            when (viewMode) {
+            "trace" -> Box(Modifier.fillMaxSize().padding(top = topChromeDp, bottom = bottomChromeDp)) {
+                val traceKind = chatCanvasKind(
+                    hasMessages = messages.isNotEmpty(),
+                    initialLoadInFlight = initialLoadInFlight && sessionStats == null,
+                    hasHistoryError = historyLoadError != null,
+                    working = running || isSending,
+                )
+                when (traceKind) {
+                    ChatCanvasKind.Loading -> ChatLoadingSkeleton(modifier = Modifier.fillMaxSize())
+                    ChatCanvasKind.Error -> Box(
+                        modifier = Modifier.fillMaxSize(),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        ChatHistoryError(
+                            message = historyLoadError,
+                            hint = L.loadConversationFailedHint,
+                            onRetry = { refreshMessages() },
+                            compact = false,
+                        )
+                    }
+                    ChatCanvasKind.Working -> Box(
+                        modifier = Modifier.fillMaxSize(),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        ThinkingStatusRow(elapsedSec)
+                    }
+                    ChatCanvasKind.Empty, ChatCanvasKind.Content -> TrajectoryView(
+                        messages = messages,
+                        running = running,
+                        elapsedSec = elapsedSec,
+                        modifier = Modifier.fillMaxSize(),
+                    )
+                }
+            }
+            else -> {
+
+            // ===== 消息流（max-width 748 居中） =====
+            // 消息流数据推导（纯函数，见 ChatFeedDerivation.kt）：
+            // 合并历史页 → 丢弃空思考行 → 按相邻工具调用聚合 → 过滤上下文注入（C3）
+            val chatFeed = remember(olderMessages, messages) {
+                deriveChatFeed(olderMessages, messages)
+            }
+            val visibleGroups = chatFeed.visibleGroups
+            // 消息渲染的副作用集合（COM-001 拆解）：状态用 getter/setter 注入，调用时读最新值
+            val chatActions = remember(client, host, context) {
+                ChatFeedActions(
+                    client = client,
+                    scope = scope,
+                    context = context,
+                    host = host,
+                    currentSessionId = { currentSessionId },
+                    messages = { messages },
+                    setMessages = { messages = it },
+                    olderMessages = { olderMessages },
+                    composerText = { inputText },
+                    setComposerText = { inputText = it },
+                    setComposerError = { composerActionError = it },
+                    isRunning = { running },
+                    busyEnter = { appSettings.busyEnter },
+                    isFeedbackSupported = { feedbackSupported },
+                    feedbackFor = { id -> messageFeedback[id] },
+                    updateFeedback = { transform -> messageFeedback = transform(messageFeedback) },
+                    refreshSessions = { refreshSessions() },
+                    fork = { sid -> forkNow(sid) },
+                    openChanges = { seq, fileIndex -> scope.launch { changesPanel.open(seq, fileIndex) } },
+                    openTrace = { selectViewMode("trace") },
+                )
+            }
+            // 消息列表进入组合（手机从首页点进会话、轨迹切回对话）时补一次贴底：
+            // 会话可能早在后台恢复好（冷启动恢复上次会话），当时列表不在屏上，
+            // 尾部请求无从对齐；点进同一会话 currentSessionId 不变，也不会再发请求。
+            // 用户离开前已上翻（stickToBottom=false）则保留原位置。
+            LaunchedEffect(Unit) {
+                if (stickToBottom && messages.isNotEmpty()) requestTailPosition()
+            }
+            // 列表高度随 IME/底栏变化时：贴底用户按变矮像素上推，跟手不跳
+            var chatListHeightPx by remember { mutableIntStateOf(0) }
+            FollowBottomChromeGrowth(listState, chrome.bottomPx, stickToBottom && messages.isNotEmpty())
+            // 第 2 步 B2：把会话级图片策略注进消息流（MarkdownContent 读 LocalRemoteImagePolicy）
+            CompositionLocalProvider(LocalRemoteImagePolicy provides imagePolicy) {
+            LazyColumn(
+                state = listState,
+                modifier = Modifier
+                    .fillMaxSize()
+                    .onSizeChanged { size ->
+                        val h = size.height
+                        val prev = chatListHeightPx
+                        if (prev > 0 && h < prev && stickToBottom && messages.isNotEmpty()) {
+                            val delta = (prev - h).toFloat()
+                            scope.launch {
+                                try {
+                                    listState.scrollBy(delta)
+                                } catch (_: Exception) {
+                                }
+                            }
+                        }
+                        chatListHeightPx = h
+                    },
+                verticalArrangement = Arrangement.spacedBy(DshSpace.s12),
+                contentPadding = PaddingValues(
+                    start = COMPOSER_SIDE_CLEARANCE + DshSpace.s8,
+                    end = COMPOSER_SIDE_CLEARANCE + DshSpace.s8,
+                    top = topChromeDp + DshSpace.s12,
+                    bottom = bottomChromeDp + DshSpace.s12,
+                )
+            ) {
+                if (messages.isEmpty()) {
+                    if (composeNewSession && currentSessionId == null) {
+                        newTaskDraftCanvas(
+                            lastTask = draftLastTask,
+                            workspaceLabel = (pendingSessionCwd ?: workspacePrefs.lastSelectedWorkspace)?.let(::workspaceDisplayName),
+                            onOpenLastTask = { sid -> selectSession(sid); showPhoneChat() },
+                            onOpenWorkspacePicker = { showDraftWorkspacePicker = true },
+                        )
+                    } else {
+                    chatEmptyCanvas(
+                        kind = chatCanvasKind(
+                            hasMessages = false,
+                            initialLoadInFlight = initialLoadInFlight && sessionStats == null,
+                            hasHistoryError = historyLoadError != null,
+                            working = running || isSending,
+                        ),
+                        elapsedSec = elapsedSec,
+                        historyLoadError = historyLoadError,
+                        onRetry = { refreshMessages() },
+                    )
+                    }
+            } else { // 闭合 if (messages.isEmpty())，打开 else 分支
+                    // 会话标题只保留在顶栏；消息流不再重复大标题
+                    // 加载更早（DSH chat.loadOlder：hasMore 时显示在消息流顶部，点击向前翻页）
+                    if (hasMoreMessages) {
+                        item(key = "load-older") {
+                            LoadOlderRow(
+                                loading = isLoadingOlder,
+                                failed = loadOlderFailed,
+                                onClick = { loadOlderMessages() }
+                            )
+                        }
+                    }
+                    // 只扫正在生成的工具/思考行；已定稿的「已思考」不能抢状态条
+                    val sweepingId = resolveSweepingId(messages, running)
+                    chatMessageItems(
+                        visibleGroups = visibleGroups,
+                        sweepingId = sweepingId,
+                        actions = chatActions,
+                        isRunning = running,
+                    )
+                    // 对齐网页 TurnStatus（Deep diving...）：整轮生成期间都在流尾显示思考中扫光
+                    if (shouldShowTurnStatus(messages, running || isSending)) {
+                        item(key = "turn-status") {
+                            ThinkingStatusRow(elapsedSec)
+                        }
+                    }
+                    // 已停止标记：仅在非执行态展示，避免等待新回复时误显示旧 turn 的停止态
+                    val badgeReason = parseStoppedReason(stoppedReason)
+                    if (badgeReason != null && !running && !isSending) {
+                        item(key = "stopped-badge") {
+                            StoppedBadge(reason = badgeReason)
+                        }
+                    }
+                }
+            }
+            } // CompositionLocalProvider(LocalRemoteImagePolicy) 结束
+            } // else 分支结束
+            } // when(viewMode) 结束
+            } // Box 结束（viewMode 容器）
+
+            // 回到底部：悬浮在消息流右下角（原生聊天 App 的位置），不挤压输入区
+            androidx.compose.animation.AnimatedVisibility(
+                visible = showScrollToBottom && currentSessionId != null && messages.isNotEmpty(),
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .padding(end = COMPOSER_SIDE_CLEARANCE, bottom = bottomChromeDp + DshSpace.s12),
+                enter = fadeIn(animationSpec = tween(motionDuration(150))) +
+                    scaleIn(animationSpec = tween(motionDuration(180))),
+                exit = fadeOut(animationSpec = tween(motionDuration(120))) +
+                    scaleOut(animationSpec = tween(motionDuration(160))),
+            ) {
+                ScrollToBottomButton(
+                    unread = unreadWhileScrolled,
+                    onClick = {
+                        showScrollToBottom = false
+                        stickToBottom = true
+                        requestTailPosition()
+                    },
+                )
+            }
+            } // Box 结束（消息流 + 悬浮层）
+
+            // ===== 底部 chrome 叠层：命令候选 + 输入区（命令候选最多长到顶部 chrome 下沿） =====
+            Column(Modifier.align(Alignment.BottomCenter).padding(top = topChromeDp).overlayBottomChrome(chrome)) {
+            // 命令候选（输入以 / 开头时，DSH 命令/技能/子智能体/快捷操作）—— 悬浮在输入区上方
+            // typed 处理：
+            //   Completable  → 直接提交到服务端并清空输入框
+            //   Insertable   → 把 trigger 插入到 composer（例如 /plan /goal /subagent 待补参数）
+            //   Local        → 本地动作（/search 等）；绝不到达服务端
+            // 外部分享带入的 `/…` 文本在用户手动编辑前不参与候选（见 shareCommandGuard）。
+            val commandModeActive = inputText.startsWith("/") &&
+                inputText.length <= 24 &&
+                (shareCommandGuard == null || inputText != shareCommandGuard)
+            if (viewMode == "chat" && commandModeActive) {
+                CommandSuggestions(
+                    query = inputText,
+                    // 只吃剩余空间（与消息区 2:1 分），键盘弹起时让位，不挤扁输入框
+                    modifier = Modifier.weight(2f, fill = false),
+                    onPick = { picked ->
+                        // 无论哪种类型，先关掉 picker：清空输入文本以触发外层 `inputText.startsWith("/") == false`
+                        when (picked) {
+                            is PaletteCommand.Local -> {
+                                inputText = ""
+                                dispatchLocalPaletteAction(picked.kind)
+                            }
+                            is PaletteCommand.Insertable -> {
+                                // 把 trigger + 空格 放进 composer，并请求焦点 + 弹起 IME（K3：走聚焦令牌）
+                                inputText = picked.trigger + " "
+                                if (composerFocusShouldEmit(ComposerFocusSource.CommandInsert)) composerFocusToken++
+                            }
+                            is PaletteCommand.Completable -> {
+                                val sid = currentSessionId
+                                if (!completableCanSubmit(sid != null) || sid == null) return@CommandSuggestions
+                                val trigger = picked.trigger
+                                inputText = ""
+                                composerActionError = null
+                                scope.launch(Dispatchers.IO) {
+                                    try {
+                                        client.sendPrompt(
+                                            sid,
+                                            trigger,
+                                            mode = resolvePromptMode(running, appSettings.busyEnter),
+                                        )
+                                        withContext(Dispatchers.Main) {
+                                            refreshSessions()
+                                            if (streamClient?.isConnected != true) {
+                                                refreshMessages(autoScroll = true)
+                                            }
+                                        }
+                                    } catch (e: Exception) {
+                                        withContext(Dispatchers.Main) {
+                                            inputText = trigger
+                                            composerActionError = L.commandSendFailed.format(e.message ?: L.unknownError)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                )
+            }
+            // ===== bottom chrome（WI-006：发送队列/输入卡/统计栏同一容器，统一安全区与 IME） =====
+            // v4：输入区是实底容器（DlComposer 自带边距），建议行 / 队列在其上方
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .navigationBarsPadding()
+                    .imePadding()
+                    .onGloballyPositioned { composerTopPx = it.positionInRoot().y }
+            ) {
+                // 工作区 + Harness 模式（新会话草稿模式下置于输入卡上方，开聊后收拢隐藏）
+                // 发送中不堆 QueueDock；插话/引导/排队由发送槽转圈表示（状态写进动作）
+                if (viewMode == "chat") {
+                // v4 4.3 / 4.4：待你拍板的审批 / 提问替换输入区
+                val decision = remember(messages, currentSessionId) { currentSessionId?.let { pendingDecision(messages) } }
+                if (decision != null) {
+                    DecisionBarHost(
+                        decision = decision,
+                        onAnswerApproval = { id, outcome, done -> currentSessionId?.let { workspaceViewModel.answerApproval(it, id, outcome, done) } ?: done(false) },
+                        onAnswerQuestion = { id, answer, done -> currentSessionId?.let { workspaceViewModel.answerQuestion(it, id, answer, done) } ?: done(false) },
+                        modifier = Modifier.widthIn(max = dshLayout.contentMaxWidthDp.dp).wrapContentWidth(Alignment.CenterHorizontally),
+                    )
+                } else {
+                // 两层输入区：上下文条（工作区 / 最近改动 / 累计用量）+ 输入卡
+                if (currentSessionId != null) {
+                    QueuedPromptsStrip(workspaceViewModel.sessionControl, { restored -> inputText = if (inputText.isBlank()) restored else inputText + "\n" + restored }, Modifier.widthIn(max = dshLayout.contentMaxWidthDp.dp))
+                    // 建议行（4.3）：继续 / 复核 / 查看改动 (N)；离线时此处显示「电脑离线」灰字。
+                    // 快捷胶囊只预填、不发送（L8）。
+                    ComposerSuggestionsRow(
+                        online = hostReachable,
+                        suggestionsVisible = composerSuggestionVisible(
+                            viewMode = viewMode,
+                            running = running,
+                            lastGroupEndedAssistant = lastGroupEndedAssistant(messages, running),
+                            inputBlank = inputText.isBlank() && pendingImages.isEmpty(),
+                            pendingBlocked = homePendingApproval != null,
+                            online = hostReachable,
+                        ),
+                        changesCount = null,
+                        onSuggestion = { text ->
+                            inputText = text
+                            if (composerFocusShouldEmit(ComposerFocusSource.CommandInsert)) composerFocusToken++
+                        },
+                        onOpenChanges = {
+                            pinnedChanges?.let { latest -> scope.launch { changesPanel.open(latest.seq, null) } }
+                        },
+                        modifier = Modifier.widthIn(max = dshLayout.contentMaxWidthDp.dp).wrapContentWidth(Alignment.CenterHorizontally),
+                    )
+                }
+                var showFullAccessSendConfirm by remember { mutableStateOf(false) }
+                // 访问模式座（DSH conversation.input.permission）：本会话改过的预设优先，否则用全局默认。
+                val inputPermissionPreset = composerPermissionPreset(currentSessionId, sessionPermissionOverrides, appSettings.permissionPreset).let(::canonicalComposerPermission)
+                val inputPermissionLabel = composerPermissionLabel(inputPermissionPreset)
+                InputBar(
+                modifier = Modifier.widthIn(max = dshLayout.contentMaxWidthDp.dp).wrapContentWidth(Alignment.CenterHorizontally),
+                inputText = inputText,
+                onInputChange = { if (currentSession?.origin != "subagent") { inputText = it; if (composerActionError != null) composerActionError = null } },
+                pendingImages = pendingImages,
+                onRemoveImage = { index ->
+                    pendingImages = pendingImages.filterIndexed { i, _ -> i != index }
+                    if (composerActionError != null) composerActionError = null
+                },
+                onPickImage = {
+                    pendingAttachOwnerKey = composerOwnerKey()
+                    imagePickerLauncher.launch(
+                        androidx.activity.result.PickVisualMediaRequest(
+                            ActivityResultContracts.PickVisualMedia.ImageOnly,
+                        )
+                    )
+                },
+                onTakePhoto = { launchCamera() },
+                isListening = isListening,
+                isSending = isSending,
+                canSend = (inputText.isNotBlank() || pendingImages.isNotEmpty()) && !isSending && currentSession?.origin != "subagent",
+                running = running,
+                modelName = inputModelSeat.name,
+                modelEffort = inputModelSeat.effort,
+                sessionStats = sessionStats,
+                onOpenUsage = { showUsage = true },
+                permissionPreset = inputPermissionPreset,
+                permissionLabel = inputPermissionLabel,
+                compact = composerSeatsCompact(containerWidthDp.value),
+                onOpenModelPicker = { loadModelCatalog(openPicker = true) },
+                onOpenPermissionPicker = { showPermissionPicker = true },
+                presetLabel = if (composeNewSession && currentSessionId == null) presetDisplayName(draftPresetId(pendingAgentPreset, appSettings.agentPreset), null) else null,
+                onOpenPresetPicker = { showAgentPresetPicker = true },
+                onToggleVoice = {
+                    if (isListening) {
+                        onStopVoiceInput()
+                        isListening = false
+                    } else {
+                        composerActionError = null
+                        isListening = true
+                        val voiceOwnerKey = composerOwnerKey()
+                        onStartVoiceInput({ recognizedText ->
+                            isListening = false
+                            if (recognizedText.isNotBlank()) {
+                                if (composerOwnerKey() == voiceOwnerKey) {
+                                    applyLiveComposer(mergeComposerText(liveComposerDraft(), recognizedText))
+                                } else {
+                                    val stored = composerDrafts[voiceOwnerKey] ?: ComposerDraft()
+                                    composerDrafts = putComposerDraft(
+                                        composerDrafts,
+                                        voiceOwnerKey,
+                                        mergeComposerText(stored, recognizedText),
+                                    )
+                                }
+                            }
+                        }, { isListening = false }, { message ->
+                            isListening = false
+                            reportComposerOwnerError(voiceOwnerKey, message)
+                        })
+                    }
+                },
+                onStop = {
+                    val sid = currentSessionId ?: return@InputBar
+                    composerActionError = null
+                    scope.launch(Dispatchers.IO) {
+                        try {
+                            client.cancelSession(sid)
+                            refreshSessions()
+                        } catch (e: Exception) {
+                            withContext(Dispatchers.Main) {
+                                composerActionError = L.stopFailed.format(e.message ?: L.unknownError)
+                            }
+                        }
+                    }
+                },
+                actionError = composerActionError,
+                composerFocusRequester = composerFocusRequester,
+                focusToken = composerFocusToken,
+                onSend = {
+                    // 不可逆权限升级：无论从哪个入口触发，都不直发，先走二次确认。
+                    if (isDangerPermissionCommand(inputText)) {
+                        showFullAccessSendConfirm = true
+                    } else {
+                        submitComposer()
+                    }
+                },
+            )
+
+            // 发送主体（原 onSend 内联体）：抽成局部函数，让高权限确认弹窗能复用同一条路径。
+
+            // 高权限命令的二次确认（文案与 PermissionPickerSheet 的确认弹窗一致）。
+            // 取消后 composer 保留原文；确认后只执行一次发送。
+            if (showFullAccessSendConfirm) {
+                DshConfirmDialog(
+                    title = L.confirmFullAccessTitle,
+                    message = L.confirmFullAccessMessage,
+                    confirmLabel = L.confirm,
+                    danger = true,
+                    icon = ShieldOutline16,
+                    iconTone = DlTone.Wait,
+                    onDismiss = { showFullAccessSendConfirm = false },
+                    onConfirm = {
+                        showFullAccessSendConfirm = false
+                        submitComposer()
+                    },
+                )
+            }
+                } // 决策栏 / 输入区
+                }
+            } // bottom chrome 容器结束
+            } // 底部 chrome 叠层结束
+        }
+        }
+    }
+
+    WorkspaceChangesPanel(
+        state = changesPanel,
+        summaries = changeSummaries,
+        loadSummary = { seq -> currentSessionId?.let { sid -> withContext(Dispatchers.IO) { client.getWorkspaceChanges(sid, seq) } } },
+        loadDiff = { seq, index -> client.getWorkspaceChangeDiff(currentSessionId ?: error(L.unknownError), seq, index) },
+        // 稿 04 底部提问条：预填「关于 <文件> 的改动：」，收起面板回聊天
+        onAskAboutFile = { file ->
+            inputText = ChangesL.askAboutFilePrefill.format(file.display) + inputText; scope.launch { changesPanel.settle(false) }; showPhoneChat()
+        },
+        onAskAboutTurn = { turn ->
+            inputText = ChangesL.askAboutTurnPrefill.format(turn.turn) + inputText; scope.launch { changesPanel.settle(false) }; showPhoneChat()
+        },
+    )
+
+    // Snackbar 叠在抽屉/遮罩之上（抽屉打开时仍可见可点）；底部让开输入区：
+    // 间距 = 根高 - 输入区 top，键盘弹起时 composerTopPx 上移自动收窄。
+    val clearancePx = if (composerTopPx >= 0f) (rootHeightPx - composerTopPx).coerceAtLeast(0f) else 0f
+    val density = androidx.compose.ui.platform.LocalDensity.current
+    SnackbarHost(
+        hostState = snackbarHostState,
+        modifier = Modifier
+            .align(Alignment.BottomCenter)
+            .padding(horizontal = DshSpace.s16)
+            .padding(bottom = with(density) { clearancePx.toDp() } + 16.dp),
+    )
+    }
+
+    cropBitmap?.let { pendingCrop ->
+        CameraCropSheet(
+            bitmap = pendingCrop,
+            onConfirm = { cropped ->
+                cropBitmap = null
+                if (pendingCrop !== cropped && !pendingCrop.isRecycled) pendingCrop.recycle()
+                addPendingBitmap(cropped)
+            },
+            onRetake = {
+                cropBitmap = null
+                if (!pendingCrop.isRecycled) pendingCrop.recycle()
+                launchCamera()
+            },
+            onDismiss = {
+                cropBitmap = null
+                if (!pendingCrop.isRecycled) pendingCrop.recycle()
+            },
+        )
+    }
+
+    // 模型选择底部抽屉（会话内与草稿态共用；草稿态目录由 openNewTaskDraft 重置加载）
+
+    ArchivedSessionsHost(
+        open = showArchivedSheet, prefs = workspacePrefs, sessions = sessions,
+        loading = sessionsInitialLoad, onDismiss = { showArchivedSheet = false },
+    )
+
+    if (showDraftWorkspacePicker) {
+        WorkspacePickerSheet(
+            sessions = sessions,
+            deletedWorkspaces = deletedWorkspaces,
+            registeredPaths = workspaceRegistry,
+            registryReady = workspaceRegistryReady,
+            selectedPath = pendingSessionCwd ?: workspacePrefs.lastSelectedWorkspace,
+            onDismiss = { showDraftWorkspacePicker = false },
+            onAddWorkspace = { showAddWorkspace = true },
+            onPick = { path ->
+                // v4 3.2：选「不绑定工作区」也生效（null = 只聊天）
+                showDraftWorkspacePicker = false
+                pendingSessionCwd = path
+                workspacePrefs.lastSelectedWorkspace = path
+            },
+        )
+    }
+
+    if (showModelPicker) {
+        ModelPickerSheet(
+            catalog = modelCatalog,
+            loading = modelCatalogLoading,
+            error = modelCatalogError,
+            contextPercent = usageFigures(sessionStats)?.let { contextUsedPercent(it.contextUsedTokens, it.contextWindowTokens) },
+            onRetry = { loadModelCatalog(openPicker = true) },
+            onDismiss = { showModelPicker = false },
+            onSelect = { provider, model, effort ->
+                val sid = currentSessionId
+                if (sid == null) {
+                    pendingModel = Triple(provider, model, effort)
+                    modelCatalog = modelCatalog?.copy(
+                        currentProvider = provider,
+                        currentModel = model,
+                        currentReasoningEffort = effort,
+                    )
+                    return@ModelPickerSheet
+                }
+                // 不关弹层，乐观更新座位（N2）；后台 selectModel 成功校正、失败回滚。
+                workspaceViewModel.selectModelOptimistic(sid, provider, model, effort) { message ->
+                    modelCatalogError = message
+                }
+            }
+        )
+    }
+
+    if (showAgentPresetPicker) {
+        AgentPresetPickerSheet(
+            presets = agentPresets,
+            currentId = pendingAgentPreset,
+            loading = agentPresetsLoading,
+            error = agentPresetsError,
+            onRetry = { loadAgentPresets() },
+            onDismiss = { showAgentPresetPicker = false },
+            onSelect = { id ->
+                pendingAgentPreset = id
+                showAgentPresetPicker = false
+            },
+        )
+    }
+
+    // 访问模式选择（有会话 → 改当前会话；无会话 → 写全局默认）
+    if (showPermissionPicker) {
+        PermissionPickerSheet(
+            context = context,
+            host = host,
+            currentPreset = composerPermissionPreset(
+                currentSessionId,
+                sessionPermissionOverrides,
+                appSettings.permissionPreset,
+            ),
+            sessionId = currentSessionId,
+            onSaved = { updated -> appSettings = updated },
+            onSessionPreset = { preset ->
+                val sid = currentSessionId ?: return@PermissionPickerSheet
+                sessionPermissionOverrides = sessionPermissionOverrides + (sid to preset)
+            },
+            onDismiss = { showPermissionPicker = false }
+        )
+    }
+
+    // 添加工作区：名称创建同级目录；绝对路径注册已有目录
+    if (showAddWorkspace) {
+        val sid = currentSessionId
+        val preferredAnchorPath = if (sid == null) {
+            pendingSessionCwd ?: workspacePrefs.lastSelectedWorkspace
+        } else {
+            workspaceGroupKey(sid, workspaceAccounts, deletedWorkspaces)
+        }
+        val creationAnchor = workspaceCreationAnchor(workspaceCatalogItems, preferredAnchorPath)
+        AddWorkspaceSheet(
+            creationAnchor = creationAnchor,
+            onDismiss = { showAddWorkspace = false },
+            createWorkspace = client::createWorkspace,
+            onAuthExpired = { error -> onAuthExpired(error) },
+            onCreated = { workspace ->
+                // A workspace.list started before this commit may carry a stale snapshot.
+                workspaceViewModel.invalidateWorkspaceRequests()
+                workspaceCatalogItems = upsertCreatedWorkspace(workspaceCatalogItems, workspace)
+                workspaceRegistryReady = true
+                val committedPath = normalizeWorkspacePath(workspace.path)
+                persistDeletedWorkspaces(deletedWorkspaces - committedPath)
+                workspacePrefs.lastSelectedWorkspace = committedPath
+                startComposeSession(committedPath)
+                selectViewMode("chat")
+                showAddWorkspace = false
+                refreshWorkspaces()
+                refreshSessions()
+                showPhoneChat()
+            },
+        )
+    }
+
+    // 会话重命名
+    renameTarget?.let { target ->
+        DshRenameDialog(
+            currentName = target.title,
+            error = renameError,
+            saving = renameSaving,
+            onDismiss = {
+                if (!renameSaving) {
+                    renameTarget = null
+                    renameError = null
+                }
+            },
+            onClearError = { renameError = null },
+            onSave = { newName ->
+                if (newName.isBlank() || renameSaving) return@DshRenameDialog
+                renameSaving = true
+                renameError = null
+                scope.launch(Dispatchers.IO) {
+                    try {
+                        client.renameSession(target.sessionId, newName.trim())
+                        withContext(Dispatchers.Main) {
+                            renameTarget = null
+                            renameError = null
+                            refreshSessions()
+                        }
+                    } catch (e: Exception) {
+                        withContext(Dispatchers.Main) {
+                            renameError = L.renameFailed.format(e.message ?: L.unknownError)
+                        }
+                    } finally {
+                        withContext(Dispatchers.Main) { renameSaving = false }
+                    }
+                }
+            }
+        )
+    }
+
+    // 删除工作区（取消注册；会话日志保留，不再显示在该工作区下）
+    deleteWorkspaceTarget?.let { rawPath ->
+        val path = normalizeWorkspacePath(rawPath)
+        DshConfirmDialog(
+            title = L.deleteWorkspaceTitle,
+            icon = TrashOutline16,
+            message = L.deleteWorkspaceMessage.format(path.substringAfterLast('/')),
+            confirmLabel = L.delete,
+            danger = true,
+            error = deleteWorkspaceError,
+            saving = deleteWorkspaceSaving,
+            onDismiss = {
+                if (!deleteWorkspaceSaving) {
+                    deleteWorkspaceTarget = null
+                    deleteWorkspaceError = null
+                }
+            },
+            onConfirm = {
+                if (deleteWorkspaceSaving) return@DshConfirmDialog
+                deleteWorkspaceSaving = true
+                deleteWorkspaceError = null
+                scope.launch(Dispatchers.IO) {
+                    try {
+                        client.deleteWorkspace(path)
+                        withContext(Dispatchers.Main) {
+                            if (localHideAfterRemote(accepted = true)) {
+                                setDeletedWorkspace(path)
+                                workspaceCatalogItems = workspaceCatalogItems.filter {
+                                    normalizeWorkspacePath(it.path) != path
+                                }
+                                if (pendingSessionCwd?.let(::normalizeWorkspacePath) == path) pendingSessionCwd = null
+                                if (workspacePrefs.lastSelectedWorkspace?.let(::normalizeWorkspacePath) == path) {
+                                    workspacePrefs.lastSelectedWorkspace = null
+                                }
+                                refreshSessions()
+                            }
+                            deleteWorkspaceTarget = null
+                            deleteWorkspaceError = null
+                            refreshWorkspaces()
+                        }
+                    } catch (e: Exception) {
+                        withContext(Dispatchers.Main) {
+                            deleteWorkspaceError = L.deleteWorkspaceFailed.format(e.message ?: L.unknownError)
+                        }
+                    } finally {
+                        withContext(Dispatchers.Main) { deleteWorkspaceSaving = false }
+                    }
+                }
+            }
+        )
+    }
+
+    // 删除会话（服务端归档 + 本机隐藏）
+    deleteSessionTarget?.let { target ->
+        DshConfirmDialog(
+            title = L.deleteSessionTitle,
+            icon = TrashOutline16,
+            message = L.deleteSessionMessage.format(displaySessionTitle(target.title)),
+            confirmLabel = L.delete,
+            danger = true,
+            error = deleteSessionError,
+            saving = deleteSessionSaving,
+            onDismiss = {
+                if (!deleteSessionSaving) {
+                    deleteSessionTarget = null
+                    deleteSessionError = null
+                }
+            },
+            onConfirm = {
+                if (deleteSessionSaving) return@DshConfirmDialog
+                deleteSessionSaving = true
+                deleteSessionError = null
+                archiveSessionNow(target, asDeleted = true) { err ->
+                    deleteSessionSaving = false
+                    if (err == null) {
+                        deleteSessionTarget = null
+                        deleteSessionError = null
+                    } else {
+                        deleteSessionError = err
+                    }
+                }
+            }
+        )
+    }
+
+    if (showSubagentSheet) {
+        SubagentBottomSheet(
+            sessions = sessions,
+            currentSession = currentSession,
+            currentSessionId = currentSessionId,
+            onSelectSession = { selectSession(it) },
+            onDismiss = { showSubagentSheet = false },
+        )
+    }
+
+    val browseSessionId = currentSessionId
+    if (showFileBrowser && browseSessionId != null) {
+        WorkspaceFileBrowserSheet(
+            sessionId = browseSessionId,
+            loadDir = client::getWorkspaceTree,
+            fetchFile = client::getSessionFile,
+            onDismiss = { showFileBrowser = false },
+            rootName = currentSession?.cwd?.trimEnd('/')?.substringAfterLast('/'),
+            onQuote = { path -> inputText = L.fileQuotePrefill.format(path) + inputText; showFileBrowser = false },
+        )
+    }
+}

@@ -1,0 +1,147 @@
+name: CI
+
+on:
+  push:
+    paths-ignore:
+      - 'apps/android/**'
+  pull_request:
+    paths-ignore:
+      - 'apps/android/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dsh-links-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  plugin:
+    name: Node gates
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 9
+
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          cache: pnpm
+
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate client and verify clean tree
+        run: pnpm build:client && git diff --exit-code -- src/client.js
+
+      - name: Run tests
+        run: pnpm test
+
+      - name: Verify plugin package contents
+        run: npm pack --dry-run
+
+      - name: Audit production dependencies
+        run: pnpm audit --prod
+
+      - name: Check whitespace errors
+        run: git diff --check -- ':!relay'
+
+  relay:
+    name: Go gates
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: relay
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: relay/go.mod
+          cache-dependency-path: relay/go.sum
+
+      - name: Verify formatting
+        run: test -z "$(gofmt -l .)"
+
+      - name: Run race tests
+        run: go test ./... -race -count=1 -timeout 120s
+
+      - name: Run vet
+        run: CGO_ENABLED=0 go vet ./...
+
+      - name: Build binary
+        run: CGO_ENABLED=0 go build ./cmd/dlp-relay
+
+      - name: Run control-frame fuzz smoke gate
+        run: go test ./internal/dlp -run=^$ -fuzz=FuzzParseControl -fuzztime=10s
+
+      - name: Check whitespace errors
+        run: git diff --check
+        working-directory: .
+
+  dlp1-e2e:
+    name: DLP/1 end to end
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+
+      - name: Detect DLP changes
+        id: dlp
+        run: |
+          set -eu
+          run=false
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            run=true
+          else
+            if [ "${{ github.event_name }}" = "pull_request" ]; then
+              base="${{ github.event.pull_request.base.sha }}"
+            else
+              base="${{ github.event.before }}"
+            fi
+            if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ]; then
+              run=true
+            elif git diff --name-only "$base" HEAD | grep -Eq '^(src/remote/|relay/|testdata/|scripts/dlp1-e2e\.mjs)'; then
+              run=true
+            fi
+          fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+
+      - name: Set up pnpm
+        if: steps.dlp.outputs.run == 'true'
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 9
+
+      - name: Set up Node.js
+        if: steps.dlp.outputs.run == 'true'
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          cache: pnpm
+
+      - name: Set up Go
+        if: steps.dlp.outputs.run == 'true'
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: relay/go.mod
+          cache-dependency-path: relay/go.sum
+
+      - name: Install locked dependencies
+        if: steps.dlp.outputs.run == 'true'
+        run: pnpm install --frozen-lockfile
+
+      - name: Run DLP/1 end to end
+        if: steps.dlp.outputs.run == 'true'
+        run: DLP1_E2E_SKIP_ANDROID=1 npm run test:dlp1-e2e
