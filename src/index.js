@@ -55,6 +55,7 @@ import {
   requestBelongsToSession,
 } from "./request-lifecycle.js"
 import { createRemoteRuntime } from "./remote/runtime.js"
+import { oneLine, toolCallDetail } from "./approval-detail.js"
 
 import { applyMobileSessionSafety, handleMobileApi } from "./mobile-api.js"
 import { hostDiagnosticsSource, runDiagnostics } from "./diagnostics.js"
@@ -1984,6 +1985,7 @@ export function apply(ctx, config) {
         settled: false,
         callId: req?.callId ?? null,
         toolName: req?.toolName ?? req?.name ?? req?.payload?.toolName ?? null,
+        reason: typeof req?.reason === "string" && req.reason.trim() ? req.reason.trim().slice(0, 400) : null,
         signal: req?.signal,
         settle: (outcome) => resolve(APPROVAL_OUTCOMES.has(outcome) ? outcome : "unavailable"),
       }
@@ -2007,6 +2009,21 @@ export function apply(ctx, config) {
         }, (error) => {
           ctx.logger.warn(`dsh-links: 电脑端审批通道异常：${String(error?.code ?? error?.message ?? error)} session=${String(sessionId).slice(0, 8)}`)
         })
+      // 审批要显示「这次到底要做什么」：approval/request 只给 toolName/callId/reason，
+      // 参数在紧邻的 tool/call 事件里。补一次，失败就只显示工具名，不影响审批本身。
+      if (req?.callId) {
+        const callId = String(req.callId)
+        Promise.resolve()
+          .then(() => callLocalRpc(targetPort, "session.history", { sessionId, maxMessages: 24 }))
+          .then((history) => {
+            const call = (history?.events ?? []).find((item) =>
+              item?.event?.type === "tool/call" && String(item.event.data?.callId ?? "") === callId)
+            const detail = toolCallDetail(rec.toolName, call?.event?.data?.arguments)
+            if (!detail) return
+            rec.detail = detail
+            rec.headline = oneLine(detail)
+          }, () => {})
+      }
     })
   }), { prepend: true })
 
@@ -2060,7 +2077,7 @@ export function apply(ctx, config) {
       const questions = new Set()
       for (const rec of rt.requests.pendingApprovals.values()) {
         if (!rec?.sessionId || approvals.has(rec.sessionId)) continue
-        approvals.set(rec.sessionId, { id: rec.id, toolName: rec.toolName ?? "" })
+        approvals.set(rec.sessionId, { id: rec.id, toolName: rec.toolName ?? "", detail: rec.detail ?? "" })
       }
       for (const rec of rt.requests.pendingQuestions.values()) {
         if (rec?.sessionId) questions.add(rec.sessionId)
@@ -2076,6 +2093,8 @@ export function apply(ctx, config) {
           // 双端审批：让 App 后台通知能带上审批 id 和工具名，直接给「允许一次 / 拒绝」。
           pendingApprovalId: approval?.id ?? null,
           pendingApprovalToolName: approval?.toolName ?? null,
+          // 通知栏也要能看见「在跑什么命令」，否则只能盲批。
+          pendingApprovalDetail: approval?.detail ? String(approval.detail).slice(0, 600) : null,
           pendingQuestion: questions.has(item?.sessionId),
           awaitingInput: Boolean(rt.awaiting?.has(item?.sessionId)),
         }

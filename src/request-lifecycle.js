@@ -197,6 +197,10 @@ export function createRequestRegistry({
         deadlineAt: rec.deadlineAt,
         callId: rec.callId ?? null,
         toolName: rec.toolName ?? null,
+        // 手机上的审批栏要显示「在跑什么命令」，只给工具名等于让人盲批。
+        detail: rec.detail ?? null,
+        headline: rec.headline ?? null,
+        reason: rec.reason ?? null,
       })
     }
     for (const rec of pendingQuestions.values()) {

@@ -273,6 +273,33 @@ test("只有 asked 时保持 pending，倒序重复 decided 不回滚", () => {
   assert.equal(messages[0].outcome, "cancelled")
 })
 
+test("审批卡带上同 callId 的 tool/call 参数：手机上看得到要跑什么", () => {
+  const events = [
+    ev(50, "tool/call", {
+      callId: "c9",
+      name: "bash",
+      arguments: JSON.stringify({ command: "rm -rf build && npm run build" }),
+      turn: 1,
+      step: 1,
+    }),
+    ev(51, "approval/asked", { id: "ap-9", toolName: "bash", reason: "escalate sandbox", callId: "c9" }),
+  ]
+  const { messages } = projectHistoryPage({ events, reasoningBySeq: new Map(), hasMore: false })
+  const card = messages.find((m) => m.role === "approval")
+  assert.equal(card.detail, "rm -rf build && npm run build")
+  assert.equal(card.text, "rm -rf build && npm run build")
+  assert.equal(card.reason, "escalate sandbox")
+  assert.equal(JSON.parse(card.args).command, "rm -rf build && npm run build")
+})
+
+test("拿不到参数时审批卡退回 reason，不假装有内容", () => {
+  const events = [ev(60, "approval/asked", { id: "ap-10", toolName: "bash", reason: "运行命令", callId: "cx" })]
+  const { messages } = projectHistoryPage({ events, reasoningBySeq: new Map(), hasMore: false })
+  assert.equal(messages[0].detail, null)
+  assert.equal(messages[0].text, "运行命令")
+  assert.equal(messages[0].args, undefined)
+})
+
 test("失败的 write 不投影产出文件", () => {
   const events = [
     userMsg(1, "写个文件"),

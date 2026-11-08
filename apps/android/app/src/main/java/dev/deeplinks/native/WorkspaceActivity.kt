@@ -1352,13 +1352,22 @@ fun WorkspaceScreen(
             }
             "approval/asked" -> {
                 val approvalId = data.optString("id", "")
+                val toolName = data.optString("toolName", "tool")
+                val callId = data.optNullableString("callId")
+                // 宿主的事件只带 toolName/callId；参数在上一条同 callId 的 tool_call 里。
+                // 手机端自己拼一次，卡片不会先停在「有个待审批」等快照回来。
+                val previousCall = callId?.let { id -> messages.lastOrNull { it.role == "tool_call" && it.callId == id } }
+                val detail = approvalCommand(previousCall?.toolArgs)
+                val reason = data.optString("reason").trim()
                 appendStreamMessage(MobileMessage(
                     id = "approval-${approvalId.ifBlank { item.seq.toString() }}",
                     role = "approval",
-                    text = data.optString("reason").ifBlank { L.approvalRequest.format(data.optString("toolName", L.toolFallbackName)) },
-                    toolName = data.optString("toolName", "tool"),
+                    text = detail ?: reason.ifBlank { L.approvalRequest.format(toolName) },
+                    detail = detail,
+                    toolArgs = previousCall?.toolArgs,
+                    toolName = toolName,
                     approvalId = approvalId,
-                    callId = data.optNullableString("callId"),
+                    callId = callId,
                     time = item.time,
                     type = "approval",
                     seq = item.seq,
@@ -1367,7 +1376,7 @@ fun WorkspaceScreen(
                 workspaceViewModel.refreshRequestSnapshot()
                 val sid = currentSessionId
                 if (!isForeground && sid != null) {
-                    DshNotifier.notifyApproval(context, host, sid, data.optString("toolName", L.toolFallbackName))
+                    DshNotifier.notifyApproval(context, host, sid, toolName, detail = detail)
                 }
             }
             "approval/decided" -> {

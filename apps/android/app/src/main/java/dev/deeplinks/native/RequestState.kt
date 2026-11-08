@@ -106,7 +106,9 @@ internal fun applyRequestSnapshotToMessages(
                 withState.copy(
                     toolName = withState.toolName ?: rec.toolName,
                     callId = withState.callId ?: rec.callId,
-                    text = withState.text.ifBlank { rec.toolName.orEmpty() },
+                    // 快照里的工作内容补上历史投影缺的那份（老会话、翻页边界都可能缺）。
+                    detail = withState.detail ?: rec.detail,
+                    text = withState.text.ifBlank { rec.detail ?: rec.toolName.orEmpty() },
                     takenOverByPhone = true,
                 )
             }
@@ -146,8 +148,9 @@ internal fun mergeMessagesWithRequestSnapshot(
                 MobileMessage(
                     id = "approval-${rec.id}",
                     role = "approval",
-                    text = rec.toolName.orEmpty(),
+                    text = rec.detail?.takeIf { it.isNotBlank() } ?: rec.toolName.orEmpty(),
                     toolName = rec.toolName,
+                    detail = rec.detail,
                     approvalId = rec.id,
                     callId = rec.callId,
                     type = "approval",

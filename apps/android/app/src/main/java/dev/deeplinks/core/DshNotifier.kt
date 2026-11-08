@@ -144,16 +144,26 @@ object DshNotifier {
         toolName: String,
         approvalId: String? = null,
         sessionTitle: String = "",
+        detail: String? = null,
     ) {
         // 阶段 8 第 3 条：设置页的两个开关（存本机）决定发不发。关卡放在这里而不是调用点，
         // 是为了「一个地方管住所有通知」——调用点分散在 WorkspaceActivity 多处，漏一处就是 bug。
         if (!WorkspacePrefs(context).notifyOnApproval) return
+        val work = detail?.trim()?.takeIf { it.isNotEmpty() }
         val builder = base(context, host, sessionId, CHANNEL_ID_APPROVAL)
             // v4 8.2：标题带会话名，正文是状态（哪个工具在等）
             .setContentTitle(sessionTitle.takeIf { it.isNotBlank() }?.let { L.notifApprovalTitle.format(it) } ?: L.notifNeedApproval)
             .setContentText(L.notifNeedApprovalBody.format(toolName))
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setAutoCancel(true)
+        // 通知栏也要看得见「要跑什么」：命令折行到多行展开区，而不是只报工具名。
+        if (work != null) {
+            builder.setStyle(
+                NotificationCompat.BigTextStyle()
+                    .bigText("${L.notifNeedApprovalBody.format(toolName)}\n$work")
+                    .setSummaryText(L.notifNeedApproval),
+            )
+        }
         if (!approvalId.isNullOrBlank()) {
             val kinds = approvalActionKinds(
                 quickApprove = WorkspacePrefs(context).allowApproveFromNotification,

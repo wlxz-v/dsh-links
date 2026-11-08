@@ -22,6 +22,13 @@
 - Android 侧：`HostEventClient.Item.State` 解析 `approvalId` / `approvalToolName`；后台监控在「非当前会话 + 待审批」时，有 id 就发带动作的审批通知（`DshNotifier.notifyApproval`），没有则保持旧的「请在电脑上处理」提示。
 - 已知体验缺口：手机先答时，电脑端那条 waterfall 请求仍在册，网页上的审批框要等宿主把 `approval/decided` 写进会话后自己收（插件无法替下游取消），通常在一次事件轮询内。
 
+**审批看得见工作内容**
+
+- 宿主 `approval/request` 只带 `toolName` / `callId` / `reason`，参数在同一条 `tool/call` 事件里。插件现在按 `callId` 把参数拼回来：history 投影的审批卡带 `detail`（命令原文 / 文件路径，≤600 字符）与 `args`（原始参数 JSON），卡片正文从「有个待审批」变成真正要执行的内容。
+- 主机事件 `session/state` 在待审批时增加 `approvalDetail`；`GET .../requests` 的 pending 审批增加 `detail` / `headline` / `reason`，`reason` 保留宿主的规则说明（例如「escalate sandbox to danger-full-access」）。
+- Android：`MobileMessage.detail` 与 `SessionRequestState.detail` 解析新字段；决策栏先用 `args` 里的 `command`/`cmd`/`script`，其次用 `detail`，只有两者都没有时才显示「看不到参数」；消息流里的审批卡在状态行下方补一段工作内容；审批通知用 `BigTextStyle` 展开命令原文。
+- 新增 `src/approval-detail.js`（纯函数，含截断与单行摘要）与 `test/approval-detail.test.mjs`。
+
 **已知问题（Windows 开发机）**
 
 - `npm test` 里 13 个用例仍失败，全部是 Windows 环境限制、与插件行为无关：符号链接需要开发者模式/管理员（8 个）、`chmod 448` 在 Windows 上是 438（1 个）、`openssl` / `npm` 不在 PATH（2 个）、POSIX 路径分隔符断言（2 个）。Linux CI 上全部通过。

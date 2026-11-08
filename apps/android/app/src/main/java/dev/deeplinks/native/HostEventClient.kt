@@ -39,6 +39,8 @@ class HostEventClient(
              */
             val approvalId: String? = null,
             val approvalToolName: String? = null,
+            /** 这次审批要做什么（命令原文等），通知正文直接显示；老插件不发。 */
+            val approvalDetail: String? = null,
         ) : Item
         data object Resync : Item
         data object Disconnected : Item
@@ -183,6 +185,7 @@ class HostEventClient(
                         // optString 缺键返回 ""，这里要的是「有没有」，空串统一成 null。
                         approvalId = obj.optString("approvalId").takeIf { it.isNotBlank() },
                         approvalToolName = obj.optString("approvalToolName").takeIf { it.isNotBlank() },
+                        approvalDetail = obj.optString("approvalDetail").takeIf { it.isNotBlank() },
                     ),
                 )
             }

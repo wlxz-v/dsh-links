@@ -1,4 +1,5 @@
 import { classifyUserMessage } from "./context-injection.js"
+import { toolCallDetail } from "./approval-detail.js"
 import { mutationPath, toolResultContent, toolResultIsError, toolResultMeta, uniquePaths } from "./produced-files.js"
 import { MAX_EMBEDDED_CHANGED_FILES, projectChangesSummary } from "./workspace-changes.js"
 
@@ -85,6 +86,8 @@ export function projectHistoryPage({ events, reasoningBySeq = new Map(), hasMore
 
   // tool/result 耗时：同 callId 的 tool/call 到 result 时差
   const toolCalls = new Map()
+  // 审批要显示「这次到底要做什么」，参数只在这条 tool/call 里（approval/asked 紧跟其后）。
+  const toolCallArgs = new Map()
   const mutationCalls = new Map()
   const producedByTurn = new Map()
   let lastTurnEndReason = null
@@ -175,12 +178,23 @@ export function projectHistoryPage({ events, reasoningBySeq = new Map(), hasMore
       const approvalId = e.data?.id ?? ""
       const decided = approvalId ? decidedById.get(approvalId) : null
       const outcome = decided ? approvalOutcomeOf(decided) : null
+      const toolName = e.data?.toolName || "tool"
+      const reason = String(e.data?.reason ?? "").trim()
+      // 参数从同 callId 的 tool/call 拼回来：审批卡要看得见「要执行什么」，
+      // 只给工具名等于让人盲批。
+      const callArgs = toolCallArgs.get(String(e.data?.callId ?? ""))
+      const detail = toolCallDetail(toolName, callArgs)
+      const args = callArgs == null ? null : (typeof callArgs === "string" ? callArgs : JSON.stringify(callArgs))
       push({
         id: `approval-${approvalId || e.seq}`,
         seq: e.seq,
         role: "approval",
-        text: e.data?.reason || `请求授权执行 ${e.data?.toolName || "工具"}`,
-        toolName: e.data?.toolName || "tool",
+        text: detail || reason || `请求授权执行 ${toolName}`,
+        detail,
+        reason,
+        toolName,
+        // App 的决策栏优先从 args 里取 command/cmd/script；老 App 忽略多出来的键。
+        ...(args ? { args } : {}),
         approvalId,
         callId: e.data?.callId ?? "",
         requestStatus: decided ? approvalUiStatus(outcome) : "pending",
@@ -193,12 +207,20 @@ export function projectHistoryPage({ events, reasoningBySeq = new Map(), hasMore
       const approvalId = e.data?.id ?? ""
       if (approvalId && askedIds.has(approvalId)) continue
       const outcome = approvalOutcomeOf(e)
+      const toolName = e.data?.toolName || "tool"
+      const reason = String(e.data?.reason ?? "").trim()
+      const callArgs = toolCallArgs.get(String(e.data?.callId ?? ""))
+      const detail = toolCallDetail(toolName, callArgs)
+      const args = callArgs == null ? null : (typeof callArgs === "string" ? callArgs : JSON.stringify(callArgs))
       push({
         id: `approval-${approvalId || e.seq}`,
         seq: e.seq,
         role: "approval",
-        text: e.data?.reason || `请求授权执行 ${e.data?.toolName || "工具"}`,
-        toolName: e.data?.toolName || "tool",
+        text: detail || reason || `请求授权执行 ${toolName}`,
+        detail,
+        reason,
+        toolName,
+        ...(args ? { args } : {}),
         approvalId,
         callId: e.data?.callId ?? "",
         requestStatus: approvalUiStatus(outcome),
@@ -209,6 +231,7 @@ export function projectHistoryPage({ events, reasoningBySeq = new Map(), hasMore
     } else if (e.type === "tool/call") {
       flushReasoning(e.time)
       toolCalls.set(e.data?.callId, { time: e.time })
+      toolCallArgs.set(String(e.data?.callId ?? ""), e.data?.arguments)
       const path = mutationPath(e.data?.name, e.data?.arguments)
       if (path) mutationCalls.set(String(e.data?.callId ?? ""), { path, turn: e.data?.turn })
       push({

@@ -28,7 +28,6 @@ import dev.deeplinks.core.decisionCustom
 import dev.deeplinks.core.decisionNext
 import dev.deeplinks.core.decisionPrev
 import dev.deeplinks.core.decisionQuestionIndex
-import dev.deeplinks.core.decisionRunCommand
 import dev.deeplinks.core.decisionSkip
 import dev.deeplinks.core.decisionUseTool
 import dev.deeplinks.core.decisionWaitAnswer
@@ -95,6 +94,9 @@ internal fun ApprovalDecisionBar(
     var submitting by remember(msg.id) { mutableStateOf(false) }
     var error by remember(msg.id) { mutableStateOf<String?>(null) }
     val command = approvalCommand(msg.toolArgs)
+    // 插件现在会把工作内容放进 detail（命令原文 / 改哪个文件）：先给命令块，再退回原文。
+    val detail = msg.detail?.trim()?.takeIf { it.isNotEmpty() }
+    val work = command ?: detail
     val tool = msg.toolName ?: L.toolFallbackName
     fun submit(outcome: String) {
         val id = msg.approvalId ?: return
@@ -110,12 +112,13 @@ internal fun ApprovalDecisionBar(
     DlDecisionBar(
         status = L.decisionWaitApproval,
         question = when {
+            // 有工作内容时，标题只说明「哪个工具要动手」，正文留给命令本身
+            work != null -> L.decisionUseTool.format(tool)
             msg.text.isNotBlank() -> msg.text
-            command != null -> L.decisionRunCommand
             else -> L.decisionUseTool.format(tool)
         },
-        command = command ?: tool,
-        note = if (command == null) L.approvalArgsMissing else null,
+        command = work ?: tool,
+        note = if (work == null) L.approvalArgsMissing else null,
         secondary = DlAction(L.reject, { submit("rejected") }, enabled = !submitting),
         primary = DlAction(L.allowOnce, { submit("allowed-once") }, enabled = !submitting),
         modifier = modifier,

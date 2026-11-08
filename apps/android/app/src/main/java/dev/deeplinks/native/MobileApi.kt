@@ -33,6 +33,11 @@ data class MobileMessage(
     val text: String,
     val toolName: String? = null,
     val toolArgs: String? = null,
+    /**
+     * 审批的具体工作内容（命令原文、改哪个文件等），插件从同 callId 的 tool/call 里拼出来。
+     * 老插件不发；`text` 已经是同内容的兜底。
+     */
+    val detail: String? = null,
     val approvalId: String? = null,
     val callId: String? = null,
     val time: Long = 0L,
@@ -179,6 +184,8 @@ data class SessionRequestState(
     val questionsJson: String? = null,
     val toolName: String? = null,
     val callId: String? = null,
+    /** 审批的工作内容（命令原文等）；老插件不发。 */
+    val detail: String? = null,
 )
 
 data class SessionRequestSnapshot(
@@ -201,6 +208,7 @@ internal fun parseSessionRequestSnapshot(root: JSONObject): SessionRequestSnapsh
                 outcome = obj.optNullableString("outcome"),
                 toolName = obj.optNullableString("toolName"),
                 callId = obj.optNullableString("callId"),
+                detail = obj.optNullableString("detail"),
             )
         },
         questions = (0 until questions.length()).mapNotNull { i ->
@@ -1372,6 +1380,7 @@ internal fun parseHistoryResponse(root: JSONObject, beforeSeq: Long?): HistoryRe
             text = obj.optStringOrEmpty("text", ""),
             toolName = obj.optNullableString("name") ?: obj.optNullableString("toolName"),
             toolArgs = obj.optNullableString("args"),
+            detail = obj.optNullableString("detail"),
             approvalId = obj.optNullableString("approvalId"),
             callId = obj.optNullableString("callId"),
             time = obj.optLong("time", 0L),

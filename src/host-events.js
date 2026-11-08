@@ -39,6 +39,10 @@ export function classifyHostSession(row) {
   const approvalToolName = approvalId && typeof row?.pendingApprovalToolName === "string" && row.pendingApprovalToolName
     ? row.pendingApprovalToolName.slice(0, 64)
     : null
+  // 审批的具体工作内容（命令原文等）：手机上只给选项等于盲批。
+  const approvalDetail = approvalId && typeof row?.pendingApprovalDetail === "string" && row.pendingApprovalDetail
+    ? row.pendingApprovalDetail.slice(0, 600)
+    : null
   return {
     sessionId,
     state,
@@ -46,6 +50,7 @@ export function classifyHostSession(row) {
     origin,
     ...(approvalId ? { approvalId } : {}),
     ...(approvalToolName ? { approvalToolName } : {}),
+    ...(approvalDetail ? { approvalDetail } : {}),
   }
 }
 
@@ -66,7 +71,8 @@ export function diffHostSessions(previous, next, { initial = false } = {}) {
       continue
     }
     if (prev.state !== row.state || prev.title !== row.title || prev.origin !== row.origin
-      || prev.approvalId !== row.approvalId || prev.approvalToolName !== row.approvalToolName) {
+      || prev.approvalId !== row.approvalId || prev.approvalToolName !== row.approvalToolName
+      || prev.approvalDetail !== row.approvalDetail) {
       events.push({ ...row })
     }
   }
@@ -87,6 +93,7 @@ export function hostEventFrame(event) {
     seq: event.seq,
     ...(event.approvalId ? { approvalId: event.approvalId } : {}),
     ...(event.approvalToolName ? { approvalToolName: event.approvalToolName } : {}),
+    ...(event.approvalDetail ? { approvalDetail: event.approvalDetail } : {}),
     // F2：终态事件是否值得推一条通知。缺失/true 时按老行为推送；
     // false 表示「同一个会话刚刚已经报过终态」——自动重试里的瞬时失败、
     // 或轮询抖动导致的重复终态，别让手机再响一次。

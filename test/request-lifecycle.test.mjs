@@ -161,3 +161,42 @@ test("snapshot 含 pending 澄清题目与审批元数据", () => {
   assert.equal(snap.questions[0].questions[0].id, "q1")
   assert.equal(snap.questions[0].questions[0].question, "选一个")
 })
+
+test("snapshot 的审批带 detail/headline/reason：手机决策栏不只剩两个按钮", () => {
+  const registry = createRequestRegistry({ now: () => 1_000, setTimeoutFn: () => ({}), clearTimeoutFn: () => {} })
+  registry.addApproval({
+    id: "ap-2",
+    sessionId: "s1",
+    type: "approval",
+    createdAt: 1_000,
+    deadlineAt: 1_000 + APPROVAL_TIMEOUT_MS,
+    eligibleDeviceIds: new Set(),
+    settled: false,
+    settle() {},
+    toolName: "pwsh",
+    reason: "escalate sandbox to danger-full-access",
+    detail: "Remove-Item -Recurse build",
+    headline: "pwsh · Remove-Item -Recurse build",
+  })
+  const rec = registry.snapshot("s1").approvals[0]
+  assert.equal(rec.detail, "Remove-Item -Recurse build")
+  assert.equal(rec.headline, "pwsh · Remove-Item -Recurse build")
+  assert.equal(rec.reason, "escalate sandbox to danger-full-access")
+
+  // 拿不到命令时字段为 null，客户端据此显示「看不到参数」，而不是空串冒充内容。
+  registry.addApproval({
+    id: "ap-3",
+    sessionId: "s2",
+    type: "approval",
+    createdAt: 1_000,
+    deadlineAt: 1_000 + APPROVAL_TIMEOUT_MS,
+    eligibleDeviceIds: new Set(),
+    settled: false,
+    settle() {},
+    toolName: "bash",
+  })
+  const bare = registry.snapshot("s2").approvals[0]
+  assert.equal(bare.detail, null)
+  assert.equal(bare.headline, null)
+  assert.equal(bare.reason, null)
+})

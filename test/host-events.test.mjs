@@ -177,3 +177,30 @@ test("待审批事件带 approvalId：App 后台通知可以直接作答（双�
   // 没有挂起审批时事件形状不变（工具名只随审批出现）。
   assert.deepEqual(Object.keys(classifyHostSession(row())).sort(), ["origin", "sessionId", "state", "title"])
 })
+
+test("待审批事件带 approvalDetail：通知栏/决策栏看得见要跑什么", () => {
+  const approval = classifyHostSession(row({
+    pendingApproval: true,
+    pendingApprovalId: "ap-777",
+    pendingApprovalToolName: "pwsh",
+    pendingApprovalDetail: "Remove-Item -Recurse build",
+  }))
+  assert.equal(approval.approvalDetail, "Remove-Item -Recurse build")
+  const body = JSON.parse(hostEventFrame({ ...approval, seq: 9 }).split("data: ")[1])
+  assert.equal(body.approvalDetail, "Remove-Item -Recurse build")
+
+  // 同一审批的工作内容变了（例如回填历史后才拿到命令）也要推一次，否则手机停在「看不到参数」。
+  const prev = new Map([["s1", classifyHostSession(row({
+    pendingApproval: true,
+    pendingApprovalId: "ap-777",
+    pendingApprovalToolName: "pwsh",
+  }))]])
+  const next = new Map([["s1", approval]])
+  const changed = diffHostSessions(prev, next)
+  assert.equal(changed.length, 1)
+  assert.equal(changed[0].approvalDetail, "Remove-Item -Recurse build")
+
+  // 没有工作内容时不出这个键（老客户端看到的帧形状不变）。
+  const bare = classifyHostSession(row({ pendingApproval: true, pendingApprovalId: "ap-1", pendingApprovalToolName: "pwsh" }))
+  assert.equal("approvalDetail" in bare, false)
+})

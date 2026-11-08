@@ -25,7 +25,7 @@
 
 `capabilities.diagnostics: { v: 1 }` 表示可以拉连接诊断，见下方「连接诊断」。旧 App 忽略该字段。
 
-`capabilities.events: { host: true }` 表示可以订阅 `GET /dsh-link/mobile/events`（设备 token，SSE）。事件只有会话级状态，不包含消息正文和工具参数：`id` 为单调 seq，`event: session/state`，正文 `{ type, sessionId, state, title, origin, seq, notify? }`。`state` 为 `running` / `awaitingApproval` / `awaitingInput` / `completed` / `failed` / `stopped`，`origin` 为 `user` / `subagent` / `schedule`。DSH 没有全局会话事件时，插件只在有订阅者的情况下每 5 秒对 `session.list` 做差分。心跳为 25 秒的 `event: heartbeat`。请求带 `Last-Event-ID`：缓冲里接得上就补发，接不上发 `event: resync-required`。`notify` 只在为 `false` 时下发：同一会话 60 秒内重复出现的同一种终态（自动重试里的瞬时失败、轮询抖动）标记为不必再通知，App 据此少响一次；缺省即通知。旧 App 忽略该键。`state` 为 `awaitingApproval` 时还会带 `approvalId`（待办审批 id）与 `approvalToolName`（工具名，截断到 64 字符）：App 后台收到后可以直接弹出带「允许一次 / 拒绝」的通知，不必等用户打开该会话（双端审批）。两个键只在确有挂起审批时出现，老插件不发，旧 App 忽略该键。旧 App 忽略该能力。
+`capabilities.events: { host: true }` 表示可以订阅 `GET /dsh-link/mobile/events`（设备 token，SSE）。事件只有会话级状态，不包含消息正文和工具参数：`id` 为单调 seq，`event: session/state`，正文 `{ type, sessionId, state, title, origin, seq, notify? }`。`state` 为 `running` / `awaitingApproval` / `awaitingInput` / `completed` / `failed` / `stopped`，`origin` 为 `user` / `subagent` / `schedule`。DSH 没有全局会话事件时，插件只在有订阅者的情况下每 5 秒对 `session.list` 做差分。心跳为 25 秒的 `event: heartbeat`。请求带 `Last-Event-ID`：缓冲里接得上就补发，接不上发 `event: resync-required`。`notify` 只在为 `false` 时下发：同一会话 60 秒内重复出现的同一种终态（自动重试里的瞬时失败、轮询抖动）标记为不必再通知，App 据此少响一次；缺省即通知。旧 App 忽略该键。`state` 为 `awaitingApproval` 时还会带 `approvalId`（待办审批 id）、`approvalToolName`（工具名，截断到 64 字符）与 `approvalDetail`（这次要做什么：命令原文、文件路径等，截断到 600 字符）：App 后台收到后可以直接弹出带「允许一次 / 拒绝」的通知，并在通知展开区显示工作内容，不必等用户打开该会话（双端审批）。三个键只在确有挂起审批、且该值存在时出现，老插件不发，旧 App 忽略该键。旧 App 忽略该能力。
 
 `capabilities.preview: { v: 1, detect: 1 }` 表示可以列已批准的本机预览，并且可以列出工具输出里看到的端口。`v` 仍是 1，旧 App 只认 `v` 时预览入口不变。`detect` 是新增字段，旧 App 忽略。手机不能批准端口。
 
@@ -176,7 +176,8 @@ DSH 结果映射：`allowed-once`/`rejected` → `resolved`；`cancelled` → `c
 - 同页 `approval/asked` 与 `approval/decided` 投影为一张终态卡。
 - 同 `approvalId` 的审批卡、同 `rpcId` 的澄清卡在客户端各归并为一张；终态不得被 pending 回滚。
 - 实时流、重连快照、`GET .../requests`、提交响应走同一归并：终态不得被 pending 回滚。
-- `GET .../requests` 的 pending 澄清带原始 `questions` 数组，pending 审批带 `toolName` / `callId`；空白 id 忽略。
+- `GET .../requests` 的 pending 澄清带原始 `questions` 数组，pending 审批带 `toolName` / `callId` / `detail` / `headline` / `reason`；空白 id 忽略。
+- 审批的 `detail` 是「这次要做什么」：插件按 `callId` 从紧邻的 `tool/call` 事件里取参数（命令原文、文件路径等），截断到 600 字符；`reason` 是宿主的规则说明（如「escalate sandbox to danger-full-access」），拿不到参数时为 `null`，客户端据此显示「看不到参数」而不是空白。history 投影里的审批卡同样带 `detail` 与 `args`（原始参数 JSON 字符串），App 决策栏优先用 `args` 里的 `command`，其次用 `detail`。
 - 澄清卡不进 history 投影。App 历史刷新与 `resync-required` 后必须保留仍 pending 的 `question` / `approval` 气泡，并用快照补回进程重启或列表被清空后缺失的 pending 卡。
 - 审批重复提交若已有终态，返回 `alreadySettled` 且不再次 settle。
 - SSE 断开后有不超过 30 秒且不超过原审批剩余期限的重连宽限；重连不重置 5 分钟总超时。
