@@ -37,10 +37,12 @@ const DROP_HEADERS = new Set([
 
 export function previewPortProblem(port, { pluginPort, hostPort } = {}) {
   const n = typeof port === "number" ? port : Number(String(port ?? "").trim())
+  const read = (value) => (typeof value === "function" ? value() : value)
   if (!Number.isInteger(n) || n < 1 || n > 65535) return "端口无效"
   if (BLACKLIST.has(n)) return "这个端口不能预览"
-  if (pluginPort != null && n === Number(pluginPort)) return "不能预览插件自己的端口"
-  if (hostPort != null && n === Number(hostPort)) return "不能预览 Host 自己的端口"
+  // pluginPort 可能是 getter：端口顺延后真实端口变了，仍要挡住预览到它自己。
+  if (pluginPort != null && n === Number(read(pluginPort))) return "不能预览插件自己的端口"
+  if (hostPort != null && n === Number(read(hostPort))) return "不能预览 Host 自己的端口"
   return null
 }
 

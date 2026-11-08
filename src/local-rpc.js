@@ -39,9 +39,11 @@ export const RPC_METHOD_ALLOWLIST = Object.freeze([
   "session.updateQueue",
   "schedule.catalog",
   "schedule.delete",
+  "schedule.edit",
   "schedule.history",
   "schedule.list",
   "schedule.update",
+  "schedule.view",
   "settings.describe",
   "settings.mutate",
   "settings.update",
@@ -223,6 +225,11 @@ const WIRE = Object.freeze({
   "schedule.history": { namespace: "schedule", method: "history", args: requestArgs },
   "schedule.update": { namespace: "schedule", method: "update", args: requestArgs },
   "schedule.delete": { namespace: "schedule", method: "delete", args: requestArgs },
+  // DSH 0.2.x 起 schedule/update 与 schedule/delete 两个 Remote 合并成 schedule/edit
+  // （request: { id, action: "update"|"delete", patch?: { title, prompt, timing } }）。
+  // 旧方法名保留在上面，作为老版本 DSH 的兜底；isMissingRemoteError() 决定走哪条。
+  "schedule.edit": { namespace: "schedule", method: "edit", args: requestArgs },
+  "schedule.view": { namespace: "schedule", method: "view", args: requestArgs },
   "settings.describe": { namespace: "settings", method: "describe", args: () => ({}) },
   "settings.mutate": { namespace: "settings", method: "mutate", args: settingsMutateArgs },
   "settings.update": { namespace: "settings", method: "update", args: settingsUpdateArgs },

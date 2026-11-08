@@ -1,5 +1,20 @@
 ## 未发布（main）
 
+**DSH 0.2.x 适配与移动端体验**
+
+- 网关 Peer（0.2.x 起 `typertGateway.prepareInvocation()` 要求 `request.peer`）：插件用 `connection.createPeer({ principal: { kind: "owner" } })` 惰性建 peer 并随每次调用带上；peer 被宿主 abort 后自动重建，调用途中收到 `gateway/peer-disposed` 会重建并重试一次（只重试一次）。旧 Host 没有 `connection` 服务时退化为不带 peer 的旧行为。
+- 定时任务写路径改为 `schedule/edit`（`{ id, action: "update" | "delete", patch }`）。0.2.x 已删除 `schedule/update`、`schedule/delete` 两个 Remote；老版本 DSH 上仍会自动回退到旧方法（CAS `expected` + `change` 原样带上），业务错误（如任务不存在）不回退。
+- 局域网地址打分：`198.18/198.19`（Clash TUN）与 `169.254`（link-local）不再出现在配对地址里；`192.168.x` > `10.x` / `172.16-31.x` > 其他，列表首项与「推荐」标记都给最可用的私网地址，同分保持系统枚举顺序。（参考 `lrxG/dsh-app` 的 `isUnreachableIPv4` / `lanScore`）
+- 端口顺延：默认端口 18640 被占用时自动按 +1 试到 +8 个，配对二维码、`pair-info`、局域网 URL、预览端口守卫、远程 `pluginPort` 全部用**实际**监听端口。探测用临时 net 服务器，不在同一个 https.Server 上反复 listen（那会留下 closing 句柄，进程退出时踩 libuv 断言）。连续 8 个端口都被占用才算启动失败。
+- `qr.png` 补 `x-content-type-options: nosniff` 与 `referrer-policy: no-referrer`（图里有配对码与证书指纹）。
+- JSON 响应压缩协商：大于 1KB 的 JSON 按 `Accept-Encoding` 选 `zstd` / `br` / `gzip`（实测 13.3KB 会话列表：gzip 673B、br 423B、zstd 533B），小响应（含 token 的配对响应）不压；`Vary: accept-encoding` 改为无条件带。Android 的 `MobileApi.request()` 不再手写 `Accept-Encoding: identity`，交给 OkHttp 自己加 gzip 并透明解压（SSE、文件下载仍显式 identity）。
+- 主机级会话事件新增 `notify` 提示：同一会话在 60 秒内重复同一种终态（自动重试里的瞬时失败、轮询抖动）标 `notify: false`，客户端可据此不重复弹通知；事件本身照发，UI 不会漏状态。参考 `dsh-meow-smooth` 的「自动重试中的瞬时错误不打扰、每条恰好一条」。
+
+**已知问题（Windows 开发机）**
+
+- `npm test` 里 13 个用例仍失败，全部是 Windows 环境限制、与插件行为无关：符号链接需要开发者模式/管理员（8 个）、`chmod 448` 在 Windows 上是 438（1 个）、`openssl` / `npm` 不在 PATH（2 个）、POSIX 路径分隔符断言（2 个）。Linux CI 上全部通过。
+- 同一进程里起两个 `apply()` 实例会在退出时踩 libuv 断言（`!(handle->flags & UV_HANDLE_CLOSING)`）；测试因此按文件串行、每文件只起一个实例（`D:/DSH/.dsh-inspect/run-tests.mjs` 逐文件跑）。
+
 **重设计 v4**
 
 - 设计稿、页面截图和执行方案放在 `docs/redesign-v4/`。proposal 002 的「自行合并到 main」自 v4 起作废，见该目录 `PLAN.md` 第 1 节。

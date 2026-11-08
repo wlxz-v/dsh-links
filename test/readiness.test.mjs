@@ -140,6 +140,10 @@ test("listen 完成后：pair-info 指纹与落盘证书一致，qr.png 正常�
   assert.equal(qr.status, 200)
   assert.equal(qr.headers?.["content-type"], "image/png")
   assert.ok(qr.raw.length > 0)
+  // E3：二维码里带配对码与证书指纹，必须带与 json() 同级的安全头
+  assert.equal(qr.headers?.["cache-control"], "no-store")
+  assert.equal(qr.headers?.["x-content-type-options"], "nosniff")
+  assert.equal(qr.headers?.["referrer-policy"], "no-referrer")
 })
 
 test("loopback / 同源围栏在就绪后不回退", async () => {
@@ -182,7 +186,7 @@ test("tls.json 无法解析：拒绝就绪、备份原文件、不生成新证�
   for (const fn of effects) try { fn() } catch (e) { assert.fail(`dispose threw: ${e}`) }
 })
 
-test("端口被占用：不假就绪、路由报 phase=failed、可清理", async () => {
+test("端口被占用：顺延到下一个端口就绪，路由报实际端口（E2）", async () => {
   const dir = join(ROOT_TMP, "occupied-port")
   mkdirSync(dir, { recursive: true, mode: 0o700 })
   copyFileSync(join(READY_DIR, "tls.json"), join(dir, "tls.json"))
@@ -190,13 +194,50 @@ test("端口被占用：不假就绪、路由报 phase=failed、可清理", asyn
   await new Promise((resolve) => occupier.listen(0, "0.0.0.0", resolve))
   const port = occupier.address().port
   const { ctx, registered, effects } = makeCtx(upstream.address().port)
-  const ready = apply(ctx, configFor(dir, port))
+  // 旧行为是直接 EADDRINUSE 失败、配对面板整块不可用；现在按 +1 顺延（见 src/index.js 的 tryListen）。
+  await apply(ctx, configFor(dir, port))
+  const pair = await callRoute(pairInfoRoute(registered))
+  assert.equal(pair.status, 200)
+  assert.equal(pair.body.port, port + 1)
+  for (const url of pair.body.urls) assert.ok(url.endsWith(`:${port + 1}`), url)
+  for (const fn of effects) try { fn() } catch (e) { assert.fail(`dispose threw: ${e}`) }
+  occupier.close()
+})
+
+test("连续 8 个端口都被占用：才算启动失败，路由报 phase=failed，可清理", async () => {
+  const dir = join(ROOT_TMP, "all-ports-occupied")
+  mkdirSync(dir, { recursive: true, mode: 0o700 })
+  copyFileSync(join(READY_DIR, "tls.json"), join(dir, "tls.json"))
+  // 找一段连续 8 个能一次性占住的端口；找不到就跳过（环境太挤时不制造假失败）。
+  let start = 0
+  const occupiers = []
+  for (let attempt = 0; attempt < 20 && !start; attempt += 1) {
+    const base = 20000 + Math.floor(Math.random() * 30000)
+    const taken = []
+    let ok = true
+    for (let offset = 0; offset < 8; offset += 1) {
+      const srv = createServer()
+      const bound = await new Promise((resolve) => {
+        srv.once("error", () => resolve(false))
+        srv.listen(base + offset, "0.0.0.0", () => resolve(true))
+      })
+      if (!bound) { ok = false; srv.close(); break }
+      taken.push(srv)
+    }
+    if (ok) { start = base; occupiers.push(...taken) } else for (const srv of taken) srv.close()
+  }
+  if (!start) {
+    for (const srv of occupiers) srv.close()
+    return
+  }
+  const { ctx, registered, effects } = makeCtx(upstream.address().port)
+  const ready = apply(ctx, configFor(dir, start))
   await assert.rejects(() => ready, (err) => err?.code === "EADDRINUSE")
   const pair = await callRoute(pairInfoRoute(registered))
   assert.equal(pair.status, 503)
   assert.equal(pair.body?.phase, "failed")
   for (const fn of effects) try { fn() } catch (e) { assert.fail(`dispose threw: ${e}`) }
-  occupier.close()
+  for (const srv of occupiers) srv.close()
 })
 
 test("已有证书的正常启动：就绪后指纹一致、qr.png 正常", async () => {

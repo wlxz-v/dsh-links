@@ -69,6 +69,10 @@ export function hostEventFrame(event) {
     title: event.title,
     origin: event.origin,
     seq: event.seq,
+    // F2：终态事件是否值得推一条通知。缺失/true 时按老行为推送；
+    // false 表示「同一个会话刚刚已经报过终态」——自动重试里的瞬时失败、
+    // 或轮询抖动导致的重复终态，别让手机再响一次。
+    ...(event.notify === false ? { notify: false } : {}),
   })}\n\n`
 }
 
@@ -106,6 +110,10 @@ export function createHostEventHub({
   pollMs = 5_000,
   heartbeatMs = 25_000,
   bufferLimit = DEFAULT_BUFFER_LIMIT,
+  // 同一会话的终态在这么长时间内重复出现时，不再建议推送通知（F2，参考 dsh-meow-smooth 的
+  // 「自动重试中的瞬时错误不打扰、每条恰好一条」）。只影响 notify 提示，事件照发，UI 不会漏状态。
+  notificationWindowMs = 60_000,
+  now = () => Date.now(),
 } = {}) {
   const subscribers = new Set()
   let previous = new Map()
@@ -114,6 +122,8 @@ export function createHostEventHub({
   let pollTimer = null
   let heartTimer = null
   let inflight = false
+  // sessionId → { state, at }：上一次已经「值得通知」的终态
+  const lastNotifiedTerminal = new Map()
 
   function remember(event) {
     buffer.push(event)
@@ -191,6 +201,20 @@ export function createHostEventHub({
           } catch {
             // 读不到结束原因就保持 completed
           }
+        }
+      }
+      // F2：终态去重。会话跑完 → 自动重试又失败 → 再跑完，这种抖动会在几分钟内
+      // 连推好几条通知；同一个会话在 notificationWindowMs 内重复同一种终态就标 notify:false。
+      const at = now()
+      for (const change of changes) {
+        // 注意：会话回到 running 时不能清掉记录——「失败→自动重试→又失败」正是要压的场景，
+        // 清理只会让第二次失败再响一次。过期由 notificationWindowMs 负责。
+        if (isActiveHostState(change.state)) continue
+        const last = lastNotifiedTerminal.get(change.sessionId)
+        if (last && last.state === change.state && at - last.at < notificationWindowMs) {
+          change.notify = false
+        } else {
+          lastNotifiedTerminal.set(change.sessionId, { state: change.state, at })
         }
       }
       const stamped = []

@@ -35,13 +35,16 @@ function settleWithin(promise, ms) {
  * @param {object} deps
  * @param {object} deps.state       插件 state（含 devices、remote）
  * @param {() => void} deps.save    落盘
- * @param {number} deps.pluginPort  Agent 只连 127.0.0.1:<pluginPort>
+ * @param {number|(() => number)} deps.pluginPort  Agent 只连 127.0.0.1:<pluginPort>；
+ *   端口顺延时插件端口要到 Agent 构造那一刻才知道，故允许传 getter（每次 open 现查）
  * @param {() => boolean} deps.isLocalReady
  * @param {(device: object) => boolean} deps.isRevoking  正在吊销的设备不再接受会合
  * @param {() => { code: string, expiresAt: number }} deps.currentPairing  当前配对码与过期时刻
  * @param {{ info(m: string): void, warn(m: string): void }} deps.logger
  */
 export function createRemoteRuntime({ state, save, pluginPort, isLocalReady, isRevoking, currentPairing, logger }) {
+  // 端口顺延（见 src/index.js 的 portState）：传 getter 时在 Agent 构造时取，传数字时保持原行为。
+  const readPluginPort = () => (typeof pluginPort === "function" ? pluginPort() : pluginPort)
   const bootstrap = new BootstrapTable()
   let agent = null
   let error = ""
@@ -78,7 +81,7 @@ export function createRemoteRuntime({ state, save, pluginPort, isLocalReady, isR
         outerPin: state.remote.outerPin ?? "",
         hostKeySeed: keys.hostKeySeed,
         keySeed: keys.keySeed,
-        pluginPort,
+        pluginPort: readPluginPort(),
         // 每次 open 现查：吊销、pending 过期都即时生效（RFC §5.5 第 4 步）
         lookupDevice: (handle) => {
           const device = findDeviceByHandle(state, handle, { isRevoking })

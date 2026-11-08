@@ -1126,10 +1126,11 @@ class MobileApiClient(private val host: Host) {
                     method = method,
                     path = path,
                     body = body?.toString()?.toByteArray(Charsets.UTF_8),
-                    headers = dshAuthHeaders() + listOf(
-                        "Accept" to "application/json",
-                        "Accept-Encoding" to "identity",
-                    ),
+                    // F3：不要把 Accept-Encoding 写死成 identity —— 那样服务端永远不会压，
+                    // 会话列表这类 JSON 在局域网/中继上要多传 10 倍左右。交给 OkHttp 自己加
+                    // gzip 并透明解压（只有它自己加的编码它才会解，所以这里必须完全不写）。
+                    // 走流式的 SSE / 文件下载仍显式 identity（见 SessionStreamClient、getSessionFile）。
+                    headers = dshAuthHeaders() + listOf("Accept" to "application/json"),
                     connectTimeoutMs = connectMs,
                     readTimeoutMs = readMs,
                 ),

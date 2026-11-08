@@ -84,6 +84,34 @@ function respondRpcError(json, res, error) {
   })
 }
 
+/** 0.2.x 的 gateway 在方法不存在时给这些码；只有这些才值得回退到老方法名。 */
+const MISSING_REMOTE_CODES = new Set([
+  "gateway/lookup-not-found",
+  "gateway/lookup-unavailable",
+  "gateway/method-unavailable",
+  "gateway/definition-unavailable",
+])
+
+export function isMissingRemoteError(error) {
+  const code = typeof error?.code === "string" ? error.code : ""
+  if (MISSING_REMOTE_CODES.has(code)) return true
+  const message = String(error?.message ?? "")
+  return /no such (remote|method)|unknown (remote|method)|not available/i.test(message)
+}
+
+/**
+ * 定时任务写操作：先用 0.2.x 的 schedule/edit（{ id, action, patch }），老版本 DSH 没有这个
+ * Remote 时回退到 schedule/update（CAS：expected + change）或 schedule/delete。
+ */
+async function callScheduleWrite(targetPort, action, editFields, legacyPayload) {
+  try {
+    return await callLocalRpc(targetPort, "schedule.edit", { id: editFields.id, action, ...(editFields.patch ? { patch: editFields.patch } : {}) })
+  } catch (error) {
+    if (!isMissingRemoteError(error)) throw error
+    return await callLocalRpc(targetPort, action === "delete" ? "schedule.delete" : "schedule.update", legacyPayload)
+  }
+}
+
 export async function handleMobileSessionControlApi(req, res, targetPort, state, device, pathname, rt, deps) {
   const { json, readAuthorizedJson, runMobileDeviceMutation, mobileMutationWasRevoked, respondDeviceRevoked } = deps
 
@@ -215,7 +243,7 @@ export async function handleMobileSessionControlApi(req, res, targetPort, state,
     if (req.method === "DELETE") {
       // 无请求体的写操作也要过同源 / CSRF 校验（与 readAuthorizedJson 同一道门）
       if (typeof deps.requireJsonWrite === "function" && !deps.requireJsonWrite(req, res)) return true
-      const result = await mutate(() => callLocalRpc(targetPort, "schedule.delete", { sessionId, id }))
+      const result = await mutate(() => callScheduleWrite(targetPort, "delete", { id }, { sessionId, id }))
       if (result.done) return true
       json(res, 200, { ok: true, sessionId, id, deleted: true })
       return true
@@ -238,7 +266,13 @@ export async function handleMobileSessionControlApi(req, res, targetPort, state,
       if (!isRecord(body.change)) return json(res, 400, { error: "change 不合法" }), true
       payload.change = body.change
     }
-    const result = await mutate(() => callLocalRpc(targetPort, "schedule.update", payload))
+    const patch = {}
+    for (const field of ["title", "prompt"]) {
+      if (payload[field] !== undefined) patch[field] = payload[field]
+    }
+    // 老接口的 change 里就是 timing 之类的改动，0.2.x 统一塞进 patch。
+    if (payload.change && typeof payload.change === "object") Object.assign(patch, payload.change)
+    const result = await mutate(() => callScheduleWrite(targetPort, "update", { id, patch }, payload))
     if (result.done) return true
     json(res, 200, { ok: true, sessionId, id, value: result.value ?? null })
     return true

@@ -9,11 +9,12 @@
  */
 import { createAwaitingInput } from "./awaiting-input.js"
 import { createServer as createHttpsServer } from "node:https"
+import { createServer as createNetServer } from "node:net"
 import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs"
 import { dirname, join } from "node:path"
 import { homedir, hostname, networkInterfaces } from "node:os"
 import { randomBytes } from "node:crypto"
-import { gzipSync } from "node:zlib"
+import { brotliCompressSync, constants as zlibConstants, gzipSync, zstdCompressSync } from "node:zlib"
 import z from "@deepseek-ai/schemastery"
 import QRCode from "qrcode"
 
@@ -239,8 +240,29 @@ function isTailnetHost(host) {
   return second <= 255 && second >= 64 && second <= 127
 }
 
-function listenExposure(config, infos) {
-  const listen = { address: "0.0.0.0", port: config.port }
+/**
+ * 探一个能监听的端口：从 start 起试 attempts 个，全被占用返回 null。
+ * 用临时 net 服务器探测而不是在 https.Server 上反复 listen —— 失败的 listen 会留下
+ * closing 状态的句柄，进程退出时踩 libuv 断言（uv_async.c 的 !(handle->flags & UV_HANDLE_CLOSING)）。
+ */
+export async function findFreeListenPort(start, attempts) {
+  for (let offset = 0; offset < attempts; offset += 1) {
+    const candidate = start + offset
+    if (candidate > 65535) return null
+    const free = await new Promise((resolve) => {
+      const probe = createNetServer()
+      let settled = false
+      const done = (value) => { if (!settled) { settled = true; resolve(value) } }
+      probe.once("error", () => { probe.removeAllListeners(); done(false) })
+      probe.listen(candidate, "0.0.0.0", () => probe.close(() => done(true)))
+    })
+    if (free) return candidate
+  }
+  return null
+}
+
+function listenExposure(config, infos, port = config.port) {
+  const listen = { address: "0.0.0.0", port }
   const networks = (infos ?? [])
     .filter((item) => item?.label)
     .map((item) => ({ label: item.label, category: item.category, url: item.url }))
@@ -249,13 +271,13 @@ function listenExposure(config, infos) {
   const publicNets = networks.filter((n) => n.category === "other")
   if (publicNets.length || extras) {
     const warning = extras
-      ? `已配置 extraUrls，18640 可能经隧道或公网地址暴露。当前监听 ${listen.address}:${listen.port}。`
+      ? `已配置 extraUrls，${listen.address}:${listen.port} 可能经隧道或公网地址暴露。当前监听 ${listen.address}:${listen.port}。`
       : `检测到非私有网卡地址。当前监听 ${listen.address}:${listen.port}，请确认这些网段可信。`
     return { listen, networks, level: "untrusted", warning }
   }
   const labels = networks.map((n) => n.label).filter(Boolean)
   const hint = labels.length
-    ? `当前监听 ${listen.address}:${listen.port}，局域网可达 ${labels.join("、")}。勿把 18640 暴露到公网。`
+    ? `当前监听 ${listen.address}:${listen.port}，局域网可达 ${labels.join("、")}。勿把 ${listen.port} 暴露到公网。`
     : `当前监听 ${listen.address}:${listen.port}。未发现可用局域网地址。`
   return { listen, networks, level: "lan", warning: null, hint }
 }
@@ -343,7 +365,7 @@ export function lanInfosForAddresses(addresses, port) {
   return { urls, infos: urlInfos }
 }
 
-function lanUrls(config) {
+function lanUrls(config, port = config.port) {
   const addresses = []
   let ifaces = {}
   try {
@@ -356,7 +378,7 @@ function lanUrls(config) {
       if (iface && iface.family === "IPv4" && !iface.internal) addresses.push(iface.address)
     }
   }
-  const built = lanInfosForAddresses(addresses, config.port)
+  const built = lanInfosForAddresses(addresses, port)
   for (const extra of config.extraUrls ?? []) {
     const httpsUrl = requireHttpsUrl(extra)
     if (!httpsUrl || built.urls.includes(httpsUrl)) continue
@@ -366,21 +388,25 @@ function lanUrls(config) {
   return built
 }
 
-function pairInfo(config, state, certFingerprint) {
-  const lan = lanUrls(config)
+/**
+ * @param port 实际监听的端口。config.port 被占用而顺延时，这里与 config.port 不同，
+ *   二维码与面板都必须用实际端口，否则手机会连一个没人听的端口。
+ */
+function pairInfo(config, state, certFingerprint, port = config.port) {
+  const lan = lanUrls(config, port)
   const info = {
     v: 1,
     type: "dsh-link",
     deviceId: state.deviceId,
     name: hostname(),
-    port: config.port,
+    port,
     urls: lan.urls,
     infos: lan.infos,
     pairingCode: ensurePairingCode(state, config.pairingTtlSeconds),
     certFingerprint,
   }
   info.requireConfirm = pairRequireConfirm(config, state)
-  info.exposure = listenExposure(config, lan.infos)
+  info.exposure = listenExposure(config, lan.infos, port)
   // 时效戳（主机时钟，Unix 毫秒）：App 扫码后可判断码是否已过期/陈旧，
   // 把「旧截图、面板未刷新」这一类 401 消灭在提交之前。
   info.issuedAt = Date.now()
@@ -388,15 +414,70 @@ function pairInfo(config, state, certFingerprint) {
   return info
 }
 
+const JSON_COMPRESS_MIN_BYTES = 1024
+// 服务端优先顺序：zstd（最快、压缩率好）> br（浏览器最爱）> gzip（App/老客户端）。
+const JSON_ENCODING_ORDER = ["zstd", "br", "gzip"]
+
+/** 解析 Accept-Encoding，返回 coding → q 的映射（同名取第一个出现的 q）。 */
+function parseAcceptEncoding(value) {
+  const out = new Map()
+  for (const part of String(value ?? "").split(",")) {
+    const [name, ...params] = part.trim().toLowerCase().split(";")
+    if (!name) continue
+    let q = 1
+    for (const param of params) {
+      const match = /^\s*q\s*=\s*([0-9.]+)\s*$/.exec(param)
+      if (match) q = Number(match[1])
+    }
+    if (!out.has(name)) out.set(name, q)
+  }
+  return out
+}
+
+/**
+ * JSON 响应用哪种编码：>=1KB 才压（小于这个体积压缩后反而更大，且含 token 的配对响应
+ * 都远小于 1KB）；按 q 值在服务端支持的 coding 里挑一个，全被 q=0 拒掉就返回 null。
+ * 导出给测试用：协商逻辑单独可测，不必起服务器。
+ */
+export function negotiateJsonEncoding(acceptEncoding, bodyLength) {
+  if (!(bodyLength >= JSON_COMPRESS_MIN_BYTES)) return null
+  const accepted = parseAcceptEncoding(acceptEncoding)
+  if (accepted.size === 0) return null
+  const supported = JSON_ENCODING_ORDER.filter((coding) => {
+    if (coding === "zstd" && typeof zstdCompressSync !== "function") return false
+    return true
+  })
+  for (const coding of supported) {
+    const q = accepted.get(coding) ?? accepted.get("*")
+    if (q === undefined || q <= 0) continue
+    return coding
+  }
+  return null
+}
+
+function compressJson(body, coding) {
+  if (coding === "zstd") return zstdCompressSync(body, { params: { [zlibConstants.ZSTD_c_compressionLevel]: 3 } })
+  if (coding === "br") return brotliCompressSync(body, {
+    params: {
+      [zlibConstants.BROTLI_PARAM_QUALITY]: 4,
+      [zlibConstants.BROTLI_PARAM_SIZE_HINT]: body.length,
+    },
+  })
+  if (coding === "gzip") return gzipSync(body, { level: 6 })
+  return body
+}
+
 export function json(res, code, obj, extraHeaders) {
   const body = Buffer.from(JSON.stringify(obj), "utf8")
-  // S3：大于 1KB 的 JSON 响应在请求方接受 gzip 时压缩（会话列表约 113KB → 约 15KB）。
+  // S3/F3：大于 1KB 的 JSON 响应按 Accept-Encoding 压缩（会话列表约 113KB → gzip 约 15KB）。
+  // 实测（node 24，zlib）：13.3KB 的会话列表样本 gzip 673B、br 423B、zstd 533B；
+  // 真机上 App 现在才真正吃到压缩（见 apps/android 的 MobileApi.request() 去掉
+  // 手写 identity 的改动），浏览器面板则可以用 br/zstd 再省一截。
   // SSE 与文件下载不走这里（见下方注释与 mobile-api 的文件流），保持不动。
   // 安全：这些响应里没有「攻击者可控输入 + 密钥」同时出现的情况，BREACH 类攻击不适用；
   // 含 token 的配对响应小于 1KB，不会被压缩。
-  const acceptEncoding = headerVal(res.req?.headers, "accept-encoding") ?? ""
-  const gzip = body.length > 1024 && /\bgzip\b/.test(acceptEncoding)
-  const encoded = gzip ? gzipSync(body, { level: 6 }) : body
+  const coding = negotiateJsonEncoding(headerVal(res.req?.headers, "accept-encoding") ?? "", body.length)
+  const encoded = coding ? compressJson(body, coding) : body
   const headers = {
     "content-type": "application/json; charset=utf-8",
     "content-length": String(encoded.length),
@@ -405,7 +486,9 @@ export function json(res, code, obj, extraHeaders) {
     "x-content-type-options": "nosniff",
     "x-frame-options": "DENY",
     "referrer-policy": "no-referrer",
-    ...(gzip ? { "content-encoding": "gzip", vary: "accept-encoding" } : {}),
+    // 响应体随 Accept-Encoding 变化，Vary 必须一直在（否则中间缓存会把 gzip 体发给不支持的人）。
+    vary: "accept-encoding",
+    ...(coding ? { "content-encoding": coding } : {}),
     ...extraHeaders,
   }
   res.writeHead(code, headers)
@@ -645,15 +728,22 @@ export function qrPayload(info) {
  * @param remote 二维码里的 remote（含 bootstrap 种子）或 null。只在这里出现：
  *   面板的 pair-info JSON 不带种子，种子只随二维码图片离开本机。
  */
-async function qrPng(res, config, state, certFingerprint, remote) {
+async function qrPng(res, config, state, certFingerprint, remote, port = config.port) {
   try {
     // 720px：面板底托 CSS 尺寸见 src/panel.js 的 .dl-qr，点击放大后约 360 CSS px
     // （Retina 720 物理 px）—— 源码分辨率不低于两者，才不会被浏览器补糊。
-    const info = pairInfo(config, state, certFingerprint)
+    const info = pairInfo(config, state, certFingerprint, port)
     if (remote) info.remote = remote
     const payload = qrPayload(info)
     const buf = await QRCode.toBuffer(JSON.stringify(payload), { type: "png", margin: 2, width: 720 })
-    res.writeHead(200, { "content-type": "image/png", "cache-control": "no-store" })
+    // 二维码里带配对码与证书指纹：不能缓存，也不能让浏览器把它当别的类型渲染；
+    // 与 json() 的敏感响应保持同一组头（参考 lrxG/dsh-app 的 no-store + no-referrer 约定）。
+    res.writeHead(200, {
+      "content-type": "image/png",
+      "cache-control": "no-store",
+      "x-content-type-options": "nosniff",
+      "referrer-policy": "no-referrer",
+    })
     res.end(buf)
   } catch (err) {
     console.error(`dsh-links: qr.png: ${err?.message ?? err}`)
@@ -809,7 +899,7 @@ async function handlePair(req, res, config, state, stateFile, rt, logger, origin
     token,
     deviceId,
     name: deviceName,
-    urls: lanUrls(config).urls,
+    urls: lanUrls(config, (rt.boundPort ?? (() => config.port))()).urls,
     pending: requireConfirm,
     pendingExpiresAt: requireConfirm ? device.pendingExpiresAt : undefined,
     ...(replacedIds.length ? { replacedDeviceIds: replacedIds } : {}),
@@ -1351,6 +1441,13 @@ function findApprovalId(req) {
 
 export function apply(ctx, config) {
   const rt = createRuntime(config)
+  // 端口顺延：config.port（默认 18640）被占用时按 +1 试到 +8，实际监听端口记在 portState。
+  // 二维码、面板、插件端口守卫都读 boundPort()——必须是「实际」端口，否则手机会连到没人听的端口。
+  const PORT_LISTEN_ATTEMPTS = 8
+  const portState = { value: config.port, shifted: false }
+  const boundPort = () => portState.value
+  // 模块级的 handlePair() 不在这个作用域里，靠 rt 拿到「实际」端口（配对响应里的 urls 必须带它）。
+  rt.boundPort = boundPort
   // 可选服务：旧 Host 没有 workspaceChanges，不能进 inject（会阻止插件加载），按请求取。
   rt.workspaceChanges = () => ctx.get("workspaceChanges")
   const web = ctx.get("webServer")
@@ -1358,10 +1455,23 @@ export function apply(ctx, config) {
   // 0.2.x 网关要求每次调用都携带 Peer（prepareInvocation → assertPeerLive(request.peer)）；
   // 缺 peer 时 in-process RPC 全部 TypeError，host.rpc 检查即报 HOST_RPC_FAILED。
   // 诊断埋点：把 peer 建立结果暴露给 /dsh-link/diagnostics（detail 只收布尔/短枚举）。
-  const gatewayPeerState = { connection: false, createPeer: false, peer: false, aborted: false, error: "" }
+  const gatewayPeerState = { connection: false, createPeer: false, peer: false, aborted: false, error: "", recreated: 0 }
   let gatewayPeer = null
+  const dropGatewayPeer = () => {
+    const dead = gatewayPeer
+    gatewayPeer = null
+    if (!dead) return
+    try { Promise.resolve(dead.dispose?.()).catch(() => {}) } catch {}
+  }
   const ensureGatewayPeer = () => {
-    if (gatewayPeer) return gatewayPeer
+    // peer 是长连接身份：宿主热重载 / 会话 dispose 后旧 peer 会被 abort。
+    // 只看「有没有」会一直拿着一个 aborted 的 peer，所有 RPC 都变成 gateway/peer-disposed，
+    // 只能重启客户端才能恢复——所以每次取用时顺手检查并重建。
+    if (gatewayPeer) {
+      if (!gatewayPeer.signal?.aborted) return gatewayPeer
+      gatewayPeerState.aborted = true
+      dropGatewayPeer()
+    }
     try {
       // 注意：apply() 期间 connection 服务可能尚未 active（ctx.get 对非 active 的 provider 返回 undefined），
       // 所以首次调用失败是正常的——必须在每次请求时惰性重试，不能只在 apply() 里建一次。
@@ -1389,9 +1499,25 @@ export function apply(ctx, config) {
       const peer = ensureGatewayPeer()
       return peer ? { ...request, peer } : request
     }
+    const isPeerDisposed = (error) => {
+      const code = typeof error?.code === "string" ? error.code : ""
+      return code === "gateway/peer-disposed" || /peer[- ]disposed/i.test(String(error?.message ?? ""))
+    }
+    // peer 在调用途中被 dispose（宿主重启某个 provider）时，重建一次再重试；只重试一次。
+    const withPeerRetry = async (call) => {
+      try {
+        return await call()
+      } catch (error) {
+        if (!isPeerDisposed(error) || !gatewayPeer) throw error
+        dropGatewayPeer()
+        gatewayPeerState.recreated += 1
+        try { ctx.logger.warn("dsh-links: gateway peer 已失效，重建后重试一次") } catch {}
+        return await call()
+      }
+    }
     bindLocalRpcRuntime({
-      invoke: (request) => gateway.invoke(withPeer(request)),
-      stream: typeof gateway.stream === "function" ? (request) => gateway.stream(withPeer(request)) : undefined,
+      invoke: (request) => withPeerRetry(() => gateway.invoke(withPeer(request))),
+      stream: typeof gateway.stream === "function" ? (request) => withPeerRetry(() => gateway.stream(withPeer(request))) : undefined,
     })
   }
   const targetPort = web.port
@@ -1437,7 +1563,7 @@ export function apply(ctx, config) {
   const remote = createRemoteRuntime({
     state,
     save: () => saveState(stateFile, state),
-    pluginPort: config.port,
+    pluginPort: boundPort,
     isLocalReady: () => readiness.phase === "ready",
     isRevoking: (device) => Boolean(device[DEVICE_REVOKING]),
     currentPairing: () => ({
@@ -1450,12 +1576,12 @@ export function apply(ctx, config) {
   const previews = createPreviewService({
     state,
     save: () => saveState(stateFile, state),
-    pluginPort: config.port,
+    pluginPort: boundPort,
     hostPort: targetPort,
     logger: ctx.logger,
   })
   rt.previewDetect = createPreviewDetector({
-    pluginPort: config.port,
+    pluginPort: boundPort,
     hostPort: targetPort,
   })
   async function currentDetections() {
@@ -1553,7 +1679,7 @@ export function apply(ctx, config) {
         sweepExpiredPending(state, stateFile, rt)
         // 面板只需要远程的状态与地址（决定码下方的文案）；bootstrap 种子只随二维码图片出去
         const view = remote.status()
-        json(res, 200, { ...pairInfo(config, state, fp()), remoteStatus: { state: view.state, host: view.host } })
+        json(res, 200, { ...pairInfo(config, state, fp(), boundPort()), remoteStatus: { state: view.state, host: view.host } })
       },
     }),
     web.register({
@@ -1562,7 +1688,7 @@ export function apply(ctx, config) {
       handler: (req, res) => {
         if (!requireLoopbackSameOrigin(req, res)) return
         if (readiness.phase !== "ready") return proxyPending(res)
-        return qrPng(res, config, state, fp(), remote.qrPayload())
+        return qrPng(res, config, state, fp(), remote.qrPayload(), boundPort())
       },
     }),
     web.register({
@@ -2012,7 +2138,7 @@ export function apply(ctx, config) {
   let pollTimer
   let keepAliveTimer
   let muxBridge = null
-  const ready = loadOrCreateTls(ensureStateDir(config)).then((tls) => {
+  const ready = loadOrCreateTls(ensureStateDir(config)).then(async (tls) => {
     tlsHolder.fingerprint = tls.fingerprint
     tlsHolder.cert = tls.cert
     proxy = createHttpsServer({ key: tls.key, cert: tls.cert, minVersion: "TLSv1.2" }, requestHandler)
@@ -2055,21 +2181,54 @@ export function apply(ctx, config) {
         if (writers.size === 0) dropSession(rt, sessionId)
       }
     }, 15_000)
-    return new Promise((resolve, reject) => {
-      proxy.once("error", reject)
-      proxy.listen(config.port, "0.0.0.0", () => {
-        ctx.logger.info(`dsh-links: 手机接入代理已启动，https 端口 ${config.port}（指纹 ${tls.fingerprint.slice(0, 12)}…）`)
-        for (const u of lanUrls(config).urls) ctx.logger.info(`dsh-links: 可访问地址 ${u}`)
-        remote.start().catch(() => {})
-        muxBridge = startMuxQuestionBridge({
-          targetPort,
-          rt,
-          logger: ctx.logger,
-          requestPoll: (sessionId) => requestGapPoll(sessionId, targetPort, rt),
-        })
-        resolve(tls)
-      })
+    // 端口顺延：默认端口（或配置端口）被占（另一个 DSH 实例、崩溃残留、别的软件抢了 18640）时
+    // 按 +1 试到 PORT_LISTEN_ATTEMPTS 个，抢到哪个就记进 portState。
+    // 二维码/面板/RPC 守卫读的都是 boundPort()，所以 App 拿到的一直是真实端口；
+    // 只有连续 attempts 个都占用才算启动失败（此时 readiness.phase="failed"，与原先一致）。
+    const candidatePort = await findFreeListenPort(config.port, PORT_LISTEN_ATTEMPTS)
+    if (candidatePort == null) {
+      const err = new Error(
+        `listen EADDRINUSE: 端口 ${config.port}–${config.port + PORT_LISTEN_ATTEMPTS - 1} 都被占用`,
+      )
+      err.code = "EADDRINUSE"
+      throw err
+    }
+    if (candidatePort !== config.port) {
+      ctx.logger.warn(`dsh-links: 端口 ${config.port} 已被占用，改用 ${candidatePort}`)
+    }
+    portState.value = candidatePort
+    portState.shifted = candidatePort !== config.port
+    await new Promise((resolve, reject) => {
+      const onError = (error) => {
+        proxy.removeListener("listening", onListening)
+        reject(error)
+      }
+      const onListening = () => {
+        proxy.removeListener("error", onError)
+        resolve()
+      }
+      proxy.once("error", onError)
+      proxy.once("listening", onListening)
+      proxy.listen(candidatePort, "0.0.0.0")
     })
+    {
+      const bound = proxy.address()?.port ?? candidatePort
+      portState.value = bound
+      portState.shifted = bound !== config.port
+      const shiftedHint = portState.shifted ? `（配置端口 ${config.port} 被占用，已顺延）` : ""
+      ctx.logger.info(
+        `dsh-links: 手机接入代理已启动，https 端口 ${bound}${shiftedHint}（指纹 ${tls.fingerprint.slice(0, 12)}…）`,
+      )
+      for (const u of lanUrls(config, bound).urls) ctx.logger.info(`dsh-links: 可访问地址 ${u}`)
+      remote.start().catch(() => {})
+      muxBridge = startMuxQuestionBridge({
+        targetPort,
+        rt,
+        logger: ctx.logger,
+        requestPoll: (sessionId) => requestGapPoll(sessionId, targetPort, rt),
+      })
+    }
+    return tls
   }).then((tls) => {
     // 只有 listen 成功才算就绪；仅证书生成完成还不够。
     readiness.phase = "ready"

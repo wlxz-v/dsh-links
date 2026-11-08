@@ -43,7 +43,8 @@ test("大响应接受 gzip 时压缩且解压后一致", () => {
   const raw = JSON.stringify(obj)
   assert.ok(Buffer.byteLength(raw) > 1024, "用例本身要大于 1KB")
 
-  const res = mockRes("gzip, deflate, br")
+  // 只接受 gzip 的客户端（App 的 OkHttp 就是这一档）仍然走 gzip；br/zstd 的协商见 json-compression.test.mjs
+  const res = mockRes("gzip, deflate")
   json(res, 200, obj)
 
   assert.equal(res.headers["content-encoding"], "gzip")
@@ -58,7 +59,8 @@ test("小响应不压缩", () => {
   const res = mockRes("gzip")
   json(res, 200, obj)
   assert.equal(res.headers["content-encoding"], undefined)
-  assert.equal(res.headers.vary, undefined)
+  // Vary 现在无条件带：响应体是否压缩取决于 Accept-Encoding，中间缓存必须按它分键
+  assert.equal(res.headers.vary, "accept-encoding")
   assert.equal(res.headers["content-length"], String(Buffer.byteLength(JSON.stringify(obj))))
 })
 

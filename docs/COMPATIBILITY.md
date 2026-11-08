@@ -10,6 +10,9 @@ or verified combination changes.
 These values describe the source snapshots used for the current Beta work.
 They do not imply that a package, APK, or Relay deployment has been
 published. Per-change details live in `CHANGELOG.md`.
+The current plugin source is additionally verified against **DSH `0.2.2-rc.1`**
+(desktop build on Windows); the 0.2.x-specific behavior is listed under
+[DSH 0.2.x host changes](#dsh-02x-host-changes).
 
 | Component | Source baseline | Published / released status |
 |---|---|---|
@@ -17,6 +20,34 @@ published. Per-change details live in `CHANGELOG.md`.
 | Plugin `dsh-links` | package `0.1.0-beta.19` on `main` | Distributed from this repository as a git source (npm publishing removed 2026-09-30). Latest pushed tag: `v0.1.0-beta.18`; `v0.1.0-beta.19` is not tagged yet |
 | Android `apps/android/` | `versionName 0.5.0-beta.27` on `main` | Latest signed APK on GitHub Releases: `app-v0.5.0-beta.27` (versionCode 35, SHA-256 `3022c5a5b25aa05c9e1e597b7a40dfcb54e50ab72aa57cc8a115bc1e583f3223`), built from `0f0fd75` — the revision the `app-v0.5.0-beta.27` tag points at. `0.5.0-beta.24`–`0.5.0-beta.26` were never published; their changes ship in `0.5.0-beta.27`. `CI - Android` (unit tests, lint, screenshot validation, `assembleDebug`, emulator smoke) is green on `0f0fd75`; real-device acceptance for this build is still pending |
 | Relay (`relay/`) | `dlp-relay` (DLP/1) from `main`; DLR/1 server removed | Official instance `wss://relay.dshlinks.com/ws`; self-hosting in `relay/README.md` |
+
+## DSH 0.2.x host changes
+
+The plugin speaks to the host through `typertGateway` (in-process) and falls
+back to `POST /api/{namespace}/{method}` on HTTP. Two host changes in DSH
+`0.2.x` are handled additively; `PLUGIN_PROTOCOL` stays `2`.
+
+- **Gateway peer.** `0.2.x` validates `request.peer` in
+  `prepareInvocation()` (`assertPeerLive`) and throws for requests without one.
+  The plugin creates a peer through `connection.createPeer({ principal: { kind: "owner" } })`,
+  attaches it to every call, recreates it when the host aborts it, and retries
+  once when a call fails with `gateway/peer-disposed`. Hosts without the
+  `connection` service keep the old peerless call path.
+- **Scheduled-task writes.** `schedule/update` and `schedule/delete` are gone in
+  `0.2.x`; they are replaced by `schedule/edit`
+  (`{ id, action: "update" | "delete", patch?: { title, prompt, timing } }`).
+  The plugin calls `schedule/edit` first and falls back to the old methods only
+  when the host reports the method as missing (business errors such as
+  `schedule/not-found` are returned to the phone unchanged).
+- **Port shift.** If the configured port (default `18640`) is busy, the plugin
+  binds the next free port within 8 attempts. `pair-info`, the QR payload,
+  LAN URLs, the preview-port guard and the remote `pluginPort` all use the
+  actual bound port; startup only fails when all 8 are taken.
+- **JSON compression.** JSON bodies over 1 KB are compressed with `zstd`,
+  `br` or `gzip` according to `Accept-Encoding` (`Vary: accept-encoding` is
+  always sent). Android's central JSON request no longer forces
+  `Accept-Encoding: identity`, so OkHttp negotiates gzip and decompresses
+  transparently; SSE and file downloads still ask for identity.
 
 ## Capability: dev server preview
 

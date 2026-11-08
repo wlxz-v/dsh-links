@@ -111,13 +111,16 @@ test("定时任务修改：expected 只保留原始记录字段，且 id 必须�
       title: "y",
     })
     assert.equal(h.out.status, 200)
-    assert.deepEqual(h.calls[0].args.request, {
-      sessionId: "s1", id: "t1", expected: { id: "t1", kind: "every", everySeconds: 60, title: "x" }, title: "y",
+    // 0.2.x：写到 schedule/edit，patch 里只放真正要改的字段
+    assert.deepEqual(h.calls[0], {
+      namespace: "schedule", method: "edit", args: { request: { id: "t1", action: "update", patch: { title: "y" } } },
     })
     await h.run("PUT", "/dsh-link/mobile/sessions/s1/schedules/t1", { expected: { id: "other" } })
     assert.equal(h.out.status, 400)
     await h.run("DELETE", "/dsh-link/mobile/sessions/s1/schedules/t1")
-    assert.deepEqual(h.calls.at(-1), { namespace: "schedule", method: "delete", args: { request: { sessionId: "s1", id: "t1" } } })
+    assert.deepEqual(h.calls.at(-1), {
+      namespace: "schedule", method: "edit", args: { request: { id: "t1", action: "delete" } },
+    })
     await h.run("GET", "/dsh-link/mobile/sessions/s1/schedules/t1/history?limit=500")
     assert.equal(h.calls.at(-1).args.request.limit, 100)
   } finally {
