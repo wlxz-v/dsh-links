@@ -1323,10 +1323,43 @@ export function apply(ctx, config) {
   rt.workspaceChanges = () => ctx.get("workspaceChanges")
   const web = ctx.get("webServer")
   const gateway = ctx.get("typertGateway") ?? ctx.typertGateway
+  // 0.2.x 网关要求每次调用都携带 Peer（prepareInvocation → assertPeerLive(request.peer)）；
+  // 缺 peer 时 in-process RPC 全部 TypeError，host.rpc 检查即报 HOST_RPC_FAILED。
+  // 诊断埋点：把 peer 建立结果暴露给 /dsh-link/diagnostics（detail 只收布尔/短枚举）。
+  const gatewayPeerState = { connection: false, createPeer: false, peer: false, aborted: false, error: "" }
+  let gatewayPeer = null
+  const ensureGatewayPeer = () => {
+    if (gatewayPeer) return gatewayPeer
+    try {
+      // 注意：apply() 期间 connection 服务可能尚未 active（ctx.get 对非 active 的 provider 返回 undefined），
+      // 所以首次调用失败是正常的——必须在每次请求时惰性重试，不能只在 apply() 里建一次。
+      const connection = ctx.get("connection")
+      gatewayPeerState.connection = Boolean(connection)
+      gatewayPeerState.createPeer = typeof connection?.createPeer === "function"
+      if (gatewayPeerState.createPeer) {
+        gatewayPeer = connection.createPeer({ principal: { kind: "owner" } })
+        gatewayPeerState.peer = Boolean(gatewayPeer)
+        gatewayPeerState.aborted = Boolean(gatewayPeer?.signal?.aborted)
+        gatewayPeerState.error = ""
+      } else {
+        gatewayPeerState.error = connection ? "no-createPeer" : "no-connection"
+      }
+    } catch (err) {
+      gatewayPeerState.error = "create-failed"
+      try { ctx.logger.warn(`dsh-links: createPeer failed: ${String(err?.message ?? err)}`) } catch {}
+    }
+    return gatewayPeer
+  }
   if (gateway && typeof gateway.invoke === "function") {
+    // connection 是按需取的可选服务（不进 inject）：旧 Host 没有它时退化为不带 peer 的旧行为。
+    ensureGatewayPeer()
+    const withPeer = (request) => {
+      const peer = ensureGatewayPeer()
+      return peer ? { ...request, peer } : request
+    }
     bindLocalRpcRuntime({
-      invoke: (request) => gateway.invoke(request),
-      stream: typeof gateway.stream === "function" ? (request) => gateway.stream(request) : undefined,
+      invoke: (request) => gateway.invoke(withPeer(request)),
+      stream: typeof gateway.stream === "function" ? (request) => gateway.stream(withPeer(request)) : undefined,
     })
   }
   const targetPort = web.port
@@ -1440,6 +1473,7 @@ export function apply(ctx, config) {
         workspaceChanges: Boolean(workspaceChangesService(rt.workspaceChanges)),
         typertGateway: Boolean(gateway && typeof gateway.invoke === "function"),
         sessions,
+        peerDebug: { ...gatewayPeerState },
       },
       certPem: tlsHolder.cert,
       fingerprint: tlsHolder.fingerprint,
@@ -2045,6 +2079,7 @@ export function apply(ctx, config) {
       rt.sessionActivityCache.clear()
       rt.requests.disposeAll("cancelled")
       unbindLocalRpcRuntime()
+      if (gatewayPeer) { try { Promise.resolve(gatewayPeer.dispose()).catch(() => {}) } catch {} }
       try { proxy?.closeAllConnections?.() } catch {}
       try { proxy?.close() } catch {}
     },

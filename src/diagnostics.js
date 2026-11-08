@@ -155,7 +155,15 @@ async function checkHostRpc(rt) {
   } catch (error) {
     const ms = Date.now() - started
     const timedOut = error?.code === "TIMEOUT"
-    return row("host.rpc", "fail", timedOut ? "HOST_RPC_TIMEOUT" : "HOST_RPC_FAILED", { ms })
+    const detail = { ms }
+    if (!timedOut) {
+      const brief = (value) => String(value).replace(/[^A-Za-z0-9_.-]/g, "_").slice(0, 32)
+      if (typeof error?.code === "string" && error.code) detail.errorCode = brief(error.code)
+      if (typeof error?.name === "string" && error.name) detail.errorName = brief(error.name)
+      const field = /reading '([^']+)'/.exec(String(error?.message ?? ""))
+      if (field) detail.errorField = brief(field[1])
+    }
+    return row("host.rpc", "fail", timedOut ? "HOST_RPC_TIMEOUT" : "HOST_RPC_FAILED", detail)
   } finally {
     if (timer) clearTimeout(timer)
   }
@@ -170,6 +178,14 @@ function checkServices(rt) {
     workspaceChanges: Boolean(services.workspaceChanges),
     typertGateway: Boolean(services.typertGateway),
     sessions: Boolean(services.sessions),
+  }
+  const peer = services.peerDebug
+  if (peer && typeof peer === "object") {
+    detail.peerConnection = Boolean(peer.connection)
+    detail.peerCreatePeer = Boolean(peer.createPeer)
+    detail.peerCreated = Boolean(peer.peer)
+    detail.peerAborted = Boolean(peer.aborted)
+    if (typeof peer.error === "string" && peer.error) detail.peerError = peer.error
   }
   if (!detail.typertGateway || !detail.sessions) {
     return row("host.services", "fail", "HOST_SERVICES_MISSING", detail)
