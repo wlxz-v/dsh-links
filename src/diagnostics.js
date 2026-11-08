@@ -185,6 +185,8 @@ function checkServices(rt) {
     detail.peerCreatePeer = Boolean(peer.createPeer)
     detail.peerCreated = Boolean(peer.peer)
     detail.peerAborted = Boolean(peer.aborted)
+    if (Number.isSafeInteger(peer.recreated) && peer.recreated > 0) detail.peerRecreated = peer.recreated
+    if (typeof peer.transport === "string" && peer.transport) detail.peerTransport = peer.transport.slice(0, 16)
     if (typeof peer.error === "string" && peer.error) detail.peerError = peer.error
   }
   if (!detail.typertGateway || !detail.sessions) {

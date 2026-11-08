@@ -1455,7 +1455,7 @@ export function apply(ctx, config) {
   // 0.2.x 网关要求每次调用都携带 Peer（prepareInvocation → assertPeerLive(request.peer)）；
   // 缺 peer 时 in-process RPC 全部 TypeError，host.rpc 检查即报 HOST_RPC_FAILED。
   // 诊断埋点：把 peer 建立结果暴露给 /dsh-link/diagnostics（detail 只收布尔/短枚举）。
-  const gatewayPeerState = { connection: false, createPeer: false, peer: false, aborted: false, error: "", recreated: 0 }
+  const gatewayPeerState = { connection: false, createPeer: false, peer: false, aborted: false, error: "", recreated: 0, transport: "" }
   let gatewayPeer = null
   const dropGatewayPeer = () => {
     const dead = gatewayPeer
@@ -1516,8 +1516,16 @@ export function apply(ctx, config) {
       }
     }
     bindLocalRpcRuntime({
-      invoke: (request) => withPeerRetry(() => gateway.invoke(withPeer(request))),
-      stream: typeof gateway.stream === "function" ? (request) => withPeerRetry(() => gateway.stream(withPeer(request))) : undefined,
+      // transport 只用于诊断：确认手机 API 走的是进程内 gateway（有 peer），
+      // 还是退化后的 HTTP /api（无 peer，需要浏览器会话，通常直接 401）。
+      invoke: (request) => {
+        gatewayPeerState.transport = "gateway"
+        return withPeerRetry(() => gateway.invoke(withPeer(request)))
+      },
+      stream: typeof gateway.stream === "function" ? (request) => {
+        gatewayPeerState.transport = "gateway"
+        return withPeerRetry(() => gateway.stream(withPeer(request)))
+      } : undefined,
     })
   }
   const targetPort = web.port
@@ -1607,6 +1615,12 @@ export function apply(ctx, config) {
 
   // 诊断只读：workspace.list 已在白名单里。证书 PEM 留在 tlsHolder，不进入返回值。
   function diagnosticsSource(device) {
+    // 诊断读的是 gatewayPeerState 快照；启动早期 connection 服务还没 active，
+    // 快照会长期停在 peerError:"no-connection"，让面板看起来像网关坏了。
+    // 这里先重试一次（惰性、无副作用），保证 detail 反映「现在」而不是 apply 那一刻。
+    try {
+      ensureGatewayPeer()
+    } catch {}
     let sessions = false
     try {
       const service = ctx.get("sessions")
@@ -1816,8 +1830,15 @@ export function apply(ctx, config) {
         if (!requireLoopbackSameOrigin(req, res)) return
         if (req.method === "GET") {
           let detected = []
-          try { detected = await currentDetections() } catch { detected = [] }
-          return json(res, 200, { previews: previews.listPanel(), detected })
+          let detectedError
+          try {
+            detected = await currentDetections()
+          } catch (err) {
+            // 探测失败不要静默成空列表：面板会以为「没有在跑的开发服务器」。
+            detectedError = String(err?.code ?? err?.message ?? "error").slice(0, 40)
+            try { ctx.logger.warn(`dsh-links: preview detection failed: ${detectedError}`) } catch {}
+          }
+          return json(res, 200, { previews: previews.listPanel(), detected, ...(detectedError ? { detectedError } : {}) })
         }
         if (req.method !== "POST") return json(res, 405, { error: "method not allowed" })
         const body = await readLoopbackPost(req, res)
