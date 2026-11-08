@@ -262,6 +262,12 @@ class SessionBackgroundMonitorService : Service() {
             "awaitingApproval" -> {
                 onProgressEvent(TaskProgressEvent.ApprovalAsked)
                 reconcilePendingApproval(host, item.sessionId)
+                // 后台接管的是当前会话时也要推到通知栏：用户可能锁着屏，回不到 App 里的决策栏。
+                val approvalId = item.approvalId
+                val tool = item.approvalToolName
+                if (background && !approvalId.isNullOrBlank() && !tool.isNullOrBlank()) {
+                    DshNotifier.notifyApproval(this, host, item.sessionId, tool, approvalId, item.title.ifBlank { sessionTitle })
+                }
             }
             "awaitingInput" -> onProgressEvent(TaskProgressEvent.QuestionAsked)
             "running" -> onProgressEvent(TaskProgressEvent.ApprovalDecided)
