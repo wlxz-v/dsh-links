@@ -13,7 +13,11 @@ export const APPROVAL_HEADLINE_LIMIT = 180
 const PRIMARY_KEYS = ["command", "cmd", "script", "cmdline"]
 
 /** 参数里可能出现的路径类键，找不到主键时按顺序回退（搜索类工具先给 pattern 再给 path）。 */
-const FALLBACK_KEYS = ["file_path", "filePath", "notebook_path", "url", "pattern", "query", "path", "target", "prompt"]
+const FALLBACK_KEYS = [
+  "file_path", "filePath", "notebook_path", "url", "pattern", "query", "path", "target", "prompt",
+  // run_code 的源码、桌面工具的人类说明：有就显示，实在没有才只剩工具名。
+  "code", "description",
+]
 
 /** 原始参数可能是对象，也可能是 JSON 字符串（历史事件里两种都出现过）。 */
 export function parseToolArguments(args) {
