@@ -8,6 +8,7 @@
 - 端口顺延：默认端口 18640 被占用时自动按 +1 试到 +8 个，配对二维码、`pair-info`、局域网 URL、预览端口守卫、远程 `pluginPort` 全部用**实际**监听端口。探测用临时 net 服务器，不在同一个 https.Server 上反复 listen（那会留下 closing 句柄，进程退出时踩 libuv 断言）。连续 8 个端口都被占用才算启动失败。
 - `qr.png` 补 `x-content-type-options: nosniff` 与 `referrer-policy: no-referrer`（图里有配对码与证书指纹）。
 - JSON 响应压缩协商：大于 1KB 的 JSON 按 `Accept-Encoding` 选 `zstd` / `br` / `gzip`（实测 13.3KB 会话列表：gzip 673B、br 423B、zstd 533B），小响应（含 token 的配对响应）不压；`Vary: accept-encoding` 改为无条件带。Android 的 `MobileApi.request()` 不再手写 `Accept-Encoding: identity`，交给 OkHttp 自己加 gzip 并透明解压（SSE、文件下载仍显式 identity）。
+- 诊断口径修正：`/dsh-link/diagnostics` 的 `host.services` 先重试一次建 peer，再取快照（原先会长期显示启动窗口里的 `peerError: "no-connection"`，看起来像网关坏了）；新增 `peerTransport`（gateway / 空）与 `peerRecreated`（重建次数）。预览探测失败不再静默成空列表，会带回 `detectedError`。
 - 主机级会话事件新增 `notify` 提示：同一会话在 60 秒内重复同一种终态（自动重试里的瞬时失败、轮询抖动）标 `notify: false`，客户端可据此不重复弹通知；事件本身照发，UI 不会漏状态。参考 `dsh-meow-smooth` 的「自动重试中的瞬时错误不打扰、每条恰好一条」。
 
 **已知问题（Windows 开发机）**
