@@ -288,21 +288,53 @@ export function classifyUrl(url) {
 }
 
 /**
+ * 手机永远连不上的 IPv4 网段：
+ *   - 198.18.0.0/15 是基准测试网段（Clash TUN 等虚拟网卡常用），
+ *   - 169.254.0.0/16 是链路本地地址（WiFi 没连上时系统自分配，手机不可达）。
+ * 这类地址进二维码只会让 App 白探一次，还可能抢到「推荐」位。
+ */
+export function isUnreachableIPv4(address) {
+  const parts = String(address ?? "").trim().split(".")
+  if (parts.length !== 4) return false
+  const [a, b, c, d] = parts.map(Number)
+  if (![a, b, c, d].every((n) => Number.isInteger(n) && n >= 0 && n <= 255)) return false
+  if (a === 198 && (b === 18 || b === 19)) return true
+  if (a === 169 && b === 254) return true
+  return false
+}
+
+/** 私网优先级：家用 192.168 最高，10 / 172.16-31 次之，其余（tailnet、公网）最低。 */
+export function lanPreference(address) {
+  const [a, b] = String(address ?? "").split(".").map(Number)
+  if (a === 192 && b === 168) return 3
+  if (a === 10) return 2
+  if (a === 172 && b >= 16 && b <= 31) return 2
+  return 1
+}
+
+/**
  * 把地址列表收成二维码用的 urls 和面板用的 infos。
- * 推荐的仍是第一个私网地址；tailnet 留在列表里，作为第二候选，不抢推荐位。
- * `198.18.` 是基准测试网段，不进码。
+ * 排序与推荐位都按「手机可达性」定：不可达网段直接丢掉（见 isUnreachableIPv4），
+ * 优先级高的排前面，同一优先级保持系统枚举顺序；推荐的仍是第一个私网地址，
+ * tailnet 留在列表里当第二候选，不抢推荐位。
  */
 export function lanInfosForAddresses(addresses, port) {
+  const candidates = (addresses ?? [])
+    .filter((address) => address && !isUnreachableIPv4(address))
+    .map((address, index) => ({ address: String(address), index }))
+  // 稳定排序：只比优先级，同分按原始顺序，避免面板地址每次刷新都跳位。
+  candidates.sort(
+    (left, right) => lanPreference(right.address) - lanPreference(left.address) || left.index - right.index,
+  )
   const urls = []
   const urlInfos = []
   const seen = new Set()
-  for (const address of addresses ?? []) {
-    if (!address || String(address).startsWith("198.18.")) continue
+  for (const { address } of candidates) {
     const fullUrl = `https://${address}:${port}`
     if (seen.has(fullUrl)) continue
     seen.add(fullUrl)
     urls.push(fullUrl)
-    urlInfos.push({ url: fullUrl, label: String(address), category: classifyUrl(fullUrl), isRecommended: false })
+    urlInfos.push({ url: fullUrl, label: address, category: classifyUrl(fullUrl), isRecommended: false })
   }
   if (urlInfos.length > 0) {
     const firstPrivate = urlInfos.find((u) => u.category === "private") ?? urlInfos[0]

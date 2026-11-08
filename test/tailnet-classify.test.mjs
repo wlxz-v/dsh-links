@@ -19,11 +19,13 @@ test("100.64/10 与 Tailscale IPv6 归为 tailnet", () => {
 
 test("私网仍是推荐地址，tailnet 作为第二候选进入二维码", () => {
   const lan = lanInfosForAddresses(["100.64.0.10", "192.168.1.10", "198.18.0.1", "100.64.0.10"], 18640)
-  assert.deepEqual(lan.urls, ["https://100.64.0.10:18640", "https://192.168.1.10:18640"])
-  assert.equal(lan.infos[0].category, "tailnet")
-  assert.equal(lan.infos[0].isRecommended, false)
-  assert.equal(lan.infos[1].category, "private")
-  assert.equal(lan.infos[1].isRecommended, true)
+  // 可达性排序（见 isUnreachableIPv4 / lanPreference）：私网排到 tailnet 前面，
+  // 198.18 是不可达的基准测试网段，不进码。
+  assert.deepEqual(lan.urls, ["https://192.168.1.10:18640", "https://100.64.0.10:18640"])
+  assert.equal(lan.infos[0].category, "private")
+  assert.equal(lan.infos[0].isRecommended, true)
+  assert.equal(lan.infos[1].category, "tailnet")
+  assert.equal(lan.infos[1].isRecommended, false)
   const payload = qrPayload({
     v: 1,
     type: "dsh-link",

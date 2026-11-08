@@ -19,3 +19,6 @@ secrets*
 .env.*
 !.env.example
 .local/
+
+# 本地用 npm 装依赖（上游用 pnpm-lock.yaml），锁文件不入库
+package-lock.json
