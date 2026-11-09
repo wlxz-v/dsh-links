@@ -46,6 +46,7 @@ import {
 } from "./protocol-caps.js"
 
 import {
+  APPROVAL_OFFLINE_GRACE_MS,
   APPROVAL_OUTCOMES,
   APPROVAL_TIMEOUT_MS,
   canDeviceHandle,
@@ -1666,6 +1667,15 @@ export function apply(ctx, config) {
       devices: state.devices,
       device,
       listenHosts,
+      // 双端审批排障：手机端到底连着没有。hostEvents 是后台事件流的订阅者数，
+      // sessions 是正在看某个会话的手机数量（只报会话 id 前缀，不泄露内容）。
+      streams: {
+        hostEvents: hostEvents.subscriberCount,
+        sessions: [...rt.sessionStreams.entries()]
+          .map(([id, writers]) => ({ id: String(id), viewers: writers?.size ?? 0 }))
+          .filter((item) => item.viewers > 0)
+          .slice(0, 8),
+      },
       remote: {
         enabled: Boolean(view.enabled),
         state: view.state,
@@ -1961,14 +1971,12 @@ export function apply(ctx, config) {
       ctx.logger.info(`dsh-links: approval/request passthrough（无法解析审批 id）session=${String(sessionId ?? "?").slice(0, 8)} callId=${req?.callId ?? "无"} reqId=${req?.id ?? "无"} tool=${req?.toolName ?? req?.name ?? "?"}`)
       return next()
     }
-    // 双端审批：只要手机端还在线（在看这个会话，或后台挂着主机事件流）就接管，
-    // 同时把请求继续交给下游的电脑端——两边各弹各的，谁先答用谁。
+    // 双端审批：总是先建手机端记录，再把请求交给电脑端——两边各弹各的，谁先答用谁。
+    // 不能按「手机此刻是否连着」决定要不要接管：电脑端开着会话、手机只是没订阅时，
+    // 整体交回电脑端会让手机端完全看不到这条待办（真实使用中就是这么漏的）。
     const hostSubscribers = hostEvents.subscriberCount
-    if (!writers?.size && !hasLiveMobileDevice(rt, hostSubscribers)) {
-      ctx.logger.info(`dsh-links: approval/request passthrough（手机端离线）session=${String(sessionId ?? "?").slice(0, 8)} tool=${req?.toolName ?? req?.name ?? "?"}`)
-      return next()
-    }
-    ctx.logger.info(`dsh-links: approval/request 双端接管 session=${String(sessionId).slice(0, 8)} id=${String(id).slice(0, 24)} callId=${req?.callId ?? "无"} tool=${req?.toolName ?? req?.name ?? "?"} 手机订阅=${writers?.size ?? 0} 后台流=${hostSubscribers}`)
+    const liveMobile = Boolean(writers?.size) || hasLiveMobileDevice(rt, hostSubscribers)
+    ctx.logger.info(`dsh-links: approval/request 双端接管 session=${String(sessionId).slice(0, 8)} id=${String(id).slice(0, 24)} callId=${req?.callId ?? "无"} tool=${req?.toolName ?? req?.name ?? "?"} 手机订阅=${writers?.size ?? 0} 后台流=${hostSubscribers} 手机在线=${liveMobile ? "是" : "否"}`)
     return new Promise((resolve) => {
       const eligible = subscribedDeviceIds(writers)
       // 没在看这个会话的手机也要能作答：后台通知点开会话后按 deviceId 认人。
@@ -2002,6 +2010,15 @@ export function apply(ctx, config) {
           if (rec.settled) return
           if (!desktopApprovalDecided(outcome)) {
             ctx.logger.info(`dsh-links: 电脑端未定案（${String(outcome)}），继续等手机端 session=${String(sessionId).slice(0, 8)}`)
+            // 手机端没连着时，别把这一轮卡满 5 分钟：电脑端都说没人应答了，
+            // 再给手机端一段重连窗口，等不到就按无人应答结束。
+            if (!liveMobile && !rec.graceTimer) {
+              rec.graceTimer = setTimeout(() => {
+                ctx.logger.info(`dsh-links: 手机端 ${Math.round(APPROVAL_OFFLINE_GRACE_MS / 1000)} 秒内未接入，审批按无人应答结束 session=${String(sessionId).slice(0, 8)}`)
+                rt.requests.finishApproval(rec, "unavailable")
+              }, APPROVAL_OFFLINE_GRACE_MS)
+              rec.graceTimer?.unref?.()
+            }
             return
           }
           ctx.logger.info(`dsh-links: 审批由电脑端定案 ${outcome} session=${String(sessionId).slice(0, 8)}`)

@@ -28,8 +28,8 @@ const IPV4 = /^(?:\d{1,3}\.){3}\d{1,3}$/
 const LONG_HEX = /^[0-9a-f]{16,}$/i
 
 const CHECKS = Object.freeze({
-  mobile: ["host.rpc", "host.services", "plugin.version", "tls.cert", "pairing.devices", "remote.relay", "clock"],
-  panel: ["host.rpc", "host.services", "plugin.version", "tls.cert", "pairing.devices", "listen.addresses", "remote.relay", "clock"],
+  mobile: ["host.rpc", "host.services", "plugin.version", "tls.cert", "pairing.devices", "mobile.streams", "remote.relay", "clock"],
+  panel: ["host.rpc", "host.services", "plugin.version", "tls.cert", "pairing.devices", "listen.addresses", "mobile.streams", "remote.relay", "clock"],
 })
 
 export function tlsExpiryMs(certPem) {
@@ -95,6 +95,7 @@ export function hostDiagnosticsSource(input = {}) {
     devices: input.devices,
     device: input.device ?? null,
     listenHosts: input.listenHosts,
+    streams: input.streams ?? null,
     remote: input.remote,
   }
 }
@@ -117,6 +118,7 @@ export async function runDiagnostics(rt, { scope } = {}) {
     "tls.cert": checkTls(source, nowMs),
     "pairing.devices": checkPairing(source, scope),
     "listen.addresses": checkListen(source),
+    "mobile.streams": checkStreams(source),
     "remote.relay": checkRemote(source),
     clock: checkClock(generatedAt),
   }
@@ -277,6 +279,23 @@ function checkListen(rt) {
     return row("listen.addresses", "warn", "LISTEN_NO_LAN", detail)
   }
   return row("listen.addresses", "ok", "LISTEN_OK", detail)
+}
+
+function checkStreams(rt) {
+  const streams = rt?.streams && typeof rt.streams === "object" ? rt.streams : {}
+  const hostEvents = Number.isSafeInteger(streams.hostEvents) && streams.hostEvents > 0 ? streams.hostEvents : 0
+  const sessions = Array.isArray(streams.sessions) ? streams.sessions.slice(0, 8) : []
+  const viewers = sessions
+    .filter((item) => item && typeof item.id === "string" && Number.isSafeInteger(item.viewers) && item.viewers > 0)
+    .map((item) => `${item.id.slice(0, 8)}_${item.viewers}`)
+  const detail = {
+    hostEvents,
+    sessionCount: viewers.length,
+  }
+  if (viewers.length) detail.viewers = viewers.join(",")
+  // 用 _ 分隔：诊断 detail 的字符串要过 ENUM_STRING 校验（不允许冒号），冒号会被清洗掉。
+  // idle 也是正常状态：手机端没打开/没在后台连着。面板上靠这一行判断审批为什么只到了电脑端。
+  return row("mobile.streams", "ok", hostEvents || viewers.length ? "MOBILE_STREAMS_LIVE" : "MOBILE_STREAMS_IDLE", detail)
 }
 
 function checkRemote(rt) {

@@ -104,7 +104,7 @@ test("面板范围：全部通过时 1 秒内出结果，且只有枚举和数�
   assert.equal(report.version, 1)
   assert.equal(report.generatedAt, Math.floor(NOW / 1000))
   assert.deepEqual(report.checks.map((item) => item.id), [
-    "host.rpc", "host.services", "plugin.version", "tls.cert", "pairing.devices", "listen.addresses", "remote.relay", "clock",
+    "host.rpc", "host.services", "plugin.version", "tls.cert", "pairing.devices", "listen.addresses", "mobile.streams", "remote.relay", "clock",
   ])
   assert.equal(check(report, "host.rpc").status, "ok")
   assert.equal(check(report, "host.rpc").code, "HOST_RPC_OK")
@@ -125,10 +125,24 @@ test("面板范围：全部通过时 1 秒内出结果，且只有枚举和数�
   assertPrivate(report)
 })
 
+test("mobile.streams：手机端连着时报告后台事件流与查看者数量", async () => {
+  const report = await runDiagnostics({
+    ...healthy(),
+    streams: { hostEvents: 2, sessions: [{ id: "s-1234567890", viewers: 1 }, { id: "s-9999", viewers: 0 }] },
+  }, { scope: "panel" })
+  const live = check(report, "mobile.streams")
+  assert.equal(live.status, "ok")
+  assert.equal(live.code, "MOBILE_STREAMS_LIVE")
+  assert.deepEqual(live.detail, { hostEvents: 2, sessionCount: 1, viewers: "s-123456_1" })
+  const idle = check(await runDiagnostics(healthy(), { scope: "panel" }), "mobile.streams")
+  assert.equal(idle.code, "MOBILE_STREAMS_IDLE")
+  assert.deepEqual(idle.detail, { hostEvents: 0, sessionCount: 0 })
+})
+
 test("手机范围不泄露面板字段、其他设备或地址", async () => {
   const report = await runDiagnostics(healthy(), { scope: "mobile" })
   assert.deepEqual(report.checks.map((item) => item.id), [
-    "host.rpc", "host.services", "plugin.version", "tls.cert", "pairing.devices", "remote.relay", "clock",
+    "host.rpc", "host.services", "plugin.version", "tls.cert", "pairing.devices", "mobile.streams", "remote.relay", "clock",
   ])
   assert.equal(check(report, "pairing.devices").code, "PAIRING_SELF_OK")
   assert.deepEqual(check(report, "pairing.devices").detail, { valid: true })

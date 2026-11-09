@@ -6,6 +6,16 @@ import { RECONNECT_GRACE_MS } from "./protocol-caps.js"
 
 export { RECONNECT_GRACE_MS }
 export const APPROVAL_TIMEOUT_MS = 5 * 60 * 1000
+
+/**
+ * 手机端这一刻没连着（没有会话订阅、也没有后台事件流）时的兜底等待。
+ *
+ * 双端审批总是先建手机端记录，否则「电脑端开着会话、手机只是没订阅」就会整体交回电脑端，
+ * 手机端事后打开会话也看不到这条待办。但没人连着时也不该把一轮工具调用卡满
+ * {@link APPROVAL_TIMEOUT_MS}：电脑端明确表示没人应答（`unavailable`）之后，再给手机端
+ * 这么长一段重连窗口，仍没等到就按「无人应答」结束。
+ */
+export const APPROVAL_OFFLINE_GRACE_MS = 30 * 1000
 export const MAX_TERMINAL_RESULTS = 256
 export const TERMINAL_TTL_MS = 10 * 60 * 1000
 export const APPROVAL_OUTCOMES = new Set(["allowed-once", "rejected", "cancelled", "unavailable"])
@@ -91,6 +101,10 @@ export function createRequestRegistry({
     if (rec?.timer) {
       clearTimeoutFn(rec.timer)
       rec.timer = null
+    }
+    if (rec?.graceTimer) {
+      clearTimeoutFn(rec.graceTimer)
+      rec.graceTimer = null
     }
     try { rec.signal?.removeEventListener?.("abort", rec.onAbort) } catch {}
   }
