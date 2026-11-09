@@ -104,6 +104,13 @@ test("resolveWorkspaceFile 拒绝越出 cwd", () => {
     assert.equal(inside.name, "ok.txt")
     assert.throws(() => resolveWorkspaceFile(root, "../secret"), { status: 403 })
     assert.equal(mimeFromName("shot.png"), "image/png")
+    // 手机上的查看器不认 octet-stream：Office / 压缩包要按后缀给准确类型。
+    assert.equal(mimeFromName("报表.xlsx"), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    assert.equal(mimeFromName("方案.docx"), "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+    assert.equal(mimeFromName("report.pdf"), "application/pdf")
+    assert.equal(mimeFromName("pack.zip"), "application/zip")
+    assert.equal(mimeFromName("data.csv"), "text/csv; charset=utf-8")
+    assert.equal(mimeFromName("unknown.bin"), "application/octet-stream")
   } finally {
     rmSync(root, { recursive: true, force: true })
   }

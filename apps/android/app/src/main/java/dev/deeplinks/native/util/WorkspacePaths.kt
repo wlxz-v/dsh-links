@@ -16,7 +16,7 @@ fun producedFileName(path: String): String {
     return trimmed.substringAfterLast('/').ifBlank { trimmed }
 }
 
-enum class ProducedFileKind { IMAGE, TEXT, OTHER }
+enum class ProducedFileKind { IMAGE, TEXT, PDF, OTHER }
 
 private val IMAGE_EXT = setOf("png", "jpg", "jpeg", "gif", "webp")
 private val TEXT_EXT = setOf(
@@ -29,8 +29,55 @@ fun producedFileKind(path: String): ProducedFileKind {
     return when (ext) {
         in IMAGE_EXT -> ProducedFileKind.IMAGE
         in TEXT_EXT -> ProducedFileKind.TEXT
+        "pdf" -> ProducedFileKind.PDF
         else -> ProducedFileKind.OTHER
     }
+}
+
+/**
+ * 交给系统应用打开时用的 MIME：插件给的是 octet-stream（老插件不认识的格式）就按后缀补，
+ * 否则 WPS / Office / 阅读器会被通用类型挡住。返回空串表示「不知道类型」。
+ */
+fun mimeForProducedFile(path: String, serverMime: String?): String {
+    val clean = serverMime?.substringBefore(';')?.trim()?.lowercase().orEmpty()
+    if (clean.isNotEmpty() && clean != "application/octet-stream") return clean
+    return when (path.trim().substringAfterLast('.', missingDelimiterValue = "").lowercase()) {
+        "pdf" -> "application/pdf"
+        "doc" -> "application/msword"
+        "docx" -> "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        "xls" -> "application/vnd.ms-excel"
+        "xlsx" -> "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        "ppt" -> "application/vnd.ms-powerpoint"
+        "pptx" -> "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+        "odt" -> "application/vnd.oasis.opendocument.text"
+        "ods" -> "application/vnd.oasis.opendocument.spreadsheet"
+        "odp" -> "application/vnd.oasis.opendocument.presentation"
+        "rtf" -> "application/rtf"
+        "zip" -> "application/zip"
+        "csv" -> "text/csv"
+        "md" -> "text/markdown"
+        "txt" -> "text/plain"
+        "json" -> "application/json"
+        "png" -> "image/png"
+        "jpg", "jpeg" -> "image/jpeg"
+        "gif" -> "image/gif"
+        "webp" -> "image/webp"
+        "svg" -> "image/svg+xml"
+        "html" -> "text/html"
+        "mp4" -> "video/mp4"
+        "mp3" -> "audio/mpeg"
+        "m4a" -> "audio/mp4"
+        "wav" -> "audio/wav"
+        else -> "application/octet-stream"
+    }
+}
+
+/** 缓存目录里的文件名：去掉路径分隔与控制字符，避免在外面打开时被拼出奇怪路径。 */
+fun safeCacheFileName(path: String): String {
+    val name = path.trim().substringAfterLast('/')
+        .replace(Regex("[\\\\/:*?\"<>|\\u0000-\\u001f]"), "_")
+        .trim()
+    return name.ifBlank { "file" }
 }
 
 fun decodeProducedText(bytes: ByteArray, maxChars: Int = 32_768): String {

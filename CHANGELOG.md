@@ -29,6 +29,18 @@
 - Android：`MobileMessage.detail` 与 `SessionRequestState.detail` 解析新字段；决策栏先用 `args` 里的 `command`/`cmd`/`script`，其次用 `detail`，只有两者都没有时才显示「看不到参数」；消息流里的审批卡在状态行下方补一段工作内容；审批通知用 `BigTextStyle` 展开命令原文。
 - 新增 `src/approval-detail.js`（纯函数，含截断与单行摘要）与 `test/approval-detail.test.mjs`。
 
+**产出文件能在手机上打开**
+
+- 以前「本轮产出」只有图片和纯文本能预览，`xlsx` / `docx` / `pdf` 这类点一下只是把路径复制走——看起来就是「只有文件名、点不开」。Android 现在按类型分派：
+  - 图片：原样在 App 内预览（不变）；
+  - 纯文本 / 代码 / JSON / CSV：App 内文本预览（不变）；
+  - PDF：App 内用系统 `PdfRenderer` 渲染前 5 页翻着看，不引第三方库；
+  - 其它（`docx`/`xlsx`/`pptx`/`zip` 等）：先下载到本机缓存，再通过 `FileProvider` 交给手机上的 WPS / Office / 阅读器打开；没有能接手的 App 时明确提示，而不是无声无息。
+- 「浏览文件」弹层用同一套分派，不再只对图片/文本生效。
+- 服务端 `mimeFromName()` 补全 Office / ODF / zip / 音视频类型：这些文件以前返回 `application/octet-stream`，手机上的查看器会拒收。
+- 下载上限仍是 8 MiB（`BoundedIo.MAX_WORKSPACE_FILE_BYTES`）；超限会提示「文件太大，请在电脑上打开」。
+- 已知边界：`docx` / `xlsx` 依赖手机上装了对应查看器；App 内没有自己排版渲染 Office 文档（那要引一套第三方库，暂不做）。
+
 **已知问题（Windows 开发机）**
 
 - `npm test` 里 13 个用例仍失败，全部是 Windows 环境限制、与插件行为无关：符号链接需要开发者模式/管理员（8 个）、`chmod 448` 在 Windows 上是 438（1 个）、`openssl` / `npm` 不在 PATH（2 个）、POSIX 路径分隔符断言（2 个）。Linux CI 上全部通过。

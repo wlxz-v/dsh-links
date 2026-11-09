@@ -33,7 +33,43 @@ class WorkspacePathsTest {
     fun producedFileKind_classifiesByExtension() {
         assertEquals(ProducedFileKind.IMAGE, producedFileKind("a/b.PNG"))
         assertEquals(ProducedFileKind.TEXT, producedFileKind("notes/hi.md"))
+        assertEquals(ProducedFileKind.PDF, producedFileKind("out/report.PDF"))
         assertEquals(ProducedFileKind.OTHER, producedFileKind("bin/out"))
+    }
+
+    @Test
+    fun producedFileKind_officeDocsAreOther() {
+        // 表格/文档没有内置渲染，走「交给系统应用打开」。
+        assertEquals(ProducedFileKind.OTHER, producedFileKind("报表.xlsx"))
+        assertEquals(ProducedFileKind.OTHER, producedFileKind("方案.docx"))
+    }
+
+    @Test
+    fun mimeForProducedFile_keepsServerMime() {
+        assertEquals("application/pdf", mimeForProducedFile("a.pdf", "application/pdf"))
+        assertEquals("image/png", mimeForProducedFile("a.png", "image/png; charset=binary"))
+    }
+
+    @Test
+    fun mimeForProducedFile_fallsBackToExtension() {
+        assertEquals("application/pdf", mimeForProducedFile("a.pdf", "application/octet-stream"))
+        assertEquals(
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            mimeForProducedFile("报表.xlsx", null),
+        )
+        assertEquals(
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            mimeForProducedFile("方案.docx", ""),
+        )
+        assertEquals("application/zip", mimeForProducedFile("pack.zip", "APPLICATION/OCTET-STREAM"))
+        assertEquals("application/octet-stream", mimeForProducedFile("weird.bin", null))
+    }
+
+    @Test
+    fun safeCacheFileName_stripsSeparatorsAndControlChars() {
+        assertEquals("报表.xlsx", safeCacheFileName("out/报表.xlsx"))
+        assertEquals("a_b.txt", safeCacheFileName("dir/a:b.txt"))
+        assertEquals("file", safeCacheFileName("dir/"))
     }
 
     @Test

@@ -40,7 +40,9 @@ import dev.deeplinks.native.util.decodeProducedText
 import dev.deeplinks.native.util.formatFileSize
 import dev.deeplinks.native.util.isProducedTextMime
 import dev.deeplinks.native.util.looksLikeText
+import dev.deeplinks.native.util.mimeForProducedFile
 import dev.deeplinks.native.util.producedFileKind
+import dev.deeplinks.native.util.safeCacheFileName
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -98,34 +100,48 @@ internal fun WorkspaceFileBrowserSheet(
     fun openFile(entry: WorkspaceDirEntry) {
         val path = childWorkspacePath(dir, entry.name)
         val kind = producedFileKind(entry.name)
+        // 无后缀/未知后缀的小文件先嗅探：像文本就地预览，不像文本交给系统应用。
         val sniff = kind == ProducedFileKind.OTHER && (entry.size ?: Long.MAX_VALUE) <= SNIFF_MAX_BYTES
-        if (kind == ProducedFileKind.OTHER && !sniff) {
-            copyPath(path)
-            rowNotice = entry.name to L.fileTreePathCopied
-            return
-        }
         openingName = entry.name
         rowNotice = null
         scope.launch {
             val result = runCatching { withContext(Dispatchers.IO) { fetchFile(sessionId, path) } }
             openingName = null
             result.fold(
-                onSuccess = { (mime, bytes) ->
+                onSuccess = { (serverMime, bytes) ->
                     val shown = when {
-                        kind == ProducedFileKind.IMAGE || mime.startsWith("image/") ->
+                        kind == ProducedFileKind.IMAGE || serverMime.startsWith("image/") ->
                             decodeSampledBitmap(bytes)?.let { ProducedPreview.Image(it) }
-                        kind == ProducedFileKind.TEXT || isProducedTextMime(mime) || looksLikeText(bytes) ->
+                        kind == ProducedFileKind.TEXT || isProducedTextMime(serverMime) ||
+                            (sniff && looksLikeText(bytes)) ->
                             ProducedPreview.Text(path, decodeProducedText(bytes))
-                        else -> null
+                        kind == ProducedFileKind.PDF -> withContext(Dispatchers.IO) {
+                            runCatching {
+                                val cacheDir = java.io.File(context.cacheDir, "opened").apply { mkdirs() }
+                                val file = java.io.File(cacheDir, safeCacheFileName(path)).apply { writeBytes(bytes) }
+                                renderPdfPages(file)
+                            }.getOrNull()?.takeIf { it.first.isNotEmpty() }
+                                ?.let { ProducedPreview.Pdf(entry.name, it.first, it.second) }
+                        }
+                        else -> {
+                            // 表格/文档/压缩包：交给手机上的查看器（WPS / Office / 解压 App）。
+                            val opened = withContext(Dispatchers.IO) {
+                                openWithSystemApp(context, path, mimeForProducedFile(path, serverMime), bytes)
+                            }
+                            if (!opened) rowNotice = entry.name to L.noAppToOpen
+                            null
+                        }
                     }
                     if (shown != null) {
                         preview = shown
-                    } else {
-                        copyPath(path)
-                        rowNotice = entry.name to L.fileTreePathCopied
+                    } else if (rowNotice == null && kind != ProducedFileKind.OTHER) {
+                        rowNotice = entry.name to L.openFileFailed
                     }
                 },
-                onFailure = { rowNotice = entry.name to L.openFileFailed },
+                onFailure = { error ->
+                    rowNotice = entry.name to
+                        if (isFileTooLarge(error)) L.fileTooLarge else L.openFileFailed
+                },
             )
         }
     }

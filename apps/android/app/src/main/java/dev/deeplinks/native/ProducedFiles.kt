@@ -9,6 +9,7 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
@@ -20,6 +21,7 @@ import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
@@ -56,8 +58,10 @@ import dev.deeplinks.core.L
 import dev.deeplinks.native.util.ProducedFileKind
 import dev.deeplinks.native.util.decodeProducedText
 import dev.deeplinks.native.util.isProducedTextMime
+import dev.deeplinks.native.util.mimeForProducedFile
 import dev.deeplinks.native.util.producedFileKind
 import dev.deeplinks.native.util.producedFileName
+import dev.deeplinks.native.util.safeCacheFileName
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -80,7 +84,77 @@ internal fun decodeSampledBitmap(bytes: ByteArray, maxEdge: Int = PREVIEW_MAX_ED
 internal sealed interface ProducedPreview {
     data class Image(val bitmap: Bitmap) : ProducedPreview
     data class Text(val path: String, val body: String) : ProducedPreview
+    /** PDF 直接在 App 内翻页看（PdfRenderer 是系统自带，不引第三方库）。 */
+    data class Pdf(val name: String, val pages: List<Bitmap>, val truncated: Boolean) : ProducedPreview
 }
+
+/** PDF 前若干页渲染成位图。页数有上限：整本渲进内存会在手机上 OOM。 */
+internal fun renderPdfPages(file: java.io.File, maxPages: Int = PDF_PREVIEW_MAX_PAGES): Pair<List<Bitmap>, Boolean> {
+    val pages = mutableListOf<Bitmap>()
+    var truncated = false
+    android.os.ParcelFileDescriptor.open(file, android.os.ParcelFileDescriptor.MODE_READ_ONLY).use { fd ->
+        android.graphics.pdf.PdfRenderer(fd).use { renderer ->
+            val count = renderer.pageCount
+            truncated = count > maxPages
+            for (index in 0 until minOf(count, maxPages)) {
+                renderer.openPage(index).use { page ->
+                    // 按屏宽的一半渲染再放大显示：手机上够清楚，内存占用小一个数量级。
+                    val width = (PDF_PREVIEW_WIDTH_PX).coerceAtLeast(320)
+                    val height = (width * page.height.toFloat() / page.width.toFloat()).toInt().coerceAtLeast(1)
+                    val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+                    bitmap.eraseColor(android.graphics.Color.WHITE)
+                    page.render(bitmap, null, null, android.graphics.pdf.PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                    pages += bitmap
+                }
+            }
+        }
+    }
+    return pages to truncated
+}
+
+/**
+ * 下载到本机缓存再交给系统应用打开（WPS / Office / 阅读器 / 播放器）。
+ * 返回 false 表示这台手机没有能接过该类型的应用。
+ */
+internal fun openWithSystemApp(context: android.content.Context, path: String, mime: String, bytes: ByteArray): Boolean {
+    return try {
+        val dir = java.io.File(context.cacheDir, "opened").apply { mkdirs() }
+        // 只留最近一次的留档：缓存目录不该无限长。
+        dir.listFiles()?.forEach { it.delete() }
+        val file = java.io.File(dir, safeCacheFileName(path)).apply { writeBytes(bytes) }
+        val uri = androidx.core.content.FileProvider.getUriForFile(
+            context,
+            "${context.packageName}.fileprovider",
+            file,
+        )
+        val view = android.content.Intent(android.content.Intent.ACTION_VIEW)
+            .setDataAndType(uri, mime)
+            .addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        val chooser = android.content.Intent.createChooser(view, producedFileName(path))
+            .addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        context.startActivity(chooser)
+        true
+    } catch (e: android.content.ActivityNotFoundException) {
+        false
+    } catch (e: Exception) {
+        false
+    }
+}
+
+/** 8 MiB 上限是在读流时抛的 IOException，外面又包了一层本地化文案，所以要顺 cause 链找。 */
+internal fun isFileTooLarge(error: Throwable?): Boolean {
+    var current = error
+    var depth = 0
+    while (current != null && depth < 5) {
+        if (current.message?.contains("too large", ignoreCase = true) == true) return true
+        current = current.cause
+        depth++
+    }
+    return false
+}
+
+private const val PDF_PREVIEW_MAX_PAGES = 5
+private const val PDF_PREVIEW_WIDTH_PX = 1080
 
 /**
  * 本轮产出：对标 DSH 0.1.5 侧栏打开文件。
@@ -98,6 +172,8 @@ internal fun ProducedFilesRow(
     var loadingPath by remember { mutableStateOf<String?>(null) }
     var errorPath by remember { mutableStateOf<String?>(null) }
     var copiedPath by remember { mutableStateOf<String?>(null) }
+    // 不能只改芯片文字：打开失败/超限要留一行说明，否则看起来还是「点了没反应」。
+    var notice by remember { mutableStateOf<String?>(null) }
 
     LaunchedEffect(copiedPath) {
         if (copiedPath == null) return@LaunchedEffect
@@ -115,32 +191,57 @@ internal fun ProducedFilesRow(
 
     fun openPath(path: String) {
         val fetch = onFetchFile
-        val kind = producedFileKind(path)
-        if (fetch == null || kind == ProducedFileKind.OTHER) {
+        if (fetch == null) {
             copyPath(path)
             return
         }
+        val kind = producedFileKind(path)
         loadingPath = path
         errorPath = null
+        notice = null
         scope.launch(Dispatchers.IO) {
             val result = runCatching { fetch(path) }
             withContext(Dispatchers.Main) {
                 loadingPath = null
                 result.fold(
-                    onSuccess = { (mime, bytes) ->
+                    onSuccess = { (serverMime, bytes) ->
                         when {
-                            kind == ProducedFileKind.IMAGE || mime.startsWith("image/") -> {
+                            kind == ProducedFileKind.IMAGE || serverMime.startsWith("image/") -> {
                                 val bmp = decodeSampledBitmap(bytes)
                                 if (bmp != null) preview = ProducedPreview.Image(bmp)
                                 else errorPath = path
                             }
-                            kind == ProducedFileKind.TEXT || isProducedTextMime(mime) -> {
+                            kind == ProducedFileKind.TEXT || isProducedTextMime(serverMime) -> {
                                 preview = ProducedPreview.Text(path, decodeProducedText(bytes))
                             }
-                            else -> copyPath(path)
+                            kind == ProducedFileKind.PDF -> {
+                                // PdfRenderer 只认真实文件：先落到缓存再渲染前几页。
+                                val rendered = withContext(Dispatchers.IO) {
+                                    runCatching {
+                                        val dir = java.io.File(context.cacheDir, "opened").apply { mkdirs() }
+                                        val file = java.io.File(dir, safeCacheFileName(path)).apply { writeBytes(bytes) }
+                                        renderPdfPages(file)
+                                    }.getOrNull()
+                                }
+                                if (rendered != null && rendered.first.isNotEmpty()) {
+                                    preview = ProducedPreview.Pdf(producedFileName(path), rendered.first, rendered.second)
+                                } else {
+                                    errorPath = path
+                                }
+                            }
+                            else -> {
+                                // 表格/文档/压缩包这类：本机查看器打开（WPS / Office / 解压 App）。
+                                val opened = withContext(Dispatchers.IO) {
+                                    openWithSystemApp(context, path, mimeForProducedFile(path, serverMime), bytes)
+                                }
+                                if (!opened) notice = L.noAppToOpen
+                            }
                         }
                     },
-                    onFailure = { errorPath = path },
+                    onFailure = { error ->
+                        errorPath = path
+                        if (isFileTooLarge(error)) notice = L.fileTooLarge
+                    },
                 )
             }
         }
@@ -225,6 +326,14 @@ internal fun ProducedFilesRow(
                 }
             }
         }
+        notice?.let { message ->
+            Spacer(Modifier.height(DshSpace.s8))
+            Text(
+                message,
+                color = Dsh.labelSecondary,
+                style = DshType.caption,
+            )
+        }
     }
 
     preview?.let { current -> ProducedPreviewDialog(current, onDismiss = { preview = null }) }
@@ -264,5 +373,61 @@ internal fun ProducedPreviewDialog(
             }
         }
         is ProducedPreview.Text -> FilePreviewDialog(current.path, current.body, onDismiss, onQuote)
+        is ProducedPreview.Pdf -> Dialog(onDismissRequest = { onDismiss() }) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .fillMaxHeight(0.85f)
+                    .clip(RoundedCornerShape(DshRadius.container))
+                    .background(Dsh.bgInput)
+                    .navigationBarsPadding()
+                    .padding(DshSpace.s16),
+            ) {
+                Text(
+                    current.name,
+                    color = Dsh.labelPrimary,
+                    style = DshType.title,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Spacer(Modifier.height(DshSpace.s8))
+                val scroll = androidx.compose.foundation.rememberScrollState()
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .weight(1f)
+                        .verticalScroll(scroll),
+                    verticalArrangement = Arrangement.spacedBy(DshSpace.s12),
+                ) {
+                    current.pages.forEachIndexed { index, bitmap ->
+                        Image(
+                            bitmap = bitmap.asImageBitmap(),
+                            contentDescription = "${current.name} ${index + 1}",
+                            contentScale = androidx.compose.ui.layout.ContentScale.FillWidth,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(DshRadius.container)),
+                        )
+                    }
+                }
+                if (current.truncated) {
+                    Spacer(Modifier.height(DshSpace.s8))
+                    Text(L.pdfPagesTruncated, color = Dsh.labelSecondary, style = DshType.caption)
+                }
+                Spacer(Modifier.height(DshSpace.s8))
+                Text(
+                    L.close,
+                    color = Dsh.labelSecondary,
+                    style = DshType.body,
+                    modifier = Modifier
+                        .align(Alignment.End)
+                        .clickable(
+                            interactionSource = remember { MutableInteractionSource() },
+                            indication = dshRipple(),
+                        ) { onDismiss() }
+                        .padding(DshSpace.s8),
+                )
+            }
+        }
     }
 }

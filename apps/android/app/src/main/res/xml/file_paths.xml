@@ -2,4 +2,6 @@
 <paths>
     <cache-path name="share" path="share/" />
     <cache-path name="capture" path="capture/" />
+    <!-- 产出文件下载到本机后交给 WPS / Office / 阅读器打开（见 ProducedFiles.openWithSystemApp） -->
+    <cache-path name="opened" path="opened/" />
 </paths>
