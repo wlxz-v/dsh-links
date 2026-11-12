@@ -269,7 +269,25 @@ class SessionBackgroundMonitorService : Service() {
                     DshNotifier.notifyApproval(this, host, item.sessionId, tool, approvalId, item.title.ifBlank { sessionTitle }, item.approvalDetail)
                 }
             }
-            "awaitingInput" -> onProgressEvent(TaskProgressEvent.QuestionAsked)
+            "awaitingInput" -> {
+                onProgressEvent(TaskProgressEvent.QuestionAsked)
+                // 双端澄清：多道题依次选择的卡片在会话里，通知栏至少要告诉用户「在问什么」，
+                // 点一下直接进该会话逐题作答。锁着屏时也要能看到。
+                val questionText = item.questionText
+                if (background && !item.questionId.isNullOrBlank()) {
+                    val title = item.title.ifBlank { sessionTitle }
+                    DshNotifier.notifyApproval(
+                        this,
+                        host,
+                        item.sessionId,
+                        toolName = L.notifNeedQuestion,
+                        sessionTitle = title,
+                        detail = questionText,
+                        titleText = L.notifNeedQuestion,
+                        bodyText = questionText ?: L.notifNeedQuestionBody.format(title),
+                    )
+                }
+            }
             "running" -> onProgressEvent(TaskProgressEvent.ApprovalDecided)
             "completed", "failed", "stopped" -> onProgressEvent(TaskProgressEvent.TurnEnded)
         }

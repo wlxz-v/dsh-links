@@ -25,7 +25,7 @@
 
 `capabilities.diagnostics: { v: 1 }` 表示可以拉连接诊断，见下方「连接诊断」。旧 App 忽略该字段。
 
-`capabilities.events: { host: true }` 表示可以订阅 `GET /dsh-link/mobile/events`（设备 token，SSE）。事件只有会话级状态，不包含消息正文和工具参数：`id` 为单调 seq，`event: session/state`，正文 `{ type, sessionId, state, title, origin, seq, notify? }`。`state` 为 `running` / `awaitingApproval` / `awaitingInput` / `completed` / `failed` / `stopped`，`origin` 为 `user` / `subagent` / `schedule`。DSH 没有全局会话事件时，插件只在有订阅者的情况下每 5 秒对 `session.list` 做差分。心跳为 25 秒的 `event: heartbeat`。请求带 `Last-Event-ID`：缓冲里接得上就补发，接不上发 `event: resync-required`。`notify` 只在为 `false` 时下发：同一会话 60 秒内重复出现的同一种终态（自动重试里的瞬时失败、轮询抖动）标记为不必再通知，App 据此少响一次；缺省即通知。旧 App 忽略该键。`state` 为 `awaitingApproval` 时还会带 `approvalId`（待办审批 id）、`approvalToolName`（工具名，截断到 64 字符）与 `approvalDetail`（这次要做什么：命令原文、文件路径等，截断到 600 字符）：App 后台收到后可以直接弹出带「允许一次 / 拒绝」的通知，并在通知展开区显示工作内容，不必等用户打开该会话（双端审批）。三个键只在确有挂起审批、且该值存在时出现，老插件不发，旧 App 忽略该键。旧 App 忽略该能力。
+`capabilities.events: { host: true }` 表示可以订阅 `GET /dsh-link/mobile/events`（设备 token，SSE）。事件只有会话级状态，不包含消息正文和工具参数：`id` 为单调 seq，`event: session/state`，正文 `{ type, sessionId, state, title, origin, seq, notify? }`。`state` 为 `running` / `awaitingApproval` / `awaitingInput` / `completed` / `failed` / `stopped`，`origin` 为 `user` / `subagent` / `schedule`。DSH 没有全局会话事件时，插件只在有订阅者的情况下每 5 秒对 `session.list` 做差分。心跳为 25 秒的 `event: heartbeat`。请求带 `Last-Event-ID`：缓冲里接得上就补发，接不上发 `event: resync-required`。`notify` 只在为 `false` 时下发：同一会话 60 秒内重复出现的同一种终态（自动重试里的瞬时失败、轮询抖动）标记为不必再通知，App 据此少响一次；缺省即通知。旧 App 忽略该键。`state` 为 `awaitingApproval` 时还会带 `approvalId`（待办审批 id）、`approvalToolName`（工具名，截断到 64 字符）与 `approvalDetail`（这次要做什么：命令原文、文件路径等，截断到 600 字符）：App 后台收到后可以直接弹出带「允许一次 / 拒绝」的通知，并在通知展开区显示工作内容，不必等用户打开该会话（双端审批）。三个键只在确有挂起审批、且该值存在时出现，老插件不发，旧 App 忽略该键。`state` 为 `awaitingInput` 时带 `questionId`（待办澄清 id）与 `questionText`（第一题的标题或题干，截断到 200 字符），App 后台据此弹「有一道选择题在等你 + 在问什么」；同样只在非空时出现，标题/题干变化也按变化下发。旧 App 忽略该能力。
 
 `capabilities.preview: { v: 1, detect: 1 }` 表示可以列已批准的本机预览，并且可以列出工具输出里看到的端口。`v` 仍是 1，旧 App 只认 `v` 时预览入口不变。`detect` 是新增字段，旧 App 忽略。手机不能批准端口。
 
@@ -33,7 +33,7 @@
 
 `GET /dsh-link/mobile/sessions` 也返回同名 `archivedSessionIds`。App 的后台会话刷新必须先应用该集合，再更新列表和当前选择，避免列表请求与工作区请求之间产生短暂不一致。
 
-会话行（`bootstrap.sessions` 与 `GET /dsh-link/mobile/sessions`）可带 `awaitingInput: true`：该会话有尚未结束的审批或澄清问题，不论它由手机接管还是交给电脑端网页处理。字段由插件在 `approval/request`、`user-questions/request` 钩子外层计数得出（DSH 的 `session.list` 不带这个状态），只在为真时下发，缺省即 `false`；旧 App 忽略该键。交给电脑端的请求手机只能看到状态，仍需在电脑上处理。
+会话行（`bootstrap.sessions` 与 `GET /dsh-link/mobile/sessions`）可带 `awaitingInput: true`：该会话有尚未结束的审批或澄清问题，不论它由手机接管还是交给电脑端网页处理。字段由插件在 `approval/request`、`user-questions/request` 钩子外层计数得出（DSH 的 `session.list` 不带这个状态），只在为真时下发，缺省即 `false`；旧 App 忽略该键。审批与澄清都是「双端同时推送、先答先算」：插件总是先建手机端待办，再把请求交给电脑端网页，谁先给出明确答复就用谁；手机端没连着时先给 30 秒重连窗口再按无人应答结束。
 
 `GET /dsh-link/mobile/sessions/search` 同样遵守该集合：成功搜索和降级的标题搜索都不会返回 Web 已归档的 `sessionId`。
 
@@ -182,6 +182,7 @@ DSH 结果映射：`allowed-once`/`rejected` → `resolved`；`cancelled` → `c
 - 审批重复提交若已有终态，返回 `alreadySettled` 且不再次 settle。
 - SSE 断开后有不超过 30 秒且不超过原审批剩余期限的重连宽限；重连不重置 5 分钟总超时。
 - 双端审批（2026-11 起）：审批同时推给电脑端与手机端，谁先答谁算。手机端「已配对 + 已鉴权 + 在这次审批的候选设备里」即可作答，不要求当前订阅该会话（从后台通知直接点「允许一次 / 拒绝」就是这条路）；`GET .../requests` 对这些设备也返回快照，作答合法性由 POST 再判一次。电脑端返回 `unavailable`（没有应答者）或 `cancelled`（网页端撤销提问）不算定案，手机端继续等。
+- 双端澄清（2026-11 起）：与审批同一条策略，插件总是先建手机端待办再把问题交给电脑端网页，谁先答用谁；电脑端先答时补发 `event: question-resolved`（`{ rpcId, sessionId, outcome: "answered" }`），让还开着澄清卡的手机立刻收掉。手机端没连着时先给 30 秒重连窗口，到期按无人应答结束（`cancelled`），不把一轮工具调用卡满 5 分钟。
 - 设备吊销、DSH abort、插件退出立即结束，不能借宽限恢复权限。
 - 插件重启后内存回调不可恢复，未决请求失效。
 - 澄清多题：旧 App 不声明 `multiQuestion` 时回落桌面，不在手机上构造未展示题目的答案。

@@ -105,6 +105,8 @@ val DshStringsZh = DshStrings(
         put("notifNeedApproval", "需要审批")
         put("notifNeedApprovalBody", "「%s」请求执行，点击查看")
         put("notifNeedApprovalPublicBody", "有一项操作等待确认")
+        put("notifNeedQuestion", "有一道选择题在等你")
+        put("notifNeedQuestionBody", "会话「%s」在等你选择")
         put("notifTaskDone", "任务完成")
         put("notifTaskDoneBody", "会话「%s」已完成")
         put("notifTaskStopped", "会话已停止")

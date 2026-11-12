@@ -1,5 +1,14 @@
 ## 未发布（main）
 
+**双端澄清（多题依次选择也能推到手机）**
+
+- 根因：`user-questions/request` 钩子以前只在「手机正看着这个会话」时才接管；电脑端开着会话时插件直接 `next()`，手机端连待办记录都不建，所以「多道题依次选择」的澄清卡永远到不了手机（打开会话也看不到）。
+- 现在与审批同一条策略：总是先建手机端记录，再把问题同时交给电脑端网页，谁先答用谁。电脑端没作答/没人在看时，手机端继续等；手机端也没连着时给 30 秒重连窗口（`APPROVAL_OFFLINE_GRACE_MS`）再按无人应答结束，不会把一轮工具调用卡满 5 分钟。
+- 多题（`questions.length > 1`）只推给声明了 `multiQuestion` 能力的连接；单题不挑客户端。答完一题推下一题仍由宿主驱动，插件只负责把每次请求送到能作答的一端。
+- 电脑端先答时向手机补发 `event: question-resolved`（`{ rpcId, sessionId, outcome: "answered" }`），还开着的澄清卡立刻收掉，不必等下一次快照。
+- 主机事件 `session/state` 在 `state == "awaitingInput"` 时增加 `questionId` 与 `questionText`（题干/标题，≤200 字符）：App 后台可以弹「有一道选择题在等你 + 在问什么」，点一下进会话逐题作答。标题/题干变化也会算作变化下发。
+- Android：`HostEventClient.Item.State` 解析 `questionId` / `questionText`；后台监控在「App 在后台 + 有题目 id」时复用审批通知通道发澄清提醒（`notifyApproval` 新增 `titleText` / `bodyText` 覆盖参数，标题「有一道选择题在等你」，展开区是题干），不加新通知函数以免撑爆 `CodeHygieneTest` 的函数体预算。
+
 **DSH 0.2.x 适配与移动端体验**
 
 - 网关 Peer（0.2.x 起 `typertGateway.prepareInvocation()` 要求 `request.peer`）：插件用 `connection.createPeer({ principal: { kind: "owner" } })` 惰性建 peer 并随每次调用带上；peer 被宿主 abort 后自动重建，调用途中收到 `gateway/peer-disposed` 会重建并重试一次（只重试一次）。旧 Host 没有 `connection` 服务时退化为不带 peer 的旧行为。

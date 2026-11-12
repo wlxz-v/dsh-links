@@ -109,6 +109,8 @@ val DshStringsEn = DshStrings(
         put("notifNeedApproval", "Approval needed")
         put("notifNeedApprovalBody", "“%s” wants to run. Tap to review")
         put("notifNeedApprovalPublicBody", "An action is waiting for confirmation")
+        put("notifNeedQuestion", "A question is waiting")
+        put("notifNeedQuestionBody", "Session “%s” is waiting for your answer")
         put("notifTaskDone", "Task complete")
         put("notifTaskDoneBody", "Session “%s” finished")
         put("notifTaskStopped", "Session stopped")

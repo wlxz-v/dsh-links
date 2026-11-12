@@ -2046,33 +2046,48 @@ export function apply(ctx, config) {
 
   /**
    * 0.1.2 起澄清卡走 `user-questions/request` waterfall，不再经 /api/events.mux。
-   * 有手机 SSE 时由插件代答；否则 next() 把问题交给网页 UI。
+   *
+   * 双端澄清（与审批同一条策略）：总是先建手机端记录，再把问题同时交给电脑端，
+   * 谁先答用谁。以前只有「手机正看着这个会话」才接管，电脑端开着会话时手机端
+   * 连记录都不建——「多道题依次选择」在真实使用中就是这么漏掉的。
    */
   ctx.on("user-questions/request", (req, next) => rt.awaiting.track(req?.agent?.session?.id, () => {
     if (req?.signal?.aborted === true) return next()
     const sessionId = req?.agent?.session?.id
     const writers = sessionId ? rt.sessionStreams.get(sessionId) : null
-    if (!writers || writers.size === 0) return next()
-    const questions = req.questions ?? []
-    const targets = questions.length > 1
-      ? [...writers].filter((conn) => conn.caps?.multiQuestion)
-      : [...writers]
-    if (targets.length === 0) return next()
+    const questions = Array.isArray(req?.questions) ? req.questions : []
+    // 多题依次选择要 App 声明 multiQuestion；单题不挑客户端。
+    const targets = (writers ? [...writers] : [])
+      .filter((conn) => questions.length <= 1 || conn.caps?.multiQuestion)
+    const hostSubscribers = hostEvents.subscriberCount
+    const liveMobile = Boolean(writers?.size) || hasLiveMobileDevice(rt, hostSubscribers)
     const rpcId = "q-" + randomBytes(12).toString("hex")
+    ctx.logger.info(`dsh-links: user-questions/request 双端接管 session=${String(sessionId).slice(0, 8)} rpc=${rpcId.slice(0, 8)} 题数=${questions.length} 手机订阅=${writers?.size ?? 0} 后台流=${hostSubscribers} 手机在线=${liveMobile ? "是" : "否"}`)
     return new Promise((resolve, reject) => {
+      const eligible = subscribedDeviceIds(targets)
+      // 没在看这个会话的手机也要能作答：后台通知点开会话后按 deviceId 认人。
+      for (const device of state.devices ?? []) {
+        if (device?.deviceId) eligible.add(device.deviceId)
+      }
+      let desktopPromise = null
+      const answerOnDesktop = () => {
+        if (!desktopPromise) desktopPromise = Promise.resolve().then(() => next())
+        return desktopPromise
+      }
       const rec = {
         id: rpcId,
         sessionId,
         type: "question",
         createdAt: Date.now(),
         deadlineAt: Date.now() + APPROVAL_TIMEOUT_MS,
-        eligibleDeviceIds: subscribedDeviceIds(targets),
+        eligibleDeviceIds: eligible,
         settled: false,
         questions,
         signal: req?.signal,
         settle: (answer) => {
+          // 手机答了就把答案交回 waterfall；中止/超时（answer 为空）才交回电脑端。
           if (answer && Array.isArray(answer.answers)) resolve(answer)
-          else Promise.resolve().then(() => next()).then(resolve, reject)
+          else answerOnDesktop().then(resolve, reject)
         },
       }
       rec.onAbort = () => rt.requests.finishQuestion(rec, null)
@@ -2080,9 +2095,39 @@ export function apply(ctx, config) {
       rec.timer?.unref?.()
       rt.requests.addQuestion(rec)
       req.signal?.addEventListener("abort", rec.onAbort, { once: true })
-      const body = JSON.stringify({ rpcId, sessionId, questions })
-      writeSse(new Set(targets), `event: question\ndata: ${body}\n\n`)
-      ctx.logger.info(`dsh-links: question → mobile session=${String(sessionId).slice(0, 8)} rpc=${rpcId.slice(0, 8)}`)
+      if (targets.length > 0) {
+        const body = JSON.stringify({ rpcId, sessionId, questions })
+        writeSse(new Set(targets), `event: question\ndata: ${body}\n\n`)
+      }
+      const notifyResolved = (outcome) => {
+        if (targets.length === 0) return
+        try {
+          const body = JSON.stringify({ rpcId, sessionId, outcome })
+          writeSse(new Set(targets), `event: question-resolved\ndata: ${body}\n\n`)
+        } catch {}
+      }
+      // 电脑端：问题同时给网页 UI。它作答就定案；没作答说明它没接这个会话，继续等手机端。
+      answerOnDesktop().then((answer) => {
+        if (rec.settled) return
+        if (!answer || !Array.isArray(answer.answers)) {
+          ctx.logger.info(`dsh-links: 澄清电脑端未作答，继续等手机端 session=${String(sessionId).slice(0, 8)}`)
+          if (!liveMobile && !rec.graceTimer) {
+            rec.graceTimer = setTimeout(() => {
+              ctx.logger.info(`dsh-links: 手机端 ${Math.round(APPROVAL_OFFLINE_GRACE_MS / 1000)} 秒内未接入，澄清按无人应答结束 session=${String(sessionId).slice(0, 8)}`)
+              rt.requests.finishQuestion(rec, null)
+              notifyResolved("cancelled")
+            }, APPROVAL_OFFLINE_GRACE_MS)
+            rec.graceTimer?.unref?.()
+          }
+          return
+        }
+        ctx.logger.info(`dsh-links: 澄清由电脑端作答 session=${String(sessionId).slice(0, 8)}`)
+        rt.requests.finishQuestion(rec, answer)
+        // 电脑端先答：让还开着澄清卡的手机把卡收掉，不用等下一次快照。
+        notifyResolved("answered")
+      }, (error) => {
+        ctx.logger.warn(`dsh-links: 电脑端澄清通道异常：${String(error?.code ?? error?.message ?? error)} session=${String(sessionId).slice(0, 8)}`)
+      })
     })
   }), { prepend: true })
 
@@ -2091,13 +2136,17 @@ export function apply(ctx, config) {
     listSessions: async () => {
       const list = await callLocalRpc(targetPort, "session.list", {})
       const approvals = new Map()
-      const questions = new Set()
+      const questions = new Map()
       for (const rec of rt.requests.pendingApprovals.values()) {
         if (!rec?.sessionId || approvals.has(rec.sessionId)) continue
         approvals.set(rec.sessionId, { id: rec.id, toolName: rec.toolName ?? "", detail: rec.detail ?? "" })
       }
       for (const rec of rt.requests.pendingQuestions.values()) {
-        if (rec?.sessionId) questions.add(rec.sessionId)
+        if (!rec?.sessionId || questions.has(rec.sessionId)) continue
+        // 通知栏要能看见「在问什么」：取第一题的标题/题干。
+        const first = Array.isArray(rec.questions) ? rec.questions[0] : null
+        const text = String(first?.header || first?.question || first?.prompt || first?.text || "").trim()
+        questions.set(rec.sessionId, { id: String(rec.id ?? ""), text: text.slice(0, 200) })
       }
       return (list?.items ?? []).map((item) => {
         const approval = approvals.get(item?.sessionId)
@@ -2113,6 +2162,9 @@ export function apply(ctx, config) {
           // 通知栏也要能看见「在跑什么命令」，否则只能盲批。
           pendingApprovalDetail: approval?.detail ? String(approval.detail).slice(0, 600) : null,
           pendingQuestion: questions.has(item?.sessionId),
+          // 双端澄清：通知栏带上请求 id 与题干，点进来就能直接答。
+          pendingQuestionId: questions.get(item?.sessionId)?.id || null,
+          pendingQuestionText: questions.get(item?.sessionId)?.text || null,
           awaitingInput: Boolean(rt.awaiting?.has(item?.sessionId)),
         }
       })

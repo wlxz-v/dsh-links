@@ -43,6 +43,14 @@ export function classifyHostSession(row) {
   const approvalDetail = approvalId && typeof row?.pendingApprovalDetail === "string" && row.pendingApprovalDetail
     ? row.pendingApprovalDetail.slice(0, 600)
     : null
+  // 双端澄清：等待回答时带上请求 id 与题干，App 后台通知才能说清「在问什么」，
+  // 点开会话后请求快照会把整张澄清卡补回。
+  const questionId = state === "awaitingInput" && typeof row?.pendingQuestionId === "string" && row.pendingQuestionId
+    ? row.pendingQuestionId
+    : null
+  const questionText = questionId && typeof row?.pendingQuestionText === "string" && row.pendingQuestionText
+    ? row.pendingQuestionText.slice(0, 200)
+    : null
   return {
     sessionId,
     state,
@@ -51,6 +59,8 @@ export function classifyHostSession(row) {
     ...(approvalId ? { approvalId } : {}),
     ...(approvalToolName ? { approvalToolName } : {}),
     ...(approvalDetail ? { approvalDetail } : {}),
+    ...(questionId ? { questionId } : {}),
+    ...(questionText ? { questionText } : {}),
   }
 }
 
@@ -72,7 +82,8 @@ export function diffHostSessions(previous, next, { initial = false } = {}) {
     }
     if (prev.state !== row.state || prev.title !== row.title || prev.origin !== row.origin
       || prev.approvalId !== row.approvalId || prev.approvalToolName !== row.approvalToolName
-      || prev.approvalDetail !== row.approvalDetail) {
+      || prev.approvalDetail !== row.approvalDetail
+      || prev.questionId !== row.questionId || prev.questionText !== row.questionText) {
       events.push({ ...row })
     }
   }
@@ -94,6 +105,8 @@ export function hostEventFrame(event) {
     ...(event.approvalId ? { approvalId: event.approvalId } : {}),
     ...(event.approvalToolName ? { approvalToolName: event.approvalToolName } : {}),
     ...(event.approvalDetail ? { approvalDetail: event.approvalDetail } : {}),
+    ...(event.questionId ? { questionId: event.questionId } : {}),
+    ...(event.questionText ? { questionText: event.questionText } : {}),
     // F2：终态事件是否值得推一条通知。缺失/true 时按老行为推送；
     // false 表示「同一个会话刚刚已经报过终态」——自动重试里的瞬时失败、
     // 或轮询抖动导致的重复终态，别让手机再响一次。

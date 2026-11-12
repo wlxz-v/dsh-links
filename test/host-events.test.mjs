@@ -204,3 +204,40 @@ test("待审批事件带 approvalDetail：通知栏/决策栏看得见要跑什�
   const bare = classifyHostSession(row({ pendingApproval: true, pendingApprovalId: "ap-1", pendingApprovalToolName: "pwsh" }))
   assert.equal("approvalDetail" in bare, false)
 })
+
+test("待回答的澄清带 questionId 与题干：多题依次选择也能推到手机（双端澄清）", () => {
+  const asking = classifyHostSession(row({
+    pendingQuestion: true,
+    pendingQuestionId: "q-abc123",
+    pendingQuestionText: "先选哪种数据库？",
+  }))
+  assert.deepEqual(asking, {
+    sessionId: "s1",
+    state: "awaitingInput",
+    title: "修登录",
+    origin: "user",
+    questionId: "q-abc123",
+    questionText: "先选哪种数据库？",
+  })
+  const frame = hostEventFrame({ ...asking, seq: 11 })
+  const body = JSON.parse(frame.split("data: ")[1])
+  assert.equal(body.state, "awaitingInput")
+  assert.equal(body.questionId, "q-abc123")
+  assert.equal(body.questionText, "先选哪种数据库？")
+
+  // 题面变了（换下一题）要再推一次，通知栏才不会停在上一题。
+  const prev = new Map([["s1", asking]])
+  const next = new Map([["s1", classifyHostSession(row({
+    pendingQuestion: true,
+    pendingQuestionId: "q-abc123",
+    pendingQuestionText: "那用哪个缓存？",
+  }))]])
+  const changed = diffHostSessions(prev, next)
+  assert.equal(changed.length, 1)
+  assert.equal(changed[0].questionText, "那用哪个缓存？")
+
+  // 只是「等待输入」但没有澄清请求（例如等用户敲字）时不带这两个键。
+  const waiting = classifyHostSession(row({ awaitingInput: true }))
+  assert.equal("questionId" in waiting, false)
+  assert.equal("questionText" in waiting, false)
+})
