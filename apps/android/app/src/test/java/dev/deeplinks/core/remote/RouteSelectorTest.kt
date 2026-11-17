@@ -152,4 +152,43 @@ class RouteSelectorTest {
         assertEquals(listOf("https://10.0.0.2/"), seen)
         assertEquals("https://10.0.0.2/", selector.lanAddress("k"))
     }
+
+    @Test
+    fun `repeated LAN misses in same network generation back off from 15s to 60s to 180s and reset on network change`() {
+        var probes = 0
+        // 第 1 次失败：缓存 15s
+        assertEquals(HostRoute.REMOTE, selector.order("k", true) { probes++; false }.first())
+        assertEquals(1, probes)
+        now += RouteSelector.REMOTE_TTL_MS
+        // 第 2 次失败：退避到 60s
+        assertEquals(HostRoute.REMOTE, selector.order("k", true) { probes++; false }.first())
+        assertEquals(2, probes)
+        now += RouteSelector.REMOTE_STEP2_TTL_MS - 1
+        assertEquals(HostRoute.REMOTE, selector.order("k", true) { probes++; false }.first())
+        assertEquals(2, probes)
+        now += 1
+        // 第 3 次失败：退避到 180s
+        assertEquals(HostRoute.REMOTE, selector.order("k", true) { probes++; false }.first())
+        assertEquals(3, probes)
+        now += RouteSelector.REMOTE_MAX_TTL_MS - 1
+        assertEquals(HostRoute.REMOTE, selector.order("k", true) { probes++; false }.first())
+        assertEquals(3, probes)
+
+        // 网络切换：立即清零退避并恢复探测
+        selector.onNetworkChanged()
+        assertEquals(HostRoute.LAN, selector.order("k", true) { probes++; true }.first())
+        assertEquals(4, probes)
+    }
+
+    @Test
+    fun `slow request finishing after LAN TTL preserves selected tailnet spare address`() {
+        selector.order("k", true, listOf("https://10.0.0.2/", "https://100.64.0.2/")) { url ->
+            url.contains("100.64")
+        }
+        assertEquals("https://100.64.0.2/", selector.lanAddress("k"))
+        // 模拟长请求耗时跨过 30s LAN_TTL_MS 后才收到响应并调用 noteSuccess
+        now += RouteSelector.LAN_TTL_MS + 5_000
+        selector.noteSuccess("k", HostRoute.LAN)
+        assertEquals("https://100.64.0.2/", selector.lanAddress("k"))
+    }
 }

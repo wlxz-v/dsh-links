@@ -3,7 +3,9 @@ import assert from "node:assert/strict"
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { validateSessionCreateWorkspace } from "../src/workspace-path.js"
+import { isPathWithinRoot, validateSessionCreateWorkspace } from "../src/workspace-path.js"
+
+const dirLinkType = process.platform === "win32" ? "junction" : "dir"
 
 test("缺失末段也会跟随工作区内指向外部的符号链接", () => {
   const root = mkdtempSync(join(tmpdir(), "dsh-links-cwd-"))
@@ -12,7 +14,7 @@ test("缺失末段也会跟随工作区内指向外部的符号链接", () => {
     const outside = join(root, "outside")
     mkdirSync(workspace)
     mkdirSync(outside)
-    symlinkSync(outside, join(workspace, "link"))
+    symlinkSync(outside, join(workspace, "link"), dirLinkType)
     const workspaces = [{ workspaceId: "ws", path: workspace }]
     const escaped = validateSessionCreateWorkspace({
       cwd: join(workspace, "link", "newdir"),
@@ -40,16 +42,39 @@ test("已存在且留在工作区内的符号链接可以通过", () => {
   const root = mkdtempSync(join(tmpdir(), "dsh-links-cwd-"))
   try {
     const workspace = join(root, "proj")
-    mkdirSync(workspace)
-    const file = join(workspace, "notes.txt")
-    writeFileSync(file, "ok")
-    symlinkSync(file, join(workspace, "alias"))
-    const checked = validateSessionCreateWorkspace({
-      cwd: join(workspace, "alias"),
+    const sub = join(workspace, "sub")
+    mkdirSync(sub, { recursive: true })
+    symlinkSync(sub, join(workspace, "alias-dir"), dirLinkType)
+    const checkedDir = validateSessionCreateWorkspace({
+      cwd: join(workspace, "alias-dir"),
       workspaces: [{ workspaceId: "ws", path: workspace }],
     })
-    assert.equal(checked.cwd, realpathSync(file))
+    assert.equal(checkedDir.cwd, realpathSync(sub))
+
+    const file = join(workspace, "notes.txt")
+    writeFileSync(file, "ok")
+    let fileSymlinkCreated = false
+    try {
+      symlinkSync(file, join(workspace, "alias"))
+      fileSymlinkCreated = true
+    } catch (err) {
+      if (process.platform !== "win32" || err?.code !== "EPERM") throw err
+    }
+    if (fileSymlinkCreated) {
+      const checked = validateSessionCreateWorkspace({
+        cwd: join(workspace, "alias"),
+        workspaces: [{ workspaceId: "ws", path: workspace }],
+      })
+      assert.equal(checked.cwd, realpathSync(file))
+    }
   } finally {
     rmSync(root, { recursive: true, force: true })
   }
+})
+
+test("Windows 盘符与路径大小写不敏感，POSIX 保持大小写敏感", () => {
+  assert.equal(isPathWithinRoot("d:\\DSH\\sub", "D:\\DSH", "win32"), true)
+  assert.equal(isPathWithinRoot("d:\\dsh", "D:\\DSH", "win32"), true)
+  assert.equal(isPathWithinRoot("d:\\DSH-evil", "D:\\DSH", "win32"), false)
+  assert.equal(isPathWithinRoot("/Users/Me/proj/sub", "/Users/me/proj", "darwin"), false)
 })

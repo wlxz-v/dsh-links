@@ -35,14 +35,55 @@ export function pickCurrentSessionLogFilename(names) {
 }
 
 /**
- * 会话目录：`<DSH 数据目录>/sessions/--<cwd 各段以 - 连接>--/<sessionId>`。
- * DSH 数据目录跟随 `DSH_HOME`（未设时为 ~/.dsh）——写死 ~/.dsh 会让用 DSH_HOME 起的实例
- * 找不到会话日志，实时补发与思考过程读取都静默失效。
+ * 与 `@deepseek-ai/dsh-session-persistence-jsonl` 对齐的路径段转义与项目键编码：
+ * - 路径分隔符 `/`、`\` 与盘符 `:` 合并为单个 `-`；
+ * - 非 `[A-Za-z0-9._-]`（以及 `~` 本身）按 UTF-16 码元转义为 `~XXXX`；
+ * - 会话目录：`<DSH 数据目录>/sessions/--<projectKey>--/<encodedSessionId>`（无 cwd 时为 `_no-cwd`）。
  */
+export function encodeSessionSegment(raw) {
+  const s = String(raw ?? "")
+  if (s.length === 0) throw new Error("cannot encode an empty path segment")
+  if (s === ".") return "~002E"
+  if (s === "..") return "~002E~002E"
+  let out = ""
+  for (let i = 0; i < s.length; i++) {
+    const code = s.charCodeAt(i)
+    const ch = String.fromCharCode(code)
+    if (ch !== "~" && /^[A-Za-z0-9._-]$/u.test(ch)) out += ch
+    else out += "~" + code.toString(16).toUpperCase().padStart(4, "0")
+  }
+  return out
+}
+
+export function encodeSessionProjectKey(cwd) {
+  const s = String(cwd ?? "")
+  if (s.length === 0) throw new Error("cannot encode an empty project path")
+  let readable = ""
+  let separatorRun = false
+  for (let i = 0; i < s.length; i++) {
+    const code = s.charCodeAt(i)
+    const ch = String.fromCharCode(code)
+    if (ch === "/" || ch === "\\" || ch === ":") {
+      if (!separatorRun) readable += "-"
+      separatorRun = true
+    } else if (ch !== "~" && /^[A-Za-z0-9._-]$/u.test(ch)) {
+      readable += ch
+      separatorRun = false
+    } else {
+      readable += "~" + code.toString(16).toUpperCase().padStart(4, "0")
+      separatorRun = false
+    }
+  }
+  return `--${(readable.replace(/^-+/u, "") || "root").slice(0, 251)}--`
+}
+
 export function sessionDirFor(cwd, sessionId, env = process.env) {
+  const id = String(sessionId ?? "").trim()
+  if (!id) return null
   const home = String(env?.DSH_HOME ?? "").trim() || join(homedir(), ".dsh")
-  const enc = "--" + String(cwd).split("/").filter(Boolean).join("-") + "--"
-  return join(home, "sessions", enc, sessionId)
+  const rawCwd = cwd === undefined || cwd === null ? "" : String(cwd)
+  const projectDir = rawCwd.length === 0 ? "_no-cwd" : encodeSessionProjectKey(rawCwd)
+  return join(home, "sessions", projectDir, encodeSessionSegment(id))
 }
 
 export function resolveSessionLogPath(sessionDir) {

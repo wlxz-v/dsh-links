@@ -17,9 +17,13 @@ function fixture() {
   writeFileSync(join(root, ".env"), "SECRET=1")
   writeFileSync(join(root, "src", "main.js"), "x")
   writeFileSync(join(outside, "secret.txt"), "s")
-  symlinkSync(join(root, "src"), join(root, "link-in"))
-  symlinkSync(outside, join(root, "link-out"))
-  symlinkSync(join(root, "missing"), join(root, "link-broken"))
+  const dirLinkType = process.platform === "win32" ? "junction" : "dir"
+  const missingTarget = join(root, "missing")
+  mkdirSync(missingTarget)
+  symlinkSync(join(root, "src"), join(root, "link-in"), dirLinkType)
+  symlinkSync(outside, join(root, "link-out"), dirLinkType)
+  symlinkSync(missingTarget, join(root, "link-broken"), dirLinkType)
+  rmSync(missingTarget, { recursive: true, force: true })
   return { base, root }
 }
 

@@ -1,0 +1,17 @@
+# 跨平台统一换行符：源码与契约文件固定 LF，Windows 批处理固定 CRLF
+* text=auto eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# 二进制资源不转换换行符
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.gif binary
+*.ico binary
+*.p12 binary
+*.jar binary
+*.apk binary
+*.zstd binary

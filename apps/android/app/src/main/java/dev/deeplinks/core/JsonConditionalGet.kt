@@ -73,3 +73,27 @@ internal fun parseMissingHostRemotes(host: JSONObject?): Set<String> {
         }
     }
 }
+
+/**
+ * 按电脑（[Host.slotKey]）缓存最近一次 bootstrap 实测缺失的宿主能力（B1），
+ * 让独立的设置路由（SettingsRoute / ModelsSettingsPage）无需重新探测即可收敛不可用入口。
+ */
+object HostCapabilitiesCache {
+    private val byHost = java.util.concurrent.ConcurrentHashMap<String, Set<String>>()
+
+    fun put(slotKey: String, missing: Set<String>) {
+        if (slotKey.isBlank()) return
+        if (missing.isEmpty()) byHost.remove(slotKey) else byHost[slotKey] = missing
+    }
+
+    fun missing(slotKey: String): Set<String> = byHost[slotKey].orEmpty()
+
+    fun clearHost(slotKey: String) {
+        if (slotKey.isBlank()) return
+        byHost.remove(slotKey)
+    }
+
+    fun clear() {
+        byHost.clear()
+    }
+}

@@ -12,7 +12,7 @@ import test from "node:test"
 import { execFileSync } from "node:child_process"
 import { existsSync, readFileSync } from "node:fs"
 import { fileURLToPath } from "node:url"
-import { dirname } from "node:path"
+import { dirname, join } from "node:path"
 
 const root = dirname(fileURLToPath(new URL("../package.json", import.meta.url)))
 const read = (rel) => readFileSync(fileURLToPath(new URL(`../${rel}`, import.meta.url)), "utf8")
@@ -65,9 +65,11 @@ test("插件包内容只含插件文件，不含 relay / apps/android", () => {
   assert.match(ci, /go test \.\/\.\.\. -race/)
   assert.doesNotMatch(ci, /CGO_ENABLED=0 go test \.\/\.\.\. -race/)
 
-  const pack = JSON.parse(
-    execFileSync("npm", ["pack", "--dry-run", "--ignore-scripts", "--json"], { encoding: "utf8", cwd: root }),
-  )
+  const npmCli = join(dirname(process.execPath), "node_modules", "npm", "bin", "npm-cli.js")
+  const packOut = existsSync(npmCli)
+    ? execFileSync(process.execPath, [npmCli, "pack", "--dry-run", "--ignore-scripts", "--json"], { encoding: "utf8", cwd: root })
+    : execFileSync("npm", ["pack", "--dry-run", "--ignore-scripts", "--json"], { encoding: "utf8", cwd: root })
+  const pack = JSON.parse(packOut)
   const packedFiles = new Set(pack[0].files.map((file) => file.path))
   assert.ok(packedFiles.has("SECURITY.md"))
   assert.ok(packedFiles.has("PRIVACY.md"))

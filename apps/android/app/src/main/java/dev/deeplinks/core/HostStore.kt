@@ -212,6 +212,8 @@ object HostStore {
         if (current.slotKey != host.slotKey && current.baseUrl != host.baseUrl) return true
         val ok = save(ctx, null)
         if (ok) {
+            JsonHttpCache.clearHost(current.slotKey)
+            HostCapabilitiesCache.clearHost(current.slotKey)
             runCatching { dev.deeplinks.native.SessionHistoryCache.clearHost(ctx.cacheDir, current.slotKey) }
             runCatching { dev.deeplinks.native.util.SessionListCache.clearHost(ctx.cacheDir, current.slotKey) }
             runCatching { dev.deeplinks.native.util.WorkspacePrefs(ctx).saveComposerDrafts(current.slotKey, emptyMap()) }

@@ -2609,7 +2609,7 @@ fun WorkspaceScreen(
                 compact = composerSeatsCompact(containerWidthDp.value),
                 onOpenModelPicker = { loadModelCatalog(openPicker = true) },
                 onOpenPermissionPicker = { showPermissionPicker = true },
-                presetLabel = if (composeNewSession && currentSessionId == null) presetDisplayName(draftPresetId(pendingAgentPreset, appSettings.agentPreset), null) else null,
+                presetLabel = if (composeNewSession && currentSessionId == null && workspaceViewModel.agentPresetsAvailable()) presetDisplayName(draftPresetId(pendingAgentPreset, appSettings.agentPreset), null) else null,
                 onOpenPresetPicker = { showAgentPresetPicker = true },
                 onToggleVoice = {
                     if (isListening) {

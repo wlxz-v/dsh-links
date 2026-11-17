@@ -159,6 +159,15 @@ internal class WorkspaceViewModel(
             "schedule.edit" !in hostMissing.value &&
             "schedule.catalog" !in hostMissing.value
 
+    fun agentPresetsAvailable(): Boolean = "agentPreset.list" !in hostMissing.value
+
+    fun workspacesAvailable(): Boolean = "workspace.list" !in hostMissing.value
+
+    fun settingsAvailable(): Boolean = "settings.describe" !in hostMissing.value
+
+    fun providersAvailable(): Boolean =
+        "llm.listProviders" !in hostMissing.value && "credentials.describe" !in hostMissing.value
+
     init {
         // 监听会话切换：切换时清空旧 goal，等 refreshMessages 再填入
         viewModelScope.launch {

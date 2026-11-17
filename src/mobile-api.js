@@ -21,6 +21,11 @@ import { canDeviceHandle, requestBelongsToSession, mapApprovalUiStatus } from ".
 import { resolveSessionLogPath, sessionDirFor } from "./session-log-path.js"
 import { reasoningBlocksFromSessionLog } from "./session-log-reasoning.js"
 import { decompressZstdFrames } from "./zstd-frames.js"
+import { getBounded, setBounded } from "./bounded-map.js"
+
+const MAX_REASONING_CACHE = 32
+const MAX_ACTIVITY_CACHE = 256
+const MAX_PRICED_MODEL_CACHE = 128
 
 const MAX_ZSTD_OUTPUT_BYTES = 32 * 1024 * 1024
 const PROMPT_BODY_LIMIT = 16 * 1024 * 1024
@@ -61,11 +66,11 @@ async function readSessionReasoning(targetPort, sessionId, rt) {
     let st
     try { st = statSync(p) } catch { return new Map() }
     if (st.size > 32 * 1024 * 1024) return new Map()
-    const hit = rt?.reasoningCache?.get(p)
+    const hit = getBounded(rt?.reasoningCache, p)
     if (hit && hit.mtime === st.mtimeMs && hit.size === st.size) return hit.map
     const text = await readSessionLogText(p)
     const reasoning = reasoningBlocksFromSessionLog(text)
-    rt?.reasoningCache?.set(p, { mtime: st.mtimeMs, size: st.size, map: reasoning })
+    setBounded(rt?.reasoningCache, p, { mtime: st.mtimeMs, size: st.size, map: reasoning }, MAX_REASONING_CACHE)
     return reasoning
   } catch (err) {
     return new Map()
@@ -142,7 +147,7 @@ export async function attachSessionActivity(rt, targetPort, sessions, deps = {})
       // running 的行**不读缓存**：审批/提问这类事件不一定改 updatedAt，用缓存会一直命中
       // 那条「没有在等」的旧行，首页就漏掉「等你处理」（2026-09-29 真机：会话卡在审批，
       // awaitingInput 三次查询都是 none）。running 通常只有一两条，代价可控。
-      const hit = row.running ? undefined : cache?.get(key)
+      const hit = row.running ? undefined : getBounded(cache, key)
       if (hit) {
         if (hit.activity) row.activity = hit.activity
         if (hit.lastResult) row.lastResult = hit.lastResult
@@ -166,7 +171,6 @@ export async function attachSessionActivity(rt, targetPort, sessions, deps = {})
         const activity = deriveActivity(events)
         if (activity) {
           row.activity = activity
-          cache?.set(key, { activity, stoppedReason: row.stoppedReason, awaitingInput })
         }
       } else {
         const lastResult = deriveLastResult(
@@ -175,7 +179,13 @@ export async function attachSessionActivity(rt, targetPort, sessions, deps = {})
         )
         if (lastResult) {
           row.lastResult = lastResult
-          cache?.set(key, { lastResult, stoppedReason: row.stoppedReason, awaitingInput })
+          if (cache) {
+            const prefix = `${row.sessionId}:`
+            for (const existingKey of cache.keys()) {
+              if (existingKey !== key && existingKey.startsWith(prefix)) cache.delete(existingKey)
+            }
+            setBounded(cache, key, { lastResult, stoppedReason: row.stoppedReason, awaitingInput }, MAX_ACTIVITY_CACHE)
+          }
         }
       }
     }
@@ -1043,7 +1053,7 @@ async function resolveSessionPriceModel(rt, targetPort, sessionId, projValues) {
   if (fromProj) return { modelId: fromProj, hostModel: null }
   if (!rt) return { modelId: null, hostModel: null }
   const cache = rt.pricedModelCache ?? (rt.pricedModelCache = new Map())
-  const hit = cache.get(sessionId)
+  const hit = getBounded(cache, sessionId)
   const now = Date.now()
   if (hit && now - hit.at < 30_000) return hit.value
   let value = { modelId: null, hostModel: null }
@@ -1061,6 +1071,6 @@ async function resolveSessionPriceModel(rt, targetPort, sessionId, projValues) {
   } catch {
     value = { modelId: null, hostModel: null }
   }
-  cache.set(sessionId, { at: now, value })
+  setBounded(cache, sessionId, { at: now, value }, MAX_PRICED_MODEL_CACHE)
   return value
 }

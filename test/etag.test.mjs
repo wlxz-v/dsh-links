@@ -79,3 +79,16 @@ test("etag：gzip 与 identity 的 304 各自成立，不会把压缩体当成�
   json(hit, 200, payload)
   assert.equal(hit.code, 304)
 })
+
+test("etag：POST 写请求与 no-store 响应不发 ETag、不走 304", () => {
+  const payload = { ok: true, token: "abc" }
+  const post = { ...response(), req: { method: "POST", headers: { "if-none-match": "*" } } }
+  json(post, 200, payload)
+  assert.equal(post.code, 200)
+  assert.equal(post.headers.etag, undefined)
+
+  const noStore = response({ "if-none-match": "*" })
+  json(noStore, 200, payload, { "cache-control": "no-store" })
+  assert.equal(noStore.code, 200)
+  assert.equal(noStore.headers.etag, undefined)
+})

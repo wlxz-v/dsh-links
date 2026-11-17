@@ -44,19 +44,31 @@ test("resolveSessionLogPath 读目录并拼出当前日志路径", () => {
   }
 })
 
-test("会话目录跟随 DSH_HOME，未设时回落到 ~/.dsh", async () => {
-  const { sessionDirFor } = await import("../src/session-log-path.js")
+test("会话目录跟随 DSH_HOME，未设时回落到 ~/.dsh，兼容 Windows 盘符与非 ASCII 路径", async () => {
+  const { encodeSessionProjectKey, sessionDirFor } = await import("../src/session-log-path.js")
   const { homedir } = await import("node:os")
   assert.equal(
     sessionDirFor("/Users/me/proj", "session-1", { DSH_HOME: "/tmp/dsh-home" }),
-    "/tmp/dsh-home/sessions/--Users-me-proj--/session-1",
+    join("/tmp/dsh-home", "sessions", "--Users-me-proj--", "session-1"),
   )
   assert.equal(
     sessionDirFor("/Users/me/proj", "session-1", {}),
-    `${homedir()}/.dsh/sessions/--Users-me-proj--/session-1`,
+    join(homedir(), ".dsh", "sessions", "--Users-me-proj--", "session-1"),
   )
   assert.equal(
     sessionDirFor("/Users/me/proj", "session-1", { DSH_HOME: "  " }),
-    `${homedir()}/.dsh/sessions/--Users-me-proj--/session-1`,
+    join(homedir(), ".dsh", "sessions", "--Users-me-proj--", "session-1"),
+  )
+  // Windows 盘符、反斜杠与非 ASCII 字符（与 @deepseek-ai/dsh-session-persistence-jsonl 对齐）
+  assert.equal(encodeSessionProjectKey("D:\\DSH"), "--D-DSH--")
+  assert.equal(encodeSessionProjectKey("C:\\Users\\无界15X"), "--C-Users-~65E0~754C15X--")
+  assert.equal(encodeSessionProjectKey("/"), "--root--")
+  assert.equal(
+    sessionDirFor("D:\\DSH", "session-1", { DSH_HOME: "D:\\dsh-home" }),
+    join("D:\\dsh-home", "sessions", "--D-DSH--", "session-1"),
+  )
+  assert.equal(
+    sessionDirFor("", "session-1", { DSH_HOME: "/tmp/dsh-home" }),
+    join("/tmp/dsh-home", "sessions", "_no-cwd", "session-1"),
   )
 })

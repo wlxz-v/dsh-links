@@ -9,14 +9,45 @@
  */
 import { createAwaitingInput } from "./awaiting-input.js"
 import { createServer as createHttpsServer } from "node:https"
-import { createServer as createNetServer } from "node:net"
 import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs"
 import { dirname, join } from "node:path"
 import { homedir, hostname, networkInterfaces } from "node:os"
-import { createHash, randomBytes } from "node:crypto"
-import { brotliCompressSync, constants as zlibConstants, gzipSync, zstdCompressSync } from "node:zlib"
+import { randomBytes } from "node:crypto"
 import z from "@deepseek-ai/schemastery"
 import QRCode from "qrcode"
+
+import { setBounded } from "./bounded-map.js"
+import {
+  classifyUrl,
+  findFreeListenPort,
+  isUnreachableIPv4,
+  lanInfosForAddresses,
+  lanPreference,
+  lanUrls,
+  listenExposure,
+} from "./lan-address.js"
+import {
+  ifNoneMatchHit,
+  isLoopbackAddress,
+  json,
+  jsonEtag,
+  negotiateJsonEncoding,
+  requireJsonWrite,
+  requireLoopbackSameOrigin,
+} from "./http-utils.js"
+
+export {
+  classifyUrl,
+  findFreeListenPort,
+  ifNoneMatchHit,
+  isUnreachableIPv4,
+  json,
+  jsonEtag,
+  lanInfosForAddresses,
+  lanPreference,
+  negotiateJsonEncoding,
+  requireJsonWrite,
+}
 
 import { createPreviewService, rejectUpgrade, matchPreviewPath } from "./preview-proxy.js"
 import { createPreviewDetector, publicDetections, refreshPreviewDetections, DETECT_HISTORY_MESSAGES } from "./preview-detect.js"
@@ -226,172 +257,6 @@ function isDevicePending(device) {
   return device?.status === "pending"
 }
 
-function isPrivateV4Host(host) {
-  if (host.startsWith("192.168.") || host.startsWith("10.")) return true
-  const m = /^172\.(\d+)\./.exec(host)
-  if (!m) return false
-  const n = Number(m[1])
-  return n >= 16 && n <= 31
-}
-
-/** 100.64.0.0/10，以及 Tailscale IPv6 `fd7a:115c:a1e0::/48`。 */
-function isTailnetHost(host) {
-  const raw = String(host ?? "").trim().toLowerCase().replace(/^\[|\]$/g, "")
-  if (raw.startsWith("fd7a:115c:a1e0:")) return true
-  const m = /^100\.(\d{1,3})\.\d{1,3}\.\d{1,3}$/.exec(raw)
-  if (!m) return false
-  const second = Number(m[1])
-  return second <= 255 && second >= 64 && second <= 127
-}
-
-/**
- * 探一个能监听的端口：从 start 起试 attempts 个，全被占用返回 null。
- * 用临时 net 服务器探测而不是在 https.Server 上反复 listen —— 失败的 listen 会留下
- * closing 状态的句柄，进程退出时踩 libuv 断言（uv_async.c 的 !(handle->flags & UV_HANDLE_CLOSING)）。
- */
-export async function findFreeListenPort(start, attempts) {
-  for (let offset = 0; offset < attempts; offset += 1) {
-    const candidate = start + offset
-    if (candidate > 65535) return null
-    const free = await new Promise((resolve) => {
-      const probe = createNetServer()
-      let settled = false
-      const done = (value) => { if (!settled) { settled = true; resolve(value) } }
-      probe.once("error", () => { probe.removeAllListeners(); done(false) })
-      probe.listen(candidate, "0.0.0.0", () => probe.close(() => done(true)))
-    })
-    if (free) return candidate
-  }
-  return null
-}
-
-function listenExposure(config, infos, port = config.port) {
-  const listen = { address: "0.0.0.0", port }
-  const networks = (infos ?? [])
-    .filter((item) => item?.label)
-    .map((item) => ({ label: item.label, category: item.category, url: item.url }))
-  const extras = (config.extraUrls ?? []).length > 0
-  // tailnet 不是公网：只有 category "other" 才算不可信地址。
-  const publicNets = networks.filter((n) => n.category === "other")
-  if (publicNets.length || extras) {
-    const warning = extras
-      ? `已配置 extraUrls，${listen.address}:${listen.port} 可能经隧道或公网地址暴露。当前监听 ${listen.address}:${listen.port}。`
-      : `检测到非私有网卡地址。当前监听 ${listen.address}:${listen.port}，请确认这些网段可信。`
-    return { listen, networks, level: "untrusted", warning }
-  }
-  const labels = networks.map((n) => n.label).filter(Boolean)
-  const hint = labels.length
-    ? `当前监听 ${listen.address}:${listen.port}，局域网可达 ${labels.join("、")}。勿把 ${listen.port} 暴露到公网。`
-    : `当前监听 ${listen.address}:${listen.port}。未发现可用局域网地址。`
-  return { listen, networks, level: "lan", warning: null, hint }
-}
-
-/** extraUrls 只接受 https；http 一律升为 https。非法项丢弃。 */
-function requireHttpsUrl(raw) {
-  const s = String(raw ?? "").trim()
-  if (!s) return null
-  const withScheme = /^[a-z][a-z0-9+.-]*:/i.test(s) ? s : `https://${s}`
-  const https = withScheme.replace(/^http:\/\//i, "https://")
-  try {
-    const u = new URL(https)
-    if (u.protocol !== "https:") return null
-    return https
-  } catch {
-    return null
-  }
-}
-
-export function classifyUrl(url) {
-  try {
-    const host = new URL(url).hostname
-    if (host === "127.0.0.1" || host === "localhost" || host === "::1" || host === "[::1]") return "loopback"
-    if (isTailnetHost(host)) return "tailnet"
-    if (isPrivateV4Host(host)) return "private"
-    return "other"
-  } catch {
-    return "unknown"
-  }
-}
-
-/**
- * 手机永远连不上的 IPv4 网段：
- *   - 198.18.0.0/15 是基准测试网段（Clash TUN 等虚拟网卡常用），
- *   - 169.254.0.0/16 是链路本地地址（WiFi 没连上时系统自分配，手机不可达）。
- * 这类地址进二维码只会让 App 白探一次，还可能抢到「推荐」位。
- */
-export function isUnreachableIPv4(address) {
-  const parts = String(address ?? "").trim().split(".")
-  if (parts.length !== 4) return false
-  const [a, b, c, d] = parts.map(Number)
-  if (![a, b, c, d].every((n) => Number.isInteger(n) && n >= 0 && n <= 255)) return false
-  if (a === 198 && (b === 18 || b === 19)) return true
-  if (a === 169 && b === 254) return true
-  return false
-}
-
-/** 私网优先级：家用 192.168 最高，10 / 172.16-31 次之，其余（tailnet、公网）最低。 */
-export function lanPreference(address) {
-  const [a, b] = String(address ?? "").split(".").map(Number)
-  if (a === 192 && b === 168) return 3
-  if (a === 10) return 2
-  if (a === 172 && b >= 16 && b <= 31) return 2
-  return 1
-}
-
-/**
- * 把地址列表收成二维码用的 urls 和面板用的 infos。
- * 排序与推荐位都按「手机可达性」定：不可达网段直接丢掉（见 isUnreachableIPv4），
- * 优先级高的排前面，同一优先级保持系统枚举顺序；推荐的仍是第一个私网地址，
- * tailnet 留在列表里当第二候选，不抢推荐位。
- */
-export function lanInfosForAddresses(addresses, port) {
-  const candidates = (addresses ?? [])
-    .filter((address) => address && !isUnreachableIPv4(address))
-    .map((address, index) => ({ address: String(address), index }))
-  // 稳定排序：只比优先级，同分按原始顺序，避免面板地址每次刷新都跳位。
-  candidates.sort(
-    (left, right) => lanPreference(right.address) - lanPreference(left.address) || left.index - right.index,
-  )
-  const urls = []
-  const urlInfos = []
-  const seen = new Set()
-  for (const { address } of candidates) {
-    const fullUrl = `https://${address}:${port}`
-    if (seen.has(fullUrl)) continue
-    seen.add(fullUrl)
-    urls.push(fullUrl)
-    urlInfos.push({ url: fullUrl, label: address, category: classifyUrl(fullUrl), isRecommended: false })
-  }
-  if (urlInfos.length > 0) {
-    const firstPrivate = urlInfos.find((u) => u.category === "private") ?? urlInfos[0]
-    firstPrivate.isRecommended = true
-  }
-  return { urls, infos: urlInfos }
-}
-
-function lanUrls(config, port = config.port) {
-  const addresses = []
-  let ifaces = {}
-  try {
-    ifaces = networkInterfaces() ?? {}
-  } catch {
-    ifaces = {}
-  }
-  for (const list of Object.values(ifaces)) {
-    for (const iface of list ?? []) {
-      if (iface && iface.family === "IPv4" && !iface.internal) addresses.push(iface.address)
-    }
-  }
-  const built = lanInfosForAddresses(addresses, port)
-  for (const extra of config.extraUrls ?? []) {
-    const httpsUrl = requireHttpsUrl(extra)
-    if (!httpsUrl || built.urls.includes(httpsUrl)) continue
-    built.urls.push(httpsUrl)
-    built.infos.push({ url: httpsUrl, label: httpsUrl, category: "extra", isRecommended: false })
-  }
-  return built
-}
-
 /**
  * @param port 实际监听的端口。config.port 被占用而顺延时，这里与 config.port 不同，
  *   二维码与面板都必须用实际端口，否则手机会连一个没人听的端口。
@@ -416,215 +281,6 @@ function pairInfo(config, state, certFingerprint, port = config.port) {
   info.issuedAt = Date.now()
   info.expiresAt = state.pairing?.expiresAt ?? null
   return info
-}
-
-const JSON_COMPRESS_MIN_BYTES = 1024
-// 服务端优先顺序：zstd（最快、压缩率好）> br（浏览器最爱）> gzip（App/老客户端）。
-const JSON_ENCODING_ORDER = ["zstd", "br", "gzip"]
-
-/** 解析 Accept-Encoding，返回 coding → q 的映射（同名取第一个出现的 q）。 */
-function parseAcceptEncoding(value) {
-  const out = new Map()
-  for (const part of String(value ?? "").split(",")) {
-    const [name, ...params] = part.trim().toLowerCase().split(";")
-    if (!name) continue
-    let q = 1
-    for (const param of params) {
-      const match = /^\s*q\s*=\s*([0-9.]+)\s*$/.exec(param)
-      if (match) q = Number(match[1])
-    }
-    if (!out.has(name)) out.set(name, q)
-  }
-  return out
-}
-
-/**
- * JSON 响应用哪种编码：>=1KB 才压（小于这个体积压缩后反而更大，且含 token 的配对响应
- * 都远小于 1KB）；按 q 值在服务端支持的 coding 里挑一个，全被 q=0 拒掉就返回 null。
- * 导出给测试用：协商逻辑单独可测，不必起服务器。
- */
-export function negotiateJsonEncoding(acceptEncoding, bodyLength) {
-  if (!(bodyLength >= JSON_COMPRESS_MIN_BYTES)) return null
-  const accepted = parseAcceptEncoding(acceptEncoding)
-  if (accepted.size === 0) return null
-  const supported = JSON_ENCODING_ORDER.filter((coding) => {
-    if (coding === "zstd" && typeof zstdCompressSync !== "function") return false
-    return true
-  })
-  for (const coding of supported) {
-    const q = accepted.get(coding) ?? accepted.get("*")
-    if (q === undefined || q <= 0) continue
-    return coding
-  }
-  return null
-}
-
-function compressJson(body, coding) {
-  if (coding === "zstd") return zstdCompressSync(body, { params: { [zlibConstants.ZSTD_c_compressionLevel]: 3 } })
-  if (coding === "br") return brotliCompressSync(body, {
-    params: {
-      [zlibConstants.BROTLI_PARAM_QUALITY]: 4,
-      [zlibConstants.BROTLI_PARAM_SIZE_HINT]: body.length,
-    },
-  })
-  if (coding === "gzip") return gzipSync(body, { level: 6 })
-  return body
-}
-
-/**
- * 弱 ETag：只按「编码后的字节」算。同一份内容用 gzip 和 br 发出去是两个不同的表示，
- * 必须各算各的，否则中间缓存会把 br 体当成 gzip 体回给客户端。
- */
-export function jsonEtag(coding, body) {
-  const hash = createHash("sha1")
-    .update(String(coding ?? "identity"))
-    .update("\u0000")
-    .update(body)
-    .digest("base64url")
-    .slice(0, 22)
-  return `W/"${hash}"`
-}
-
-/** If-None-Match 用弱比较（RFC 9110 §13.1.2）：`W/` 前缀忽略，逗号分隔，`*` 都算命中。 */
-export function ifNoneMatchHit(header, etag) {
-  const raw = String(header ?? "").trim()
-  if (!raw || !etag) return false
-  if (raw === "*") return true
-  const want = String(etag).replace(/^W\//, "")
-  return raw.split(",").some((part) => part.trim().replace(/^W\//, "") === want)
-}
-
-export function json(res, code, obj, extraHeaders) {
-  const body = Buffer.from(JSON.stringify(obj), "utf8")
-  // S3/F3：大于 1KB 的 JSON 响应按 Accept-Encoding 压缩（会话列表约 113KB → gzip 约 15KB）。
-  // 实测（node 24，zlib）：13.3KB 的会话列表样本 gzip 673B、br 423B、zstd 533B；
-  // 真机上 App 现在才真正吃到压缩（见 apps/android 的 MobileApi.request() 去掉
-  // 手写 identity 的改动），浏览器面板则可以用 br/zstd 再省一截。
-  // SSE 与文件下载不走这里（见下方注释与 mobile-api 的文件流），保持不动。
-  // 安全：这些响应里没有「攻击者可控输入 + 密钥」同时出现的情况，BREACH 类攻击不适用；
-  // 含 token 的配对响应小于 1KB，不会被压缩。
-  const coding = negotiateJsonEncoding(headerVal(res.req?.headers, "accept-encoding") ?? "", body.length)
-  const encoded = coding ? compressJson(body, coding) : body
-  // D1：GET 的列表类响应带弱 ETag。手机在 4G/中继上每 15 秒轮一次会话列表，
-  // 内容没变时回 304（几十字节）而不是重发整份列表；编码不同 → 表示不同 → ETag 不同。
-  const etag = code === 200 && body.length > 0 ? jsonEtag(coding, encoded) : null
-  const headers = {
-    "content-type": "application/json; charset=utf-8",
-    "content-length": String(encoded.length),
-    // 不再发 connection: close：远程每条连接都是一次 WSS + 会合 + 内层 TLS，
-    // 必须让 App 的连接池复用（RFC §4.2）。空闲上限见 createHttpsServer 之后的 keepAliveTimeout。
-    "x-content-type-options": "nosniff",
-    "x-frame-options": "DENY",
-    "referrer-policy": "no-referrer",
-    // 响应体随 Accept-Encoding 变化，Vary 必须一直在（否则中间缓存会把 gzip 体发给不支持的人）。
-    vary: "accept-encoding",
-    ...(coding ? { "content-encoding": coding } : {}),
-    ...(etag ? { etag } : {}),
-    ...extraHeaders,
-  }
-  if (etag && ifNoneMatchHit(headerVal(res.req?.headers, "if-none-match"), etag)) {
-    // 304 不带 content-length / content-encoding：body 是复用的旧表示，由客户端自己保管。
-    const { "content-length": _len, "content-encoding": _enc, ...rest } = headers
-    res.writeHead(304, rest)
-    res.end()
-    return
-  }
-  res.writeHead(code, headers)
-  res.end(encoded)
-}
-
-function headerVal(headers, name) {
-  const value = headers?.[name] ?? headers?.[name.toLowerCase()]
-  return typeof value === "string" ? value : undefined
-}
-
-function isLoopbackHostname(hostname) {
-  const host = String(hostname ?? "").toLowerCase().replace(/^\[|\]$/g, "")
-  if (host === "localhost" || host === "::1") return true
-  const parts = host.split(".")
-  return parts.length === 4 && parts[0] === "127" && parts.every((part) => /^\d{1,3}$/.test(part) && Number(part) <= 255)
-}
-
-/**
- * 对齐 dsh-client-connection isTrustedApiRequest（trustedHosts 为空，只认回环）。
- * Host/Origin 之外必须校验 TCP 对端地址，防止伪造 Host: 127.0.0.1 绕过围栏。
- */
-function isLoopbackAddress(addr) {
-  if (!addr) return false
-  const a = String(addr).replace(/^::ffff:/i, "").toLowerCase()
-  return a === "127.0.0.1" || a === "::1" || a === "localhost"
-}
-
-function requireLoopbackSameOrigin(req, res) {
-  const remote = req.socket?.remoteAddress ?? req.connection?.remoteAddress
-  if (!isLoopbackAddress(remote)) {
-    json(res, 403, { error: "forbidden" })
-    return false
-  }
-  const host = headerVal(req.headers, "host")
-  if (!host) {
-    json(res, 403, { error: "forbidden" })
-    return false
-  }
-  let hostUrl
-  try {
-    hostUrl = new URL(`http://${host}`)
-  } catch {
-    json(res, 403, { error: "forbidden" })
-    return false
-  }
-  if (!isLoopbackHostname(hostUrl.hostname)) {
-    json(res, 403, { error: "forbidden" })
-    return false
-  }
-  if (headerVal(req.headers, "sec-fetch-site") === "cross-site") {
-    json(res, 403, { error: "forbidden" })
-    return false
-  }
-  const origin = headerVal(req.headers, "origin")
-  if (origin !== undefined) {
-    try {
-      if (new URL(origin).host !== hostUrl.host) {
-        json(res, 403, { error: "forbidden" })
-        return false
-      }
-    } catch {
-      json(res, 403, { error: "forbidden" })
-      return false
-    }
-  }
-  return true
-}
-
-/** 状态变更请求：强制 JSON media type（触发 CORS 预检）+ 拒绝跨站 Origin。 */
-export function requireJsonWrite(req, res) {
-  if (headerVal(req.headers, "sec-fetch-site") === "cross-site") {
-    json(res, 403, { error: "forbidden" })
-    return false
-  }
-  const origin = headerVal(req.headers, "origin")
-  const host = headerVal(req.headers, "host")
-  if (origin) {
-    if (!host) {
-      json(res, 403, { error: "forbidden" })
-      return false
-    }
-    try {
-      if (new URL(origin).host !== host) {
-        json(res, 403, { error: "forbidden" })
-        return false
-      }
-    } catch {
-      json(res, 403, { error: "forbidden" })
-      return false
-    }
-  }
-  const ct = (headerVal(req.headers, "content-type") ?? "").toLowerCase()
-  if (ct !== "application/json" && !ct.startsWith("application/json;")) {
-    json(res, 415, { error: "content-type must be application/json" })
-    return false
-  }
-  return true
 }
 
 /** 回环面板的 JSON POST。响应已写出时返回 null。 */
@@ -1139,6 +795,7 @@ function settleOrphanApprovals(rt) {
 }
 
 async function sessionFilePath(targetPort, sessionId, rt) {
+  const MAX_SESSION_FILES_CACHE = 256
   const cached = rt.sessionFiles.get(sessionId)
   if (cached?.missingUntil && Date.now() < cached.missingUntil) return null
   if (cached?.path) return cached.path
@@ -1147,20 +804,20 @@ async function sessionFilePath(targetPort, sessionId, rt) {
     const row = (list.items ?? []).find((s) => s.sessionId === sessionId)
     const cwd = row?.cwd
     if (!cwd) {
-      rt.sessionFiles.set(sessionId, { missingUntil: Date.now() + 10_000 })
+      setBounded(rt.sessionFiles, sessionId, { missingUntil: Date.now() + 10_000 }, MAX_SESSION_FILES_CACHE)
       return null
     }
     const p = resolveSessionLogPath(sessionDirFor(cwd, sessionId))
     if (!p) {
-      rt.sessionFiles.set(sessionId, { missingUntil: Date.now() + 10_000 })
+      setBounded(rt.sessionFiles, sessionId, { missingUntil: Date.now() + 10_000 }, MAX_SESSION_FILES_CACHE)
       return null
     }
     const prev = cached?.path
-    rt.sessionFiles.set(sessionId, {
+    setBounded(rt.sessionFiles, sessionId, {
       path: p,
       lastSize: prev === p ? cached?.lastSize : undefined,
       lastMtime: prev === p ? cached?.lastMtime : undefined,
-    })
+    }, MAX_SESSION_FILES_CACHE)
     return p
   } catch {
     return null
@@ -2472,6 +2129,7 @@ export function apply(ctx, config) {
       rt.gapPolls.clear()
       rt.reasoningCache.clear()
       rt.sessionActivityCache.clear()
+      rt.pricedModelCache?.clear()
       rt.requests.disposeAll("cancelled")
       unbindLocalRpcRuntime()
       if (gatewayPeer) { try { Promise.resolve(gatewayPeer.dispose()).catch(() => {}) } catch {} }

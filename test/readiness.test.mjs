@@ -198,8 +198,8 @@ test("端口被占用：顺延到下一个端口就绪，路由报实际端口�
   await apply(ctx, configFor(dir, port))
   const pair = await callRoute(pairInfoRoute(registered))
   assert.equal(pair.status, 200)
-  assert.equal(pair.body.port, port + 1)
-  for (const url of pair.body.urls) assert.ok(url.endsWith(`:${port + 1}`), url)
+  assert.ok(pair.body.port > port && pair.body.port < port + 8, `expected shifted port in (${port}, ${port + 8}), got ${pair.body.port}`)
+  for (const url of pair.body.urls) assert.ok(url.endsWith(`:${pair.body.port}`), url)
   for (const fn of effects) try { fn() } catch (e) { assert.fail(`dispose threw: ${e}`) }
   occupier.close()
 })

@@ -33,7 +33,7 @@ test("单层名称解析为当前工作区的同级目录", () => {
     parentWorkspaceId: "ws-current",
     workspaces: anchor("/Volumes/Space/Dev/dsh-links"),
   })
-  assert.equal(plan.path, "/Volumes/Space/Dev/space")
+  assert.equal(plan.path, join("/Volumes/Space/Dev", "space"))
   assert.equal(plan.inputKind, "name")
   assert.equal(plan.shouldCreateDirectory, true)
 })
@@ -116,7 +116,7 @@ test("绝对路径解析成已存在目录的 realpath", async () => {
     const real = join(root, "real")
     const link = join(root, "link")
     await mkdir(real)
-    symlinkSync(real, link)
+    symlinkSync(real, link, process.platform === "win32" ? "junction" : "dir")
     assert.equal(resolveAbsoluteWorkspaceDirectory(link), realpathSync(real))
     assert.throws(
       () => resolveAbsoluteWorkspaceDirectory(join(root, "missing")),

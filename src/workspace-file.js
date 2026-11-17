@@ -17,8 +17,7 @@ export function resolveWorkspaceFile(cwd, requested) {
   }
   const root = realpathSync(resolve(cwd.trim()))
   const candidate = isAbsolute(requested.trim()) ? resolve(requested.trim()) : resolve(root, requested.trim())
-  const lexicalRel = relative(root, candidate)
-  if (lexicalRel.startsWith("..") || isAbsolute(lexicalRel)) {
+  if (candidate === root || !insideRoot(root, candidate)) {
     const err = new Error("路径越出工作区")
     err.status = 403
     throw err
@@ -32,7 +31,7 @@ export function resolveWorkspaceFile(cwd, requested) {
     throw err
   }
   const rel = relative(root, real)
-  if (!rel || rel.startsWith("..") || isAbsolute(rel)) {
+  if (!rel || !insideRoot(root, real)) {
     const err = new Error("路径越出工作区")
     err.status = 403
     throw err

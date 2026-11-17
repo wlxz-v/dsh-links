@@ -589,7 +589,7 @@ test("绝对路径注册工作区必须经本机批准", async () => {
     const real = join(root, "real")
     const link = join(root, "link")
     mkdirSync(real)
-    symlinkSync(real, link)
+    symlinkSync(real, link, process.platform === "win32" ? "junction" : "dir")
     const submitted = await proxyFetch(`/dsh-link/mobile/workspaces`, {
       method: "POST",
       headers: tokenHeaders(globalThis.__testDevice.token),
@@ -1003,10 +1003,15 @@ test("state.json 权限与不含明文 code", () => {
   const file = join(TMP, "state.json")
   const dirStat = statSync(TMP)
   const fileStat = statSync(file)
-  assert.equal(dirStat.mode & 0o777, 0o700)
-  assert.equal(fileStat.mode & 0o777, 0o600)
   const tlsStat = statSync(join(TMP, "tls.json"))
-  assert.equal(tlsStat.mode & 0o777, 0o600)
+  assert.equal(dirStat.isDirectory(), true)
+  assert.equal(fileStat.isFile(), true)
+  assert.equal(tlsStat.isFile(), true)
+  if (process.platform !== "win32") {
+    assert.equal(dirStat.mode & 0o777, 0o700)
+    assert.equal(fileStat.mode & 0o777, 0o600)
+    assert.equal(tlsStat.mode & 0o777, 0o600)
+  }
   const parsed = JSON.parse(readFileSync(file, "utf8"))
   assert.equal(parsed.pairing?.code, undefined)
   assert.equal(parsed.pairing?.codeHash, undefined)

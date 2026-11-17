@@ -20,10 +20,18 @@ function canonicalPathForContainment(p) {
   }
 }
 
-function isPathWithinRoot(target, root) {
-  if (target === root) return true
-  const prefix = root.endsWith(sep) ? root : root + sep
-  return target.startsWith(prefix)
+function normalizeComparisonPath(p, platform = process.platform) {
+  if (platform !== "win32") return String(p)
+  return String(p).replace(/\//g, "\\").toLowerCase()
+}
+
+export function isPathWithinRoot(target, root, platform = process.platform) {
+  const normTarget = normalizeComparisonPath(target, platform)
+  const normRoot = normalizeComparisonPath(root, platform)
+  if (normTarget === normRoot) return true
+  const separator = platform === "win32" ? "\\" : sep
+  const prefix = normRoot.endsWith(separator) ? normRoot : normRoot + separator
+  return normTarget.startsWith(prefix)
 }
 
 /** session.create 的 cwd / workspaceId 必须落在已注册工作区内。都没给时交给 DSH 选默认工作区。 */

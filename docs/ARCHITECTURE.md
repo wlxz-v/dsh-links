@@ -52,7 +52,7 @@
 | 路径 | 责任 | 约束 |
 |---|---|---|
 | `src/mobile-api.js` | 手机端 HTTPS API 唯一实现 | 不放 UI；新增端点必须同步 MOBILE_SYNC_CONTRACT.md |
-| `src/index.js` | 插件入口：路由注册、配对/设备状态机、Runtime 装配 | 单文件偏大，新增逻辑优先抽模块（如 `workspace-approval.js`） |
+| `src/index.js` | 插件入口：路由注册、配对/设备状态机、Runtime 装配 | HTTP 编码/ETag/同源守卫在 `http-utils.js`，局域网/Tailscale 选址在 `lan-address.js` |
 | `src/panel.js` → `src/client.js` | 「手机连接」面板唯一源码；client.js 由 `build-client.mjs` 生成 | **勿手改 client.js**；CI 校验生成物与提交一致 |
 | `src/remote/` | DLP/1：`agent.js`（控制连接、会合验证、接本机端口）、`runtime.js`（启停、面板状态、二维码种子、设备远程能力）、`state.js`（state.remote 纯函数）、`crypto.js` / `wire.js` / `bootstrap.js` | 不 import Host 能力；密码学常量由 `testdata/dlp1/vectors.json` 三端锁定 |
 | `relay/` | 中继服务端（`cmd/dlp-relay` + `internal/dlp`），`deploy/` 为 systemd + Caddy | 门禁独立（gofmt/vet/build/race），不随插件包发布 |
@@ -129,9 +129,7 @@
 - 吊销设备 = 删除设备记录 + `agent.dropDevice()` 关掉它所有远程流。
 - 中继可能伪造错误码：App 只据此提示，删除凭据只认插件在内层 TLS 上的答复。
 
-**多路订阅的边界**：手机只在打开某个会话时才订阅它的 SSE，插件也只在有手机订阅时
-才接管该会话的审批（`src/index.js` 的 `approval/request`）；因此首页能内联批准的行
-至多一行，其余审批仍要到电脑端或进对话页处理。这是方案 D1 选定的诚实降级，不是缺陷。
+**双端审批与双端澄清**：`approval/request` 与 `user-questions/request` 钩子在有活跃配对手机（会话 SSE 已订阅，或后台挂着主机事件流 `GET /dsh-link/mobile/events`）时，同时在手机端建立待办记录并把请求透传给电脑端网页，两端先答先算；后台监控通过主机事件流里的 `approvalId`/`approvalDetail` 与 `questionId`/`questionText` 直接弹出通知与快捷操作，无需预先打开对应会话。
 
 ## 门禁
 

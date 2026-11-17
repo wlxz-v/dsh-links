@@ -165,6 +165,14 @@ internal fun ModelsSettingsPage(
             }
         }
         launch(Dispatchers.IO) {
+            val missing = dev.deeplinks.core.HostCapabilitiesCache.missing(host.slotKey)
+            if ("llm.listProviders" in missing || "credentials.describe" in missing) {
+                withContext(Dispatchers.Main) {
+                    unsupported = true
+                    directoryLoading = false
+                }
+                return@launch
+            }
             val result = runCatching { client.getProviders() }
             withContext(Dispatchers.Main) {
                 result.onSuccess { directory = it; directoryError = null; unsupported = false }

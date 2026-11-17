@@ -1,5 +1,14 @@
 ## 未发布（main）
 
+**全量梳理优化：修复 2c86839 网络层回归、Windows 会话日志兼容、选路与缓存有界化（0.1.0-beta.20）**
+
+- **修复 Android 写请求与 304 回归（P0）**：`MobileApiClient.request()` 仅对幂等 `GET` 调用 `conditionalJsonGet()`，命中 `304` 且本地有副本时直接返回缓存 JSON（不再误入 `!in 200..299` 抛错）；`POST` / `PUT` / `DELETE` 走独立 `HostHttp.execute()` 保留原始方法与 UTF-8 JSON 请求体，无请求体的 `DELETE`（如删除定时任务）自动附带 `Content-Type: application/json; charset=utf-8` 以通过服务端 `requireJsonWrite` 门禁。新增 `MobileApiRequestTest` 守护上述契约。
+- **修复 Windows 会话日志路径编码（P0）**：`src/session-log-path.js` 对齐 `@deepseek-ai/dsh-session-persistence-jsonl` 的 `encodeSessionProjectKey` / `encodeSessionSegment`（合并 `/`、`\`、`:` 为单 `-`，非 ASCII 与保留字符按 UTF-16 码元转义为 `~XXXX`），修复 Windows 盘符与中文路径下 SSE 实时思考补发与历史页思考读取静默返回空的缺陷。
+- **修复工作区路径沙箱 Windows 大小写与 `..` 普通文件名边界**：`src/workspace-path.js` 在 `win32` 下按大小写不敏感比对工作区包含关系；`src/workspace-file.js` 的 `resolveWorkspaceFile()` 复用 `insideRoot()`，允许读取以 `..` 开头的合法普通文件（如 `..env`）。
+- **自动选路退避与 Tailscale 备用地址保持（P1）**：Android `RouteSelector` 在同一网络代内连续局域网探测失败时按 `15s → 60s → 180s` 阶梯退避（网络切换 `onNetworkChanged()` 立即归零恢复 15s 探测），消除中继模式下每 15 秒一次的同步探测停顿；`remember(key, LAN)` 保留同一网络代已命中的备用直连地址，防止慢请求跨过 30 秒后 `noteSuccess` 抹掉 Tailscale 地址。
+- **服务端 ETag 零多余压缩与双端缓存有界化（P1）**：`src/http-utils.js` 按 `(coding, body)` 计算弱 ETag，命中 `304` 时直接返回、跳过主线程同步 `gzip`/`br`/`zstd` 压缩，且对非 `GET`/`HEAD` 与 `no-store` 响应禁用 ETag；新增 `src/bounded-map.js` 为 `sessionActivityCache`（256，同会话覆盖旧时间戳并跳过 running 行写入）、`reasoningCache`（32）、`pricedModelCache`（128，退出清理）、`sessionFiles`（256）建立 LRU 上限；Android `JsonHttpCache` 增加单条 256 KB、总计 2 MB 预算，并在 `HostStore.remove()` 及 `401/403` 时按 `slotKey` 清除对应电脑缓存。
+- **代码拆解、Windows 单测全绿与宿主能力全量收敛（P2/P3）**：`src/index.js` 拆出 `src/http-utils.js` 与 `src/lan-address.js`（缩减约 340 行）；Android `MobileApi.kt`（原 1,439 行）拆分为 `MobileApi.kt`、`MobileApiModels.kt`、`MobileApiParsers.kt` 三文件；`WorkspaceViewModel`、`SettingsRoute`、`ModelsSettings` 经 `HostCapabilitiesCache` 收敛全部 7 项宿主能力探针；修复 Windows 下 7 个测试文件的 `junction`/`selfsigned`/`npm-cli`/路径断言，新增 `.gitattributes` 统一 LF，`npm run prepack` 399 例全绿。
+
 **双端契约、宿主能力探针、断线补传与 ETag（B1/B2/E2/D1）**
 
 - 宿主能力探针（B1）：新增 `src/host-probe.js`，用只读 Remote 实测这台 DSH 有没有插件依赖的能力（`schedule.catalog`、`agentPreset.list`、`settings.describe`、`llm.listProviders`、`credentials.describe`、`workspace.list`），写接口 `schedule.edit` 用「指向不存在 id 的 delete」探测——不会真删，只有明确「方法缺失」才算不支持，not-found 视为支持。启动后就并发探测（并发 4、单次 3 秒超时），结果缓存 5 分钟；诊断新增 `host.probe` 行（缺失/未知分别计数），`capabilities.host` 交给 App 把对应入口藏起来。

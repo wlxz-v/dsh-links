@@ -4,11 +4,9 @@
  */
 import assert from "node:assert/strict"
 import test from "node:test"
-import { execFileSync } from "node:child_process"
-import { mkdtempSync, readFileSync, rmSync } from "node:fs"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { readFileSync } from "node:fs"
 import { X509Certificate } from "node:crypto"
+import selfsigned from "selfsigned"
 import { pluginCapabilities } from "../src/protocol-caps.js"
 import {
   DIAGNOSTIC_RPC_TIMEOUT_MS,
@@ -414,23 +412,18 @@ test("地址分类：私网、Tailscale、回环、公网", () => {
   assert.equal(classifyListenHost(SELF_TOKEN), null)
 })
 
-function tempCertPem() {
-  const dir = mkdtempSync(join(tmpdir(), "dsh-diag-cert-"))
-  const cert = join(dir, "cert.pem")
-  try {
-    execFileSync("openssl", [
-      "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1",
-      "-keyout", join(dir, "key.pem"), "-out", cert, "-days", "40", "-nodes", "-subj", "/CN=dsh-links",
-    ], { stdio: "ignore" })
-    return readFileSync(cert, "utf8")
-  } finally {
-    rmSync(dir, { recursive: true, force: true })
-  }
+async function tempCertPem() {
+  const notAfter = new Date(Date.now() + 40 * DAY)
+  const pems = await selfsigned.generate(
+    [{ name: "commonName", value: "dsh-links" }],
+    { keySize: 2048, algorithm: "sha256", notAfterDate: notAfter },
+  )
+  return pems.cert
 }
 
 test("证书 PEM 只用于算到期，不会进入诊断上下文或结果", async () => {
   const marker = "PEM-SECRET-MARKER"
-  const cert = tempCertPem()
+  const cert = await tempCertPem()
   const expiry = tlsExpiryMs(cert)
   assert.equal(typeof expiry, "number")
   assert.ok(expiry > Date.now())

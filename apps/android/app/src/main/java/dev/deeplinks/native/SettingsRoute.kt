@@ -165,6 +165,7 @@ internal fun SettingsRoute(
 
     LaunchedEffect(host) {
         if (host == null) return@LaunchedEffect
+        if ("settings.describe" in dev.deeplinks.core.HostCapabilitiesCache.missing(host.slotKey)) return@LaunchedEffect
         withContext(Dispatchers.IO) {
             try {
                 val view = settingsClient?.getSettings() ?: return@withContext
@@ -496,13 +497,16 @@ internal fun SettingsHome(
         )
     }
     if (host != null) {
+        val missing = dev.deeplinks.core.HostCapabilitiesCache.missing(host.slotKey)
         DshListSection(header = s.sectionAgent) {
-            DshListRow(
-                title = s.conversationDefaults,
-                icon = ChatOutline16,
-                value = dev.deeplinks.native.util.permissionPresetLabel(appSettings.permissionPreset, s),
-                onClick = { onOpen(SettingsDest.CONVERSATION) },
-            )
+            if ("settings.describe" !in missing) {
+                DshListRow(
+                    title = s.conversationDefaults,
+                    icon = ChatOutline16,
+                    value = dev.deeplinks.native.util.permissionPresetLabel(appSettings.permissionPreset, s),
+                    onClick = { onOpen(SettingsDest.CONVERSATION) },
+                )
+            }
             DshListRow(
                 title = s.modelsAndBalance,
                 icon = SparkleOutline16,
