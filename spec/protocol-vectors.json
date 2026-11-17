@@ -1,0 +1,127 @@
+{
+  "version": 1,
+  "protocol": 2,
+  "clientCaps": "sync2,multiQuestion,requestState",
+  "notes": [
+    "插件与手机端共用的线上契约。插件测试读它校验自己发出的帧，Android 单测读它校验解析结果。",
+    "改字段时两边一起过：required 里的键一旦缺失，老版本的另一端就会静默丢信息。"
+  ],
+  "plugin": {
+    "questions": { "multi": true, "serverValidation": true },
+    "requests": { "snapshot": true },
+    "events": { "host": true, "since": true },
+    "files": { "workspace": true, "sha256": true },
+    "diagnostics": { "v": 1 }
+  },
+  "snapshot": {
+    "request": "/dsh-link/mobile/sessions/:id/requests",
+    "required": ["version"],
+    "approval": {
+      "required": ["approvalId", "status", "sessionId", "createdAt", "deadlineAt"],
+      "optional": ["outcome", "callId", "toolName", "detail", "headline", "reason"]
+    },
+    "question": {
+      "required": ["rpcId", "status", "sessionId", "createdAt", "deadlineAt", "questions"],
+      "optional": []
+    }
+  },
+  "frames": [
+    {
+      "name": "session/state",
+      "event": "session/state",
+      "required": ["type", "sessionId", "state", "seq"],
+      "optional": ["title", "origin", "notify", "approvalId", "approvalToolName", "approvalDetail", "questionId", "questionText"],
+      "data": {
+        "type": "session/state",
+        "sessionId": "s-1",
+        "state": "done",
+        "title": "会话标题",
+        "origin": "desktop",
+        "seq": 12
+      }
+    },
+    {
+      "name": "session/state 待审批",
+      "event": "session/state",
+      "required": ["type", "sessionId", "state", "seq", "approvalId"],
+      "optional": ["title", "origin", "notify", "approvalToolName", "approvalDetail", "questionId", "questionText"],
+      "data": {
+        "type": "session/state",
+        "sessionId": "s-1",
+        "state": "awaitingApproval",
+        "title": "会话标题",
+        "origin": "desktop",
+        "seq": 13,
+        "approvalId": "ap-1",
+        "approvalToolName": "pwsh",
+        "approvalDetail": "pnpm test"
+      }
+    },
+    {
+      "name": "session/state 待回答",
+      "event": "session/state",
+      "required": ["type", "sessionId", "state", "seq", "questionId"],
+      "optional": ["title", "origin", "notify", "approvalId", "approvalToolName", "approvalDetail", "questionText"],
+      "data": {
+        "type": "session/state",
+        "sessionId": "s-1",
+        "state": "awaitingInput",
+        "title": "会话标题",
+        "origin": "desktop",
+        "seq": 14,
+        "questionId": "q-1",
+        "questionText": "要装到哪个目录？"
+      }
+    },
+    {
+      "name": "session/state 重复终态（静音）",
+      "event": "session/state",
+      "required": ["type", "sessionId", "state", "seq"],
+      "optional": ["title", "origin", "notify", "approvalId", "approvalToolName", "approvalDetail", "questionId", "questionText"],
+      "data": {
+        "type": "session/state",
+        "sessionId": "s-2",
+        "state": "failed",
+        "title": "会话标题",
+        "origin": "schedule",
+        "seq": 15,
+        "notify": false
+      }
+    },
+    {
+      "name": "resync-required",
+      "event": "resync-required",
+      "required": ["reason", "afterSeq"],
+      "optional": [],
+      "data": { "reason": "gap", "afterSeq": 41 }
+    },
+    {
+      "name": "question",
+      "event": "question",
+      "required": ["rpcId", "sessionId", "questions"],
+      "optional": [],
+      "data": {
+        "rpcId": "q-1",
+        "sessionId": "s-1",
+        "questions": [
+          {
+            "id": "q1",
+            "header": "安装位置",
+            "question": "装到哪个目录？",
+            "options": [
+              { "id": "a", "label": "D:/apps" },
+              { "id": "b", "label": "C:/Program Files" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "question-resolved",
+      "event": "question-resolved",
+      "required": ["rpcId", "sessionId", "outcome"],
+      "optional": [],
+      "data": { "rpcId": "q-1", "sessionId": "s-1", "outcome": "answered" }
+    }
+  ]
+}

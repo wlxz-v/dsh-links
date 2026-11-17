@@ -13,7 +13,7 @@ import { createServer as createNetServer } from "node:net"
 import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs"
 import { dirname, join } from "node:path"
 import { homedir, hostname, networkInterfaces } from "node:os"
-import { randomBytes } from "node:crypto"
+import { createHash, randomBytes } from "node:crypto"
 import { brotliCompressSync, constants as zlibConstants, gzipSync, zstdCompressSync } from "node:zlib"
 import z from "@deepseek-ai/schemastery"
 import QRCode from "qrcode"
@@ -56,6 +56,7 @@ import {
   requestBelongsToSession,
 } from "./request-lifecycle.js"
 import { createRemoteRuntime } from "./remote/runtime.js"
+import { createHostProbe } from "./host-probe.js"
 import { oneLine, toolCallDetail } from "./approval-detail.js"
 
 import { applyMobileSessionSafety, handleMobileApi } from "./mobile-api.js"
@@ -470,6 +471,29 @@ function compressJson(body, coding) {
   return body
 }
 
+/**
+ * 弱 ETag：只按「编码后的字节」算。同一份内容用 gzip 和 br 发出去是两个不同的表示，
+ * 必须各算各的，否则中间缓存会把 br 体当成 gzip 体回给客户端。
+ */
+export function jsonEtag(coding, body) {
+  const hash = createHash("sha1")
+    .update(String(coding ?? "identity"))
+    .update("\u0000")
+    .update(body)
+    .digest("base64url")
+    .slice(0, 22)
+  return `W/"${hash}"`
+}
+
+/** If-None-Match 用弱比较（RFC 9110 §13.1.2）：`W/` 前缀忽略，逗号分隔，`*` 都算命中。 */
+export function ifNoneMatchHit(header, etag) {
+  const raw = String(header ?? "").trim()
+  if (!raw || !etag) return false
+  if (raw === "*") return true
+  const want = String(etag).replace(/^W\//, "")
+  return raw.split(",").some((part) => part.trim().replace(/^W\//, "") === want)
+}
+
 export function json(res, code, obj, extraHeaders) {
   const body = Buffer.from(JSON.stringify(obj), "utf8")
   // S3/F3：大于 1KB 的 JSON 响应按 Accept-Encoding 压缩（会话列表约 113KB → gzip 约 15KB）。
@@ -481,6 +505,9 @@ export function json(res, code, obj, extraHeaders) {
   // 含 token 的配对响应小于 1KB，不会被压缩。
   const coding = negotiateJsonEncoding(headerVal(res.req?.headers, "accept-encoding") ?? "", body.length)
   const encoded = coding ? compressJson(body, coding) : body
+  // D1：GET 的列表类响应带弱 ETag。手机在 4G/中继上每 15 秒轮一次会话列表，
+  // 内容没变时回 304（几十字节）而不是重发整份列表；编码不同 → 表示不同 → ETag 不同。
+  const etag = code === 200 && body.length > 0 ? jsonEtag(coding, encoded) : null
   const headers = {
     "content-type": "application/json; charset=utf-8",
     "content-length": String(encoded.length),
@@ -492,7 +519,15 @@ export function json(res, code, obj, extraHeaders) {
     // 响应体随 Accept-Encoding 变化，Vary 必须一直在（否则中间缓存会把 gzip 体发给不支持的人）。
     vary: "accept-encoding",
     ...(coding ? { "content-encoding": coding } : {}),
+    ...(etag ? { etag } : {}),
     ...extraHeaders,
+  }
+  if (etag && ifNoneMatchHit(headerVal(res.req?.headers, "if-none-match"), etag)) {
+    // 304 不带 content-length / content-encoding：body 是复用的旧表示，由客户端自己保管。
+    const { "content-length": _len, "content-encoding": _enc, ...rest } = headers
+    res.writeHead(304, rest)
+    res.end()
+    return
   }
   res.writeHead(code, headers)
   res.end(encoded)
@@ -1274,7 +1309,10 @@ async function handleStreamRoute(sessionId, res, targetPort, config, req, rt, de
   res.write(`event: ready\ndata: ${JSON.stringify({
     resumeSeq: conn.lastSeq,
     protocol: PLUGIN_PROTOCOL,
-    capabilities: pluginCapabilities({ changes: Boolean(workspaceChangesService(rt.workspaceChanges)) }),
+    capabilities: pluginCapabilities({
+      changes: Boolean(workspaceChangesService(rt.workspaceChanges)),
+      host: rt.hostProbe?.capabilities?.(),
+    }),
   })}\n\n`)
   try { res.flush?.() } catch {}
   ;(async () => {
@@ -1607,6 +1645,12 @@ export function apply(ctx, config) {
     pluginPort: boundPort,
     hostPort: targetPort,
   })
+  // 宿主能力实测（B1）：DSH 升级会改名/合并 Remote（0.2.x 的 schedule/update + delete → edit），
+  // 插件这边没有可读的注册表，只能启动后实际调一遍，把结论交给 App 隐藏点不通的入口。
+  const hostProbe = createHostProbe({
+    call: (method, params) => callLocalRpc(targetPort, method, params ?? {}),
+  })
+  rt.hostProbe = hostProbe
   async function currentDetections() {
     const rows = await refreshPreviewDetections({
       detector: rt.previewDetect,
@@ -1630,6 +1674,10 @@ export function apply(ctx, config) {
 
   // 诊断只读：workspace.list 已在白名单里。证书 PEM 留在 tlsHolder，不进入返回值。
   function diagnosticsSource(device) {
+    // 探测结论过期时补一次，但不阻塞这次诊断：第一次可能报 checkedAt=0/unknown。
+    try {
+      hostProbe.ensure()
+    } catch {}
     // 诊断读的是 gatewayPeerState 快照；启动早期 connection 服务还没 active，
     // 快照会长期停在 peerError:"no-connection"，让面板看起来像网关坏了。
     // 这里先重试一次（惰性、无副作用），保证 detail 反映「现在」而不是 apply 那一刻。
@@ -1682,6 +1730,7 @@ export function apply(ctx, config) {
         error: view.error,
         replaced: Boolean(view.replaced),
       },
+      host: hostProbe.snapshot(),
     })
   }
 
@@ -2384,6 +2433,8 @@ export function apply(ctx, config) {
   }).then((tls) => {
     // 只有 listen 成功才算就绪；仅证书生成完成还不够。
     readiness.phase = "ready"
+    // 就绪后再探宿主能力（不 await：探测慢不该拖慢启动，失败也只是让 App 多显示入口）。
+    void hostProbe.refresh().catch(() => {})
     return tls
   }).catch((err) => {
     readiness.phase = "failed"
@@ -2401,6 +2452,7 @@ export function apply(ctx, config) {
       if (pollTimer) clearInterval(pollTimer)
       if (keepAliveTimer) clearInterval(keepAliveTimer)
       try { hostEvents.stop() } catch {}
+      try { hostProbe.stop() } catch {}
       try { previews.stop() } catch {}
       try { muxBridge?.stop() } catch {}
       muxBridge = null

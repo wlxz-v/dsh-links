@@ -4,7 +4,9 @@ import {
   classifyHostSession,
   createHostEventHub,
   diffHostSessions,
+  handleHostEvents,
   hostEventFrame,
+  parseHostCursor,
   terminalHostState,
 } from "../src/host-events.js"
 
@@ -240,4 +242,65 @@ test("待回答的澄清带 questionId 与题干：多题依次选择也能推�
   const waiting = classifyHostSession(row({ awaitingInput: true }))
   assert.equal("questionId" in waiting, false)
   assert.equal("questionText" in waiting, false)
+})
+
+function sseResponse() {
+  const chunks = []
+  const handlers = new Map()
+  return {
+    chunks,
+    writeHead() {},
+    flushHeaders() {},
+    socket: { setNoDelay() {} },
+    write(frame) { chunks.push(frame); return true },
+    on(name, fn) { handlers.set(name, fn) },
+    destroy() {},
+    end() {},
+    close() { handlers.get("close")?.() },
+  }
+}
+
+test("?since= 与 Last-Event-ID 等价：断线期间的事件按游标补发", async () => {
+  let rows = [row({ sessionId: "s1" })]
+  const hub = createHostEventHub({
+    listSessions: async () => rows,
+    setIntervalFn: () => ({ unref() {} }),
+    clearIntervalFn: () => {},
+    bufferLimit: 20,
+  })
+  const first = sseResponse()
+  handleHostEvents({ url: "/dsh-link/mobile/events", headers: {} }, first, hub)
+  await new Promise((resolve) => setImmediate(resolve))
+  const firstId = Number(first.chunks.join("").match(/id: (\d+)/)[1])
+
+  // 还连着的时候产生第二条事件；随后断线，断线期间的事件要靠游标补回来。
+  rows = [row({ sessionId: "s1", running: false })]
+  await hub.poll()
+  first.close()
+  assert.equal(hub.subscriberCount, 0)
+
+  // 用查询参数续传：只补游标之后的事件，不重复快照。
+  const byQuery = sseResponse()
+  handleHostEvents({ url: `/dsh-link/mobile/events?since=${firstId}`, headers: {} }, byQuery, hub)
+  assert.match(byQuery.chunks.join(""), /"state":"completed"/)
+  assert.equal(byQuery.chunks.filter((chunk) => chunk.includes("session/state")).length, 1)
+  byQuery.close()
+
+  // 头部写法等价。
+  const byHeader = sseResponse()
+  handleHostEvents({ url: "/dsh-link/mobile/events", headers: { "last-event-id": String(firstId) } }, byHeader, hub)
+  assert.match(byHeader.chunks.join(""), /"state":"completed"/)
+  byHeader.close()
+
+  // 非法游标当没有游标：不回放旧事件（此时也没有活跃会话，快照为空），更不会 resync 风暴。
+  const garbage = sseResponse()
+  handleHostEvents({ url: "/dsh-link/mobile/events?since=abc", headers: {} }, garbage, hub)
+  assert.equal(garbage.chunks.join(""), "")
+  garbage.close()
+
+  assert.equal(parseHostCursor("12"), 12)
+  assert.equal(parseHostCursor("0"), null)
+  assert.equal(parseHostCursor("-1"), null)
+  assert.equal(parseHostCursor("1.5"), null)
+  hub.stop()
 })

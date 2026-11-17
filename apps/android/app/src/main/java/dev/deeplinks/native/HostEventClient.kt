@@ -4,6 +4,7 @@ import android.util.Log
 import dev.deeplinks.core.BoundedIo
 import dev.deeplinks.core.Host
 import dev.deeplinks.core.HostHttp
+import dev.deeplinks.core.parseHostStateFields
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -112,13 +113,16 @@ class HostEventClient(
             "x-dsh-link-token" to host.token,
         )
         val cursor = lastEventId.get()
+        // 游标同时用查询串和标准头发：有些中间层会剥掉 Last-Event-ID，?since= 是它的等价替代
+        // （插件侧两个都认，见 src/host-events.js 的 parseHostCursor）。
+        val path = if (cursor > 0) "/dsh-link/mobile/events?since=$cursor" else "/dsh-link/mobile/events"
         if (cursor > 0) headers += "Last-Event-ID" to cursor.toString()
         val response = try {
             HostHttp.execute(
                 host,
                 HostHttp.DshRequest(
                     method = "GET",
-                    path = "/dsh-link/mobile/events",
+                    path = path,
                     headers = headers,
                     connectTimeoutMs = 8_000,
                     readTimeoutMs = 90_000,
@@ -177,23 +181,20 @@ class HostEventClient(
     private suspend fun dispatch(name: String, body: String, seq: Long?) {
         when (name) {
             "session/state" -> {
-                val obj = JSONObject(body)
-                val sessionId = obj.optString("sessionId")
-                if (sessionId.isBlank()) return
+                val fields = parseHostStateFields(body, seq) ?: return
                 _items.send(
                     Item.State(
-                        sessionId = sessionId,
-                        state = obj.optString("state"),
-                        title = obj.optString("title"),
-                        origin = obj.optString("origin"),
-                        seq = seq ?: obj.optLong("seq"),
-                        notify = obj.optBoolean("notify", true),
-                        // optString 缺键返回 ""，这里要的是「有没有」，空串统一成 null。
-                        approvalId = obj.optString("approvalId").takeIf { it.isNotBlank() },
-                        approvalToolName = obj.optString("approvalToolName").takeIf { it.isNotBlank() },
-                        approvalDetail = obj.optString("approvalDetail").takeIf { it.isNotBlank() },
-                        questionId = obj.optString("questionId").takeIf { it.isNotBlank() },
-                        questionText = obj.optString("questionText").takeIf { it.isNotBlank() },
+                        sessionId = fields.sessionId,
+                        state = fields.state,
+                        title = fields.title,
+                        origin = fields.origin,
+                        seq = fields.seq,
+                        notify = fields.notify,
+                        approvalId = fields.approvalId,
+                        approvalToolName = fields.approvalToolName,
+                        approvalDetail = fields.approvalDetail,
+                        questionId = fields.questionId,
+                        questionText = fields.questionText,
                     ),
                 )
             }

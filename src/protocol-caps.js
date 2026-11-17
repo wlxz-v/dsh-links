@@ -21,10 +21,11 @@ export function parseClientCaps(raw) {
 }
 
 /**
- * @param {{ changes?: boolean }} [host] changes：Host 挂载了 workspaceChanges 服务
- *   （DSH 0.1.7 起的 `@deepseek-ai/dsh-workspace-changes`）。旧 App 忽略未知字段。
+ * @param {{ changes?: boolean, host?: object }} [input] changes：Host 挂载了 workspaceChanges
+ *   服务（DSH 0.1.7 起的 `@deepseek-ai/dsh-workspace-changes`）；host：宿主能力探针的结论
+ *   （`{ checkedAt, missing, unknown }`，见 host-probe.js）。旧 App 忽略未知字段。
  */
-export function pluginCapabilities({ changes = false } = {}) {
+export function pluginCapabilities({ changes = false, host } = {}) {
   return {
     protocol: PLUGIN_PROTOCOL,
     sync: { resync: true, catchupIntegrity: true },
@@ -43,7 +44,11 @@ export function pluginCapabilities({ changes = false } = {}) {
     // 连接诊断。旧 App 忽略未知字段；没声明时 App 不展示主机诊断报告。
     diagnostics: { v: 1 },
     // 主机级会话状态流。旧 App 忽略未知字段，仍只订阅单个会话。
-    events: { host: true },
+    // since：/mobile/events 除了 Last-Event-ID 头，也接受 ?since=<seq> 续传。
+    events: { host: true, since: true },
+    // 宿主能力实测结论：missing 里的入口在宿主上不存在，App 据此隐藏对应按钮，
+    // 而不是点下去才收到 400。checkedAt 为 0 表示还没探测完（App 先按「可能在」处理）。
+    ...(host && typeof host === "object" ? { host } : {}),
     // 已批准的本机预览端口。detect=1 表示可以列出工具输出里看到的端口。旧 App 忽略未知字段。手机不能批准端口。
     preview: { v: 1, detect: 1 },
   }

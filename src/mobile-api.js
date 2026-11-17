@@ -322,7 +322,10 @@ export async function handleMobileApi(req, res, targetPort, state, stateFile, de
       return json(res, 200, {
         version: 1,
         protocol: PLUGIN_PROTOCOL,
-        capabilities: pluginCapabilities({ changes: Boolean(workspaceChangesService(rt.workspaceChanges)) }),
+        capabilities: pluginCapabilities({
+          changes: Boolean(workspaceChangesService(rt.workspaceChanges)),
+          host: rt.hostProbe?.capabilities?.(),
+        }),
         host: { name: hostname(), deviceId: state.deviceId },
         device: { name: device.name },
         sessions,

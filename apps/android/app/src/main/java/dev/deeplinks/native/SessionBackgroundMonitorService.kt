@@ -200,6 +200,9 @@ class SessionBackgroundMonitorService : Service() {
                     HostEventClient.Item.Resync -> {
                         sessionStates.clear()
                         activeSince.clear()
+                        // 游标越界时断线期间的帧已经拿不回来了：重拉一次快照，把「还在等审批 /
+                        // 等回答」的待办补回来，否则重连后通知栏会漏掉那一条（E2）。
+                        resyncPendingState(currentHost, sid)
                     }
                     HostEventClient.Item.Disconnected -> {
                         if (client.lastFailure == StreamFailure.AUTH) stopMonitoring()
@@ -476,6 +479,23 @@ class SessionBackgroundMonitorService : Service() {
                     DshNotifier.cancelApproval(this@SessionBackgroundMonitorService, host, sid)
                     DshNotifier.openSession(this@SessionBackgroundMonitorService, host, sid)
                 }
+            }
+        }
+    }
+
+    /**
+     * resync-required 之后补一次待办：只关心「这一轮还在等人答」的情况。
+     * 审批/澄清都会在 /requests 快照里留下记录，重拉后按原来的提示通路补发通知。
+     */
+    private fun resyncPendingState(host: Host, sid: String) {
+        serviceScope.launch(Dispatchers.IO) {
+            val session = runCatching {
+                MobileApiClient(host).getSessions().sessions.firstOrNull { it.sessionId == sid }
+            }.getOrNull() ?: return@launch
+            withContext(Dispatchers.Main) {
+                if (sessionId != sid || !background) return@withContext
+                if (session.running) sessionStates[sid] = "running"
+                if (session.awaitingInput) reconcilePendingApproval(host, sid)
             }
         }
     }

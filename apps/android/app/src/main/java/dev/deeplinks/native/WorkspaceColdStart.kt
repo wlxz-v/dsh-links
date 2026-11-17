@@ -74,6 +74,7 @@ internal suspend fun WorkspaceViewModel.runColdStartBootstrap(
         CrashRecorder.breadcrumb("bootstrap", "done ${boot.sessions.size}")
         StartupTrace.mark("bootstrap_done", "${boot.sessions.size}")
         filesTreeSupported.value = boot.filesTree
+        hostMissing.value = boot.hostMissing
         sessionControl.supported.value = boot.sessionControl
         previewSupported.value = boot.preview
         previewDetect.value = boot.previewDetect

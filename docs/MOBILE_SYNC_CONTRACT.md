@@ -25,7 +25,9 @@
 
 `capabilities.diagnostics: { v: 1 }` 表示可以拉连接诊断，见下方「连接诊断」。旧 App 忽略该字段。
 
-`capabilities.events: { host: true }` 表示可以订阅 `GET /dsh-link/mobile/events`（设备 token，SSE）。事件只有会话级状态，不包含消息正文和工具参数：`id` 为单调 seq，`event: session/state`，正文 `{ type, sessionId, state, title, origin, seq, notify? }`。`state` 为 `running` / `awaitingApproval` / `awaitingInput` / `completed` / `failed` / `stopped`，`origin` 为 `user` / `subagent` / `schedule`。DSH 没有全局会话事件时，插件只在有订阅者的情况下每 5 秒对 `session.list` 做差分。心跳为 25 秒的 `event: heartbeat`。请求带 `Last-Event-ID`：缓冲里接得上就补发，接不上发 `event: resync-required`。`notify` 只在为 `false` 时下发：同一会话 60 秒内重复出现的同一种终态（自动重试里的瞬时失败、轮询抖动）标记为不必再通知，App 据此少响一次；缺省即通知。旧 App 忽略该键。`state` 为 `awaitingApproval` 时还会带 `approvalId`（待办审批 id）、`approvalToolName`（工具名，截断到 64 字符）与 `approvalDetail`（这次要做什么：命令原文、文件路径等，截断到 600 字符）：App 后台收到后可以直接弹出带「允许一次 / 拒绝」的通知，并在通知展开区显示工作内容，不必等用户打开该会话（双端审批）。三个键只在确有挂起审批、且该值存在时出现，老插件不发，旧 App 忽略该键。`state` 为 `awaitingInput` 时带 `questionId`（待办澄清 id）与 `questionText`（第一题的标题或题干，截断到 200 字符），App 后台据此弹「有一道选择题在等你 + 在问什么」；同样只在非空时出现，标题/题干变化也按变化下发。旧 App 忽略该能力。
+`capabilities.events: { host: true }` 表示可以订阅 `GET /dsh-link/mobile/events`（设备 token，SSE）。事件只有会话级状态，不包含消息正文和工具参数：`id` 为单调 seq，`event: session/state`，正文 `{ type, sessionId, state, title, origin, seq, notify? }`。`state` 为 `running` / `awaitingApproval` / `awaitingInput` / `completed` / `failed` / `stopped`，`origin` 为 `user` / `subagent` / `schedule`。DSH 没有全局会话事件时，插件只在有订阅者的情况下每 5 秒对 `session.list` 做差分。心跳为 25 秒的 `event: heartbeat`。请求带 `Last-Event-ID`（或等价的查询串 `?since=<seq>`：有些中间层会剥掉自定义头，两个都认）——缓冲里接得上就补发，接不上发 `event: resync-required`；App 收到 `resync-required` 后应重拉一次 `GET /dsh-link/mobile/sessions` 与待办快照，把断线期间的「等审批 / 等回答」补回通知栏（旧 App 只清状态表，影响仅限漏一条通知）。`notify` 只在为 `false` 时下发：同一会话 60 秒内重复出现的同一种终态（自动重试里的瞬时失败、轮询抖动）标记为不必再通知，App 据此少响一次；缺省即通知。旧 App 忽略该键。`state` 为 `awaitingApproval` 时还会带 `approvalId`（待办审批 id）、`approvalToolName`（工具名，截断到 64 字符）与 `approvalDetail`（这次要做什么：命令原文、文件路径等，截断到 600 字符）：App 后台收到后可以直接弹出带「允许一次 / 拒绝」的通知，并在通知展开区显示工作内容，不必等用户打开该会话（双端审批）。三个键只在确有挂起审批、且该值存在时出现，老插件不发，旧 App 忽略该键。`state` 为 `awaitingInput` 时带 `questionId`（待办澄清 id）与 `questionText`（第一题的标题或题干，截断到 200 字符），App 后台据此弹「有一道选择题在等你 + 在问什么」；同样只在非空时出现，标题/题干变化也按变化下发。旧 App 忽略该能力。
+
+`capabilities.host: { v: 1, checkedAt, missing: [...], unknown: [...] }` 是插件对本机宿主实测结果（B1）：`missing` 里是这台 DSH 上确实没有的 Remote 名（如 `schedule.edit`），`unknown` 是探测超时/无法判定的。App 应按 `missing` 隐藏对应入口（例如没有 `schedule.edit` 就不显示定时任务），而不是让用户点进去吃一次失败；`unknown` 不要据此隐藏任何东西。`checkedAt` 是毫秒时间戳，0 表示还没探完；没有该对象 = 老插件，按「没有已知缺口」处理。同一份结论也出现在回环诊断的 `host.probe` 行。
 
 `capabilities.preview: { v: 1, detect: 1 }` 表示可以列已批准的本机预览，并且可以列出工具输出里看到的端口。`v` 仍是 1，旧 App 只认 `v` 时预览入口不变。`detect` 是新增字段，旧 App 忽略。手机不能批准端口。
 
@@ -269,3 +271,9 @@ DSH 结果映射：`allowed-once`/`rejected` → `resolved`；`cancelled` → `c
 - **回退**：旧插件不下发该键时，App 把这一行当作「已完成」（方案 3.6 的明文回退）；**图标与文案
   必须同时按这一个判断走**，否则会出现「已完成」配灰底方块的自相矛盾（这正是 2026-09-29 真机走查
   抓到的第 5 处问题）。
+
+## 条件请求（ETag / 304，D1）
+
+200 的 JSON 响应带 `etag`（弱校验值，按**压缩后**的字节计算：`gzip` 与 `identity` 的同一份内容 ETag 不同），并保留 `vary: accept-encoding`。客户端再次请求同一路径时带 `If-None-Match: <etag>`，命中回 `304`（无正文、无 `content-length`、无 `content-encoding`，保留 `etag` 与 `vary`）。
+
+App 侧按「电脑 + 路径」在内存里记 `etag + 上次正文`：304 直接复用正文，非 2xx 时丢弃该条。缓存只在进程内、最多 24 条，不做持久化 —— 冷启动后第一次仍是 200。

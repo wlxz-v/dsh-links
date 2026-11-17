@@ -2177,7 +2177,7 @@ fun WorkspaceScreen(
                 onUsage = { showUsage = true },
                 previewSupported = workspaceViewModel.previewSupported.value, onPreview = { showPreviewSheet = true },
                 canGoal = workspaceViewModel.sessionControl.goal.value?.manageable == true, onGoal = { showGoalEdit = true },
-                canSchedules = workspaceViewModel.sessionControl.supported.value, onSchedules = { showSchedules = true },
+                canSchedules = workspaceViewModel.schedulesAvailable(), onSchedules = { showSchedules = true },
                 onRename = { currentSession?.let { openRename(it) } },
                 onFork = { currentSessionId?.let { forkNow(it) } },
                 onShare = { showShareSheet = true },

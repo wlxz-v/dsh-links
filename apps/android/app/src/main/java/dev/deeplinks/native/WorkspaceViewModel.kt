@@ -117,6 +117,12 @@ internal class WorkspaceViewModel(
     /** 插件是否支持工作区文件树（bootstrap capabilities.files.tree）。 */
     val filesTreeSupported = mutableStateOf(false)
 
+    /**
+     * 这台电脑上实测缺失的宿主能力（bootstrap capabilities.host.missing，B1）。
+     * 缺失的入口直接藏，别让用户点进去才看到 404 / 失败提示。老插件不发 → 空集。
+     */
+    val hostMissing = mutableStateOf<Set<String>>(emptySet())
+
     /** 插件可以列已批准的预览端口（capabilities.preview）。 */
     val previewSupported = mutableStateOf(false)
 
@@ -143,6 +149,15 @@ internal class WorkspaceViewModel(
 
     /** 排队消息 / 结构化目标 / 定时任务（插件 capabilities.control）。 */
     val sessionControl = SessionControlController(viewModelScope, { client }, { currentSessionId.value }) { refreshMessages() }
+
+    /**
+     * 定时任务入口是否该出现：插件宣告了 control，且宿主实测有 schedule 的 Remote（B1）。
+     * 宿主的 scheduled-task 写法在 0.2.x 换成了 schedule/edit，老插件探测不到就不再呈现入口。
+     */
+    fun schedulesAvailable(): Boolean =
+        sessionControl.supported.value &&
+            "schedule.edit" !in hostMissing.value &&
+            "schedule.catalog" !in hostMissing.value
 
     init {
         // 监听会话切换：切换时清空旧 goal，等 refreshMessages 再填入

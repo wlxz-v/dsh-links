@@ -1,5 +1,12 @@
 ## 未发布（main）
 
+**双端契约、宿主能力探针、断线补传与 ETag（B1/B2/E2/D1）**
+
+- 宿主能力探针（B1）：新增 `src/host-probe.js`，用只读 Remote 实测这台 DSH 有没有插件依赖的能力（`schedule.catalog`、`agentPreset.list`、`settings.describe`、`llm.listProviders`、`credentials.describe`、`workspace.list`），写接口 `schedule.edit` 用「指向不存在 id 的 delete」探测——不会真删，只有明确「方法缺失」才算不支持，not-found 视为支持。启动后就并发探测（并发 4、单次 3 秒超时），结果缓存 5 分钟；诊断新增 `host.probe` 行（缺失/未知分别计数），`capabilities.host` 交给 App 把对应入口藏起来。
+- 协议向量（B2）：新增 `spec/protocol-vectors.json`，把 `session/state`（含 `notify` / `approvalId` / `approvalDetail` / `questionId` / `questionText`）、`event: question`、`question-resolved`、`resync-required`、`/requests` 快照与 `capabilities` 的形状写成一份可执行契约。插件侧 `test/protocol-vectors.test.mjs` 与 App 侧 `ProtocolVectorsTest.kt` 读**同一份文件**：谁改了帧而另一边没跟上，测试立刻红。
+- 断线补传（E2）：主机事件流除了 `Last-Event-ID` 头，也接受 `?since=<seq>`（有些中间层会剥掉自定义头）。游标还在环形缓冲里就补发断线期间的事件，够不着就发 `resync-required`；App 收到后重拉一次快照，把「还在等审批/等回答」的待办补回通知栏。
+- ETag / 304（D1）：200 的 JSON 响应带 `etag`（按**压缩后的字节**算，gzip 与 identity 各自一个表示），客户端带 `If-None-Match` 命中时回 304 且保留 `vary`。App 每条 GET 记住「路径 → etag + 正文」，304 直接复用，省掉会话列表、bootstrap、待办快照的整段传输。
+
 **双端澄清（多题依次选择也能推到手机）**
 
 - 根因：`user-questions/request` 钩子以前只在「手机正看着这个会话」时才接管；电脑端开着会话时插件直接 `next()`，手机端连待办记录都不建，所以「多道题依次选择」的澄清卡永远到不了手机（打开会话也看不到）。

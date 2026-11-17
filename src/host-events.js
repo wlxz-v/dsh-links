@@ -316,6 +316,18 @@ export function createHostEventHub({
   }
 }
 
+/**
+ * 续传游标。浏览器 EventSource 只能带 Last-Event-ID 头；有些客户端（以及对
+ * 代理/中间层不信任的场景）拿不到自定义头，就用 ?since=<seq>。两处都按正整数解析，
+ * 非法值一律当「没有游标」，让订阅从快照开始而不是从 0 号事件开始乱补。
+ */
+export function parseHostCursor(value) {
+  const raw = String(value ?? "").trim()
+  if (!/^\d{1,12}$/.test(raw)) return null
+  const seq = Number(raw)
+  return Number.isSafeInteger(seq) && seq > 0 ? seq : null
+}
+
 export function handleHostEvents(req, res, hub) {
   res.writeHead(200, {
     "content-type": "text/event-stream; charset=utf-8",
@@ -325,7 +337,13 @@ export function handleHostEvents(req, res, hub) {
   })
   res.flushHeaders?.()
   try { res.socket?.setNoDelay?.(true) } catch {}
-  const last = req?.headers?.["last-event-id"]
-  const unsubscribe = hub.subscribe(res, last)
+  let since = null
+  try {
+    since = parseHostCursor(new URL(req?.url ?? "/", "http://localhost").searchParams.get("since"))
+  } catch {
+    since = null
+  }
+  const cursor = since ?? parseHostCursor(req?.headers?.["last-event-id"])
+  const unsubscribe = hub.subscribe(res, cursor != null ? String(cursor) : null)
   res.on("close", unsubscribe)
 }

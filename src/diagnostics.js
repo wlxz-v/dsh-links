@@ -28,8 +28,8 @@ const IPV4 = /^(?:\d{1,3}\.){3}\d{1,3}$/
 const LONG_HEX = /^[0-9a-f]{16,}$/i
 
 const CHECKS = Object.freeze({
-  mobile: ["host.rpc", "host.services", "plugin.version", "tls.cert", "pairing.devices", "mobile.streams", "remote.relay", "clock"],
-  panel: ["host.rpc", "host.services", "plugin.version", "tls.cert", "pairing.devices", "listen.addresses", "mobile.streams", "remote.relay", "clock"],
+  mobile: ["host.rpc", "host.services", "host.probe", "plugin.version", "tls.cert", "pairing.devices", "mobile.streams", "remote.relay", "clock"],
+  panel: ["host.rpc", "host.services", "host.probe", "plugin.version", "tls.cert", "pairing.devices", "listen.addresses", "mobile.streams", "remote.relay", "clock"],
 })
 
 export function tlsExpiryMs(certPem) {
@@ -89,7 +89,10 @@ export function hostDiagnosticsSource(input = {}) {
     plugin: {
       version: PLUGIN_VERSION,
       protocol: PLUGIN_PROTOCOL,
-      capabilities: pluginCapabilities({ changes: Boolean(services.workspaceChanges) }),
+      capabilities: pluginCapabilities({
+        changes: Boolean(services.workspaceChanges),
+        host: input.host,
+      }),
     },
     tls: fingerprint ? { fingerprint, notAfterMs } : null,
     devices: input.devices,
@@ -97,6 +100,7 @@ export function hostDiagnosticsSource(input = {}) {
     listenHosts: input.listenHosts,
     streams: input.streams ?? null,
     remote: input.remote,
+    hostProbe: input.host ?? null,
   }
 }
 
@@ -114,6 +118,7 @@ export async function runDiagnostics(rt, { scope } = {}) {
   const byId = {
     "host.rpc": await checkHostRpc(source),
     "host.services": checkServices(source),
+    "host.probe": checkHostProbe(source),
     "plugin.version": checkPlugin(source),
     "tls.cert": checkTls(source, nowMs),
     "pairing.devices": checkPairing(source, scope),
@@ -198,6 +203,26 @@ function checkServices(rt) {
   return row("host.services", "ok", "HOST_SERVICES_OK", detail)
 }
 
+/**
+ * 宿主能力实测（B1）：插件把手机端入口依赖的 Remote 各调一次，结论按 missing / unknown / supported
+ * 计数上报。detail 只放数字——Remote 名字里的点号过不了 ENUM_STRING 校验。
+ */
+function checkHostProbe(rt) {
+  const probe = rt.hostProbe
+  if (!probe || typeof probe !== "object") {
+    return row("host.probe", "skip", "HOST_PROBE_UNKNOWN", {})
+  }
+  const supported = Array.isArray(probe.supported) ? probe.supported.length : 0
+  const missing = Array.isArray(probe.missing) ? probe.missing.length : 0
+  const unknown = Array.isArray(probe.unknown) ? probe.unknown.length : 0
+  const total = Number.isSafeInteger(probe.total) ? probe.total : supported + missing + unknown
+  const detail = { total, supported, missing, unknown }
+  if (!probe.checkedAt) return row("host.probe", "skip", "HOST_PROBE_PENDING", detail)
+  if (missing > 0) return row("host.probe", "warn", "HOST_PROBE_MISSING", detail)
+  if (unknown > 0) return row("host.probe", "warn", "HOST_PROBE_PARTIAL", detail)
+  return row("host.probe", "ok", "HOST_PROBE_OK", detail)
+}
+
 function checkPlugin(rt) {
   const plugin = rt.plugin ?? {}
   const protocol = Number(plugin.protocol)
@@ -208,6 +233,11 @@ function checkPlugin(rt) {
   if (caps && typeof caps === "object") {
     for (const key of ["sync", "questions", "requests", "control", "files", "diagnostics"]) {
       if (caps[key] != null) detail[`cap${key[0].toUpperCase()}${key.slice(1)}`] = true
+    }
+    // 宿主能力实测已出结论时带上缺口数量，方便面板一眼看出「入口被隐藏了」的原因。
+    if (caps.host && typeof caps.host === "object" && Number.isSafeInteger(caps.host.checkedAt) && caps.host.checkedAt > 0) {
+      detail.capHost = true
+      detail.hostMissing = Array.isArray(caps.host.missing) ? caps.host.missing.length : 0
     }
   }
   if (!detail.protocol) return row("plugin.version", "fail", "PLUGIN_VERSION_INVALID", detail)

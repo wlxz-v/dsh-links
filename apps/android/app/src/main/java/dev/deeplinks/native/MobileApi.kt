@@ -4,6 +4,8 @@ import dev.deeplinks.core.DshStrings
 import dev.deeplinks.core.BoundedIo
 import dev.deeplinks.core.Host
 import dev.deeplinks.core.HostHttp
+import dev.deeplinks.core.conditionalJsonGet
+import dev.deeplinks.core.parseMissingHostRemotes
 import dev.deeplinks.core.L
 import dev.deeplinks.core.fileIntegrityFailed
 import dev.deeplinks.core.PinnedSsl
@@ -174,6 +176,8 @@ data class MobileBootstrap(
     val preview: Boolean = false,
     /** 插件可以从工具输出里看到本机端口（capabilities.preview.detect = 1）。手机不能批准。 */
     val previewDetect: Boolean = false,
+    /** 实测缺失的宿主能力（capabilities.host.missing）；对应入口直接藏，老插件不发为空集。 */
+    val hostMissing: Set<String> = emptySet(),
 )
 
 data class SessionRequestState(
@@ -741,6 +745,7 @@ class MobileApiClient(private val host: Host) {
             sessionControl = root.optJSONObject("capabilities")?.optJSONObject("control")?.optBoolean("queue") == true,
             preview = root.optJSONObject("capabilities")?.optJSONObject("preview")?.optInt("v") == 1,
             previewDetect = root.optJSONObject("capabilities")?.optJSONObject("preview")?.optInt("detect") == 1,
+            hostMissing = parseMissingHostRemotes(root.optJSONObject("capabilities")?.optJSONObject("host")),
         )
         return info to applyBootstrapRemote(host, root)
     }
@@ -1128,30 +1133,18 @@ class MobileApiClient(private val host: Host) {
         val connectMs = 8_000
         val readMs = 12_000
         try {
-            HostHttp.execute(
-                host,
-                HostHttp.DshRequest(
-                    method = method,
-                    path = path,
-                    body = body?.toString()?.toByteArray(Charsets.UTF_8),
-                    // F3：不要把 Accept-Encoding 写死成 identity —— 那样服务端永远不会压，
-                    // 会话列表这类 JSON 在局域网/中继上要多传 10 倍左右。交给 OkHttp 自己加
-                    // gzip 并透明解压（只有它自己加的编码它才会解，所以这里必须完全不写）。
-                    // 走流式的 SSE / 文件下载仍显式 identity（见 SessionStreamClient、getSessionFile）。
-                    headers = dshAuthHeaders() + listOf("Accept" to "application/json"),
-                    connectTimeoutMs = connectMs,
-                    readTimeoutMs = readMs,
-                ),
-            ).use { response ->
-                val code = response.code
-                val text = response.body.byteStream().use { BoundedIo.readText(it, maxBytes) }
-                if (code !in 200..299) {
-                    val msg = parseMobileApiError(code, text)
-                    if (code == 401 || code == 403) throw MobileAuthException(msg, code)
-                    throw MobileApiHttpException(code, text, msg)
-                }
-                return JSONObject(text)
+            // D1：GET 走条件请求（ETag/304）。缓存键、If-None-Match 与 304 复用都在
+            // core/JsonConditionalGet.kt 里，这里只把状态码变成 App 自己的异常。
+            val result = conditionalJsonGet(host, path, dshAuthHeaders(), connectMs, readMs, maxBytes)
+            if (result.code == 304 && result.text.isEmpty()) {
+                throw MobileApiHttpException(304, "", "资源未修改但本地没有副本，请重试")
             }
+            if (result.code !in 200..299) {
+                val msg = parseMobileApiError(result.code, result.text)
+                if (result.code == 401 || result.code == 403) throw MobileAuthException(msg, result.code)
+                throw MobileApiHttpException(result.code, result.text, msg)
+            }
+            return JSONObject(result.text)
         } catch (e: MobileAuthException) {
             Log.w("MobileApi", "$method ${redactRequestPath(path)} remote=${HostHttp.isViaRemote(host)} auth ${e.code}: ${e.message}")
             throw e

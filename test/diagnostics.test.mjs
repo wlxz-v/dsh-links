@@ -104,7 +104,7 @@ test("面板范围：全部通过时 1 秒内出结果，且只有枚举和数�
   assert.equal(report.version, 1)
   assert.equal(report.generatedAt, Math.floor(NOW / 1000))
   assert.deepEqual(report.checks.map((item) => item.id), [
-    "host.rpc", "host.services", "plugin.version", "tls.cert", "pairing.devices", "listen.addresses", "mobile.streams", "remote.relay", "clock",
+    "host.rpc", "host.services", "host.probe", "plugin.version", "tls.cert", "pairing.devices", "listen.addresses", "mobile.streams", "remote.relay", "clock",
   ])
   assert.equal(check(report, "host.rpc").status, "ok")
   assert.equal(check(report, "host.rpc").code, "HOST_RPC_OK")
@@ -142,7 +142,7 @@ test("mobile.streams：手机端连着时报告后台事件流与查看者数量
 test("手机范围不泄露面板字段、其他设备或地址", async () => {
   const report = await runDiagnostics(healthy(), { scope: "mobile" })
   assert.deepEqual(report.checks.map((item) => item.id), [
-    "host.rpc", "host.services", "plugin.version", "tls.cert", "pairing.devices", "mobile.streams", "remote.relay", "clock",
+    "host.rpc", "host.services", "host.probe", "plugin.version", "tls.cert", "pairing.devices", "mobile.streams", "remote.relay", "clock",
   ])
   assert.equal(check(report, "pairing.devices").code, "PAIRING_SELF_OK")
   assert.deepEqual(check(report, "pairing.devices").detail, { valid: true })
@@ -208,6 +208,34 @@ test("host.services：缺可选服务是 warn，缺必需服务或读不到是 f
 
   const unavailable = await runDiagnostics(healthy({ services: null }), { scope: "panel" })
   assert.equal(check(unavailable, "host.services").code, "HOST_SERVICES_UNAVAILABLE")
+})
+
+test("host.probe：宿主能力实测结果按 missing / unknown 计数上报", async () => {
+  const pending = await runDiagnostics(healthy({ hostProbe: undefined }), { scope: "panel" })
+  assert.equal(check(pending, "host.probe").status, "skip")
+  assert.equal(check(pending, "host.probe").code, "HOST_PROBE_UNKNOWN")
+
+  const notChecked = await runDiagnostics(healthy({
+    hostProbe: { checkedAt: 0, total: 7, supported: [], missing: [], unknown: [] },
+  }), { scope: "panel" })
+  assert.equal(check(notChecked, "host.probe").code, "HOST_PROBE_PENDING")
+
+  const missing = await runDiagnostics(healthy({
+    hostProbe: { checkedAt: NOW, total: 7, supported: ["a", "b"], missing: ["c"], unknown: [] },
+  }), { scope: "panel" })
+  assert.equal(check(missing, "host.probe").status, "warn")
+  assert.equal(check(missing, "host.probe").code, "HOST_PROBE_MISSING")
+  assert.deepEqual(check(missing, "host.probe").detail, { total: 7, supported: 2, missing: 1, unknown: 0 })
+
+  const partial = await runDiagnostics(healthy({
+    hostProbe: { checkedAt: NOW, total: 7, supported: ["a"], missing: [], unknown: ["b"] },
+  }), { scope: "panel" })
+  assert.equal(check(partial, "host.probe").code, "HOST_PROBE_PARTIAL")
+
+  const ok = await runDiagnostics(healthy({
+    hostProbe: { checkedAt: NOW, total: 7, supported: ["a", "b", "c"], missing: [], unknown: [] },
+  }), { scope: "mobile" })
+  assert.equal(check(ok, "host.probe").code, "HOST_PROBE_OK")
 })
 
 test("plugin.version：没有版本字符串是 warn，没有协议号是 fail，路径不会被当成版本", async () => {
