@@ -552,18 +552,19 @@ internal fun WorkspaceTopBar(
  */
 internal fun LazyListScope.chatEmptyCanvas(
     kind: ChatCanvasKind,
-    elapsedSec: Long,
+    elapsedSec: Long = 0L,
     historyLoadError: String?,
     onRetry: () -> Unit,
+    elapsedTimer: TurnElapsedTimer? = null,
 ) {
     when (kind) {
-        ChatCanvasKind.Loading -> item(key = "chat-loading-skeleton") {
+        ChatCanvasKind.Loading -> item(key = "chat-loading-skeleton", contentType = "chat-empty-loading") {
             ChatLoadingSkeleton()
         }
-        ChatCanvasKind.Working -> item(key = "turn-status") {
-            ThinkingStatusRow(elapsedSec)
+        ChatCanvasKind.Working -> item(key = "turn-status", contentType = "turn-status") {
+            if (elapsedTimer != null) ThinkingStatusRow(elapsedTimer) else ThinkingStatusRow(elapsedSec)
         }
-        ChatCanvasKind.Error -> item(key = "chat-load-error") {
+        ChatCanvasKind.Error -> item(key = "chat-load-error", contentType = "chat-empty-error") {
             // 与空态 hero 同一骨架：整屏居中，而不是贴在顶部
             Box(
                 modifier = Modifier
@@ -580,7 +581,7 @@ internal fun LazyListScope.chatEmptyCanvas(
             }
         }
         // 空会话只留白：起点是输入框占位句，不放标语和品牌标志
-        ChatCanvasKind.Empty, ChatCanvasKind.Content -> item(key = "empty-hero") {
+        ChatCanvasKind.Empty, ChatCanvasKind.Content -> item(key = "empty-hero", contentType = "chat-empty-hero") {
             Box(Modifier.fillParentMaxSize())
         }
     }

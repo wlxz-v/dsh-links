@@ -21,6 +21,8 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.Immutable
+import androidx.compose.runtime.Stable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -137,6 +139,7 @@ private fun ToolSummaryCard(summary: MessageGroup.ToolSummary, onOpenTrace: () -
  * 回调在调用时读取最新值。真正的 IO（审批/提问/反馈/重生成）留在类里，
  * 与原先内联在 composable 中的行为一一对应。
  */
+@Stable
 internal class ChatFeedActions(
     private val client: MobileApiClient,
     private val scope: CoroutineScope,
@@ -270,16 +273,21 @@ internal class ChatFeedActions(
 }
 
 /**
- * 消息列表渲染（从 WorkspaceScreen 的 LazyColumn 抽出，COM-001 拆解）。
- * 纯展示 + 通过 [actions] 触发副作用。
+ * 预计算完成的消息流视图模型：在 LazyColumn 外部 remember，避免滚动或 chrome 高度微调时重跑折叠与切块。
  */
-internal fun LazyListScope.chatMessageItems(
+@Immutable
+internal data class PreparedChatFeed(
+    val rows: List<ChatFeedRow>,
+    val turnEnds: Set<String>,
+    val turnChanges: Map<String, MobileMessage>,
+    val turnModelById: Map<String, String>,
+)
+
+internal fun prepareChatFeed(
     visibleGroups: List<MessageGroup>,
-    sweepingId: String?,
-    actions: ChatFeedActions,
     isRunning: Boolean = false,
     pinnedChangesSeq: Long? = null,
-) {
+): PreparedChatFeed {
     val groups = if (pinnedChangesSeq == null) {
         visibleGroups
     } else {
@@ -298,28 +306,55 @@ internal fun LazyListScope.chatMessageItems(
     // 轮尾元信息的模型名（4.3）：只认本轮出现过的模型切换标记，不伪造逐条模型字段
     val turnModelById = turnEndModelLabels(foldedGroups, turnEnds)
     val rows = chatFeedRows(foldedGroups, isRunning)
+    return PreparedChatFeed(rows, turnEnds, turnChanges, turnModelById)
+}
+
+/**
+ * 消息列表渲染（从 WorkspaceScreen 的 LazyColumn 抽出，COM-001 拆解）。
+ * 纯展示 + 通过 [actions] 触发副作用。
+ */
+internal fun LazyListScope.chatMessageItems(
+    visibleGroups: List<MessageGroup>,
+    sweepingId: String?,
+    actions: ChatFeedActions,
+    isRunning: Boolean = false,
+    pinnedChangesSeq: Long? = null,
+) = chatMessageItems(
+    prepared = prepareChatFeed(visibleGroups, isRunning, pinnedChangesSeq),
+    sweepingId = sweepingId,
+    actions = actions,
+)
+
+internal fun chatRowContentType(row: ChatFeedRow): String = when (val g = row.group) {
+    is MessageGroup.ToolGroup -> "toolgroup"
+    is MessageGroup.ToolSummary -> "toolsummary"
+    is MessageGroup.Single -> if (row.partCount > 1) "assistant-part" else "single-${g.msg.role}"
+}
+
+internal fun LazyListScope.chatMessageItems(
+    prepared: PreparedChatFeed,
+    sweepingId: String?,
+    actions: ChatFeedActions,
+) {
     items(
-        items = rows,
+        items = prepared.rows,
         key = { it.key },
-        contentType = { row: ChatFeedRow ->
-            when {
-                row.group is MessageGroup.ToolGroup -> "toolgroup"
-                row.group is MessageGroup.ToolSummary -> "toolsummary"
-                row.partCount > 1 -> "assistant-part"
-                else -> "single"
-            }
-        },
+        contentType = ::chatRowContentType,
     ) { row: ChatFeedRow ->
         val group = row.group
-        // 入场只交给 animateItem：AnimatedVisibility(visible = true) 首帧即可见，enter 永远不会播。
-        // 仅本机刚收到的消息（entrance）淡入；历史分页、切会话载入的消息直接出现。
+        // 入场只交给 animateItem：仅本机刚收到的消息（entrance）挂入场动画节点；
+        // 历史消息不挂 animateItem，避免几百条消息在高速滑动时维护放置动画层。
         val live = group is MessageGroup.Single && group.msg.entrance
-        Box(
-            modifier = Modifier.animateItem(
-                fadeInSpec = if (live) tween(motionDuration(DshDuration.normal), easing = DshEasing.out) else null,
+        val rowModifier = if (live) {
+            Modifier.animateItem(
+                fadeInSpec = tween(motionDuration(DshDuration.normal), easing = DshEasing.out),
+                placementSpec = null,
                 fadeOutSpec = null,
-            ),
-        ) {
+            )
+        } else {
+            Modifier
+        }
+        Box(modifier = rowModifier) {
             when (group) {
                 is MessageGroup.Single -> {
                     MessageItem(
@@ -335,12 +370,12 @@ internal fun LazyListScope.chatMessageItems(
                         onRetract = actions.onRetract(group.msg),
                         onFetchProducedFile = actions.onFetchProducedFile(group.msg),
                         onOpenChanges = actions.openChanges,
-                        showActions = group.msg.id in turnEnds,
-                        turnModelLabel = turnModelById[group.msg.id],
+                        showActions = group.msg.id in prepared.turnEnds,
+                        turnModelLabel = prepared.turnModelById[group.msg.id],
                         isTurnEnd = row.isTurnEnd,
                         textPart = row.part,
                         isLastPart = row.partIndex == row.partCount - 1,
-                        turnChanges = turnChanges[group.msg.id],
+                        turnChanges = prepared.turnChanges[group.msg.id],
                     )
                 }
                 is MessageGroup.ToolGroup -> ToolGroupHeader(
@@ -354,6 +389,7 @@ internal fun LazyListScope.chatMessageItems(
     }
 }
 /** 消息流里的一行：普通分组原样一行；长助手回复按 Markdown 块拆成多行（各自独立测量）。 */
+@Immutable
 internal data class ChatFeedRow(
     val group: MessageGroup,
     val key: String,

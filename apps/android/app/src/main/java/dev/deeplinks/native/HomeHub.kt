@@ -5,12 +5,12 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListScope
+import androidx.compose.foundation.lazy.items
 import androidx.compose.runtime.remember
 import dev.deeplinks.core.L
 import dev.deeplinks.core.homeSearchContentMatches
 import dev.deeplinks.core.homeSearchTitleMatches
 import dev.deeplinks.native.ui.v4.DlIconButton
-import dev.deeplinks.native.util.homeSearchGroups
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -84,14 +84,17 @@ internal fun HomeHeader(
 ) {
     val s = DshS
     val status = s.homeStatusLine.format(hostName.ifBlank { s.deviceAndPairing }, if (online) s.statusOnline else s.statusOffline)
+    val actions = remember(s, onOpenSearch, onOpenSettings) {
+        listOf(
+            DlTopBarAction(SearchOutline16, s.searchSessions, onOpenSearch),
+            DlTopBarAction(SettingsOutline16, s.settingsTitle, onOpenSettings),
+        )
+    }
     DlTopBar(
         title = "DeepLinks",
         large = true,
         nav = DlTopBarNav.None,
-        actions = listOf(
-            DlTopBarAction(SearchOutline16, s.searchSessions, onOpenSearch),
-            DlTopBarAction(SettingsOutline16, s.settingsTitle, onOpenSettings),
-        ),
+        actions = actions,
         onSubtitleClick = onOpenComputer,
         subtitleContent = {
             DlStatusDot(if (online) DlTone.Ok else DlTone.Off)
@@ -450,49 +453,50 @@ internal fun HomeSearchPage(
     actions: WorkspaceSidebarActions,
     statusItems: LazyListScope.(Boolean) -> Unit,
 ) {
-    val groups = remember(scoped, needle, searchResults) {
-        homeSearchGroups(scoped, needle, searchResults.associate { it.sessionId to it.snippet })
+    val s = DshS
+    val groups = remember(scoped, needle, searchResults, s) {
+        prepareHomeSearchGroups(scoped, needle, searchResults)
     }
     Column(Modifier.fillMaxSize()) {
         Row(
             modifier = Modifier.fillMaxWidth().padding(start = DshSpace.s4, end = DshSpace.s16, top = DshSpace.s4),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            DlIconButton(ArrowLeftOutline16, DshS.back, onBack)
+            DlIconButton(ArrowLeftOutline16, s.back, onBack)
             Spacer(Modifier.width(DshSpace.s4))
             SidebarSearchField(
                 value = query,
                 onValueChange = actions.onSearchQueryChange,
-                onClear = { actions.onClearSearch() },
+                onClear = actions.onClearSearch,
                 loading = loading,
                 modifier = Modifier.weight(1f),
             )
         }
         HomeWorkspaceChips(workspaces = workspaces, selected = activeWorkspace, onSelect = onSelectWorkspace)
         LazyColumn(Modifier.weight(1f).fillMaxWidth(), contentPadding = PaddingValues(bottom = DshSpace.s32)) {
-            statusItems(groups.titleMatches.isEmpty() && groups.contentMatches.isEmpty())
+            statusItems(groups.isEmpty)
             if (groups.titleMatches.isNotEmpty()) {
-                item(key = "search-title-header") {
+                item(key = "search-title-header", contentType = "search-section-header") {
                     DlSectionHeader(if (needle.isEmpty()) L.homeRecent else L.homeSearchTitleMatches)
                 }
-                groups.titleMatches.forEachIndexed { index, s ->
-                    item(key = "search-title-${s.sessionId}") {
-                        Column {
-                            if (index > 0) HomeDivider()
-                            HomeSearchRow(s, snippet = null, needle = needle, onClick = { actions.onSelectSession(s.sessionId) })
-                        }
-                    }
+                items(
+                    items = groups.titleMatches,
+                    key = { "search-title-${it.sessionId}" },
+                    contentType = { "search-row" },
+                ) { row ->
+                    PreparedHomeSearchItem(row = row, needle = needle, onSelectSession = actions.onSelectSession)
                 }
             }
             if (groups.contentMatches.isNotEmpty()) {
-                item(key = "search-content-header") { DlSectionHeader(L.homeSearchContentMatches) }
-                groups.contentMatches.forEachIndexed { index, (s, snippet) ->
-                    item(key = "search-content-${s.sessionId}") {
-                        Column {
-                            if (index > 0) HomeDivider()
-                            HomeSearchRow(s, snippet = snippet, needle = needle, onClick = { actions.onSelectSession(s.sessionId) })
-                        }
-                    }
+                item(key = "search-content-header", contentType = "search-section-header") {
+                    DlSectionHeader(L.homeSearchContentMatches)
+                }
+                items(
+                    items = groups.contentMatches,
+                    key = { "search-content-${it.sessionId}" },
+                    contentType = { "search-row" },
+                ) { row ->
+                    PreparedHomeSearchItem(row = row, needle = needle, onSelectSession = actions.onSelectSession)
                 }
             }
         }

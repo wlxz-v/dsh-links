@@ -33,6 +33,12 @@ import dev.deeplinks.native.util.redactRequestPath
 
 class MobileApiClient(private val host: Host) {
 
+    @Volatile
+    private var cachedSessionsSnapshot: Pair<String, MobileSessionSnapshot>? = null
+
+    @Volatile
+    private var cachedWorkspacesCatalog: Pair<String, MobileWorkspaceCatalog>? = null
+
     /** 会话模型目录（当前模型 + 供应商分组模型列表）。 */
     fun getModels(sessionId: String): MobileModelCatalog {
         val root = request("GET", "/dsh-link/mobile/models?sessionId=" + java.net.URLEncoder.encode(sessionId, "UTF-8"))
@@ -104,7 +110,11 @@ class MobileApiClient(private val host: Host) {
 
     /** 工作区列表（含服务端已归档会话 id，用于跨设备同步隐藏）。 */
     fun getWorkspaces(): MobileWorkspaceCatalog {
-        val root = request("GET", "/dsh-link/mobile/workspaces")
+        val raw = requestGetRaw("/dsh-link/mobile/workspaces")
+        cachedWorkspacesCatalog?.let { (prevRaw, prevCatalog) ->
+            if (prevRaw === raw || prevRaw == raw) return prevCatalog
+        }
+        val root = JSONObject(raw)
         val arr = root.optJSONArray("workspaces") ?: org.json.JSONArray()
         val workspaces = (0 until arr.length()).mapNotNull { i ->
             parseMobileWorkspace(arr.optJSONObject(i))
@@ -118,7 +128,7 @@ class MobileApiClient(private val host: Host) {
             workspaces = workspaces,
             archivedSessionIds = archivedIds,
             archiveSnapshotAvailable = archived != null,
-        )
+        ).also { cachedWorkspacesCatalog = raw to it }
     }
 
     /** 按会话设置权限预设（对标 web 当前会话权限）。 */
@@ -227,7 +237,11 @@ class MobileApiClient(private val host: Host) {
     }
 
     fun getSessions(): MobileSessionSnapshot {
-        val root = request("GET", "/dsh-link/mobile/sessions")
+        val raw = requestGetRaw("/dsh-link/mobile/sessions")
+        cachedSessionsSnapshot?.let { (prevRaw, prevSnapshot) ->
+            if (prevRaw === raw || prevRaw == raw) return prevSnapshot
+        }
+        val root = JSONObject(raw)
         val sessions = root.optJSONArray("sessions") ?: org.json.JSONArray()
         val archived = root.optJSONArray("archivedSessionIds")
         val archivedArray = archived ?: org.json.JSONArray()
@@ -239,7 +253,7 @@ class MobileApiClient(private val host: Host) {
                 archivedArray.optString(index).takeIf { it.isNotBlank() }
             }.toSet(),
             archiveSnapshotAvailable = archived != null,
-        )
+        ).also { cachedSessionsSnapshot = raw to it }
     }
 
     fun getSessionHistory(sessionId: String, beforeSeq: Long? = null, maxMessages: Int? = null): HistoryResult =
@@ -571,36 +585,56 @@ class MobileApiClient(private val host: Host) {
         request("POST", "/dsh-link/mobile/revoke", body)
     }
 
+    private fun requestGetRaw(
+        path: String,
+        maxBytes: Int = BoundedIo.MAX_JSON_BODY_BYTES,
+    ): String {
+        if (host.token.isBlank()) throw MobileAuthException("缺少或无效的连接 token", 401)
+        val connectMs = 8_000
+        val readMs = 12_000
+        try {
+            // D1：仅幂等 GET 走条件请求（ETag/304）；304 且有缓存副本时直接复用原始文本引用，免重解析大 JSON。
+            val result = conditionalJsonGet(host, path, dshAuthHeaders(), connectMs, readMs, maxBytes)
+            if (result.code == 304) {
+                if (result.text.isEmpty()) {
+                    throw MobileApiHttpException(304, "", "资源未修改但本地没有副本，请重试")
+                }
+                return result.text
+            }
+            if (result.code !in 200..299) {
+                val msg = parseMobileApiError(result.code, result.text)
+                if (result.code == 401 || result.code == 403) {
+                    JsonHttpCache.clearHost(host.slotKey)
+                    throw MobileAuthException(msg, result.code)
+                }
+                throw MobileApiHttpException(result.code, result.text, msg)
+            }
+            return result.text
+        } catch (e: MobileAuthException) {
+            runCatching { Log.w("MobileApi", "GET ${redactRequestPath(path)} remote=${HostHttp.isViaRemote(host)} auth ${e.code}: ${e.message}") }
+            throw e
+        } catch (e: MobileApiHttpException) {
+            runCatching { Log.w("MobileApi", "GET ${redactRequestPath(path)} remote=${HostHttp.isViaRemote(host)} http ${e.httpCode}: ${e.message}") }
+            throw e
+        } catch (e: Exception) {
+            val friendly = friendlyNetworkError(e)
+            runCatching { Log.w("MobileApi", "GET ${redactRequestPath(path)} remote=${HostHttp.isViaRemote(host)} ${e.javaClass.simpleName}: ${e.message}") }
+            throw IllegalStateException(friendly, e)
+        }
+    }
+
     private fun request(
         method: String,
         path: String,
         body: JSONObject? = null,
         maxBytes: Int = BoundedIo.MAX_JSON_BODY_BYTES,
     ): JSONObject {
+        if (method == "GET") return JSONObject(requestGetRaw(path, maxBytes))
         if (host.token.isBlank()) throw MobileAuthException("缺少或无效的连接 token", 401)
         // 远程路径的超时由 HostHttp 按路由放宽；这里只给局域网的值
         val connectMs = 8_000
         val readMs = 12_000
         try {
-            if (method == "GET") {
-                // D1：仅幂等 GET 走条件请求（ETag/304）；304 且有缓存副本时直接复用，不进非 2xx 分支。
-                val result = conditionalJsonGet(host, path, dshAuthHeaders(), connectMs, readMs, maxBytes)
-                if (result.code == 304) {
-                    if (result.text.isEmpty()) {
-                        throw MobileApiHttpException(304, "", "资源未修改但本地没有副本，请重试")
-                    }
-                    return JSONObject(result.text)
-                }
-                if (result.code !in 200..299) {
-                    val msg = parseMobileApiError(result.code, result.text)
-                    if (result.code == 401 || result.code == 403) {
-                        JsonHttpCache.clearHost(host.slotKey)
-                        throw MobileAuthException(msg, result.code)
-                    }
-                    throw MobileApiHttpException(result.code, result.text, msg)
-                }
-                return JSONObject(result.text)
-            }
             // POST / PUT / DELETE 保留真实 HTTP 方法与请求体；无请求体时补 Content-Type 以通过服务端 CSRF 门禁。
             val writeHeaders = buildList {
                 addAll(dshAuthHeaders())

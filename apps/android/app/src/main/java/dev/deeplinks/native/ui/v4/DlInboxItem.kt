@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -49,16 +50,16 @@ fun DlInboxItem(
     highlight: String? = null,
 ) {
     val hit = Dsh.brand400
+    val hasHighlight = !highlight.isNullOrBlank()
+    val clickModifier = if (onClick != null || onLongClick != null) {
+        Modifier.combinedClickable(onLongClick = onLongClick, onClick = onClick ?: {})
+    } else {
+        Modifier
+    }
     Column(
         modifier = modifier
             .fillMaxWidth()
-            .then(
-                if (onClick != null || onLongClick != null) {
-                    Modifier.combinedClickable(onLongClick = onLongClick, onClick = { onClick?.invoke() })
-                } else {
-                    Modifier
-                },
-            )
+            .then(clickModifier)
             .padding(horizontal = DshSpace.s20, vertical = DshSpace.s12),
         verticalArrangement = Arrangement.spacedBy(DshSpace.s4),
     ) {
@@ -85,22 +86,37 @@ fun DlInboxItem(
                     modifier = Modifier.weight(1f, fill = false),
                 )
             }
-            Text(time, style = DshType.caption, color = Dsh.tertiaryText, maxLines = 1)
+            if (time.isNotEmpty()) {
+                Text(time, style = DshType.caption, color = Dsh.tertiaryText, maxLines = 1)
+            }
         }
-        Text(dlHighlighted(title, highlight, hit), style = DshType.bodyStrong, color = Dsh.labelPrimary, maxLines = 2, overflow = TextOverflow.Ellipsis)
+        // 无搜索高亮时走 Text(String) 单段快速布局节点（避免 AnnotatedString / MultiParagraph 开销）
+        if (hasHighlight) {
+            val highlightedTitle = remember(title, highlight, hit) { dlHighlighted(title, highlight, hit) }
+            Text(highlightedTitle, style = DshType.bodyStrong, color = Dsh.labelPrimary, maxLines = 2, overflow = TextOverflow.Ellipsis)
+        } else {
+            Text(title, style = DshType.bodyStrong, color = Dsh.labelPrimary, maxLines = 2, overflow = TextOverflow.Ellipsis)
+        }
         if (preview != null) {
             Row(
                 horizontalArrangement = Arrangement.spacedBy(DshSpace.s8),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 if (running) DlSpinner()
-                Text(dlHighlighted(preview, highlight, hit), style = DshType.supporting, color = Dsh.labelSecondary, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                if (hasHighlight) {
+                    val highlightedPreview = remember(preview, highlight, hit) { dlHighlighted(preview, highlight, hit) }
+                    Text(highlightedPreview, style = DshType.supporting, color = Dsh.labelSecondary, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                } else {
+                    Text(preview, style = DshType.supporting, color = Dsh.labelSecondary, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                }
             }
         }
         if (command != null) {
+            val baseCaption = DshType.caption
+            val monoCaption = remember(baseCaption) { baseCaption.copy(fontFamily = FontFamily.Monospace) }
             Text(
                 command,
-                style = DshType.caption.copy(fontFamily = FontFamily.Monospace),
+                style = monoCaption,
                 color = Dsh.labelPrimary,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,

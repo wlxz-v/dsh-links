@@ -39,6 +39,52 @@ fun runningSubagentCount(sessions: List<MobileSession>, parentId: String, seen: 
     return children.count { it.running } + children.sumOf { runningSubagentCount(sessions, it.sessionId, nextSeen) }
 }
 
+/**
+ * 批量预计算每个父会话下运行中的子智能体总数（O(N) 建索引 + 记忆化遍历）。
+ * 避免首页 LazyColumn 在逐行组合/滑动时对每条可见会话重复全表扫描。
+ */
+fun runningSubagentCountsByParent(sessions: List<MobileSession>): Map<String, Int> {
+    var byParent: HashMap<String, MutableList<MobileSession>>? = null
+    for (s in sessions) {
+        val pid = s.parentSessionId
+        if (s.origin == "subagent" && !pid.isNullOrBlank()) {
+            val map = byParent ?: HashMap<String, MutableList<MobileSession>>().also { byParent = it }
+            map.getOrPut(pid) { ArrayList(2) }.add(s)
+        }
+    }
+    val childrenByParent = byParent ?: return emptyMap()
+    val memo = HashMap<String, Int>(childrenByParent.size)
+    fun countFor(parentId: String, visiting: MutableSet<String>): Pair<Int, Boolean> {
+        if (parentId.isBlank()) return 0 to false
+        if (!visiting.add(parentId)) return 0 to true
+        memo[parentId]?.let {
+            visiting.remove(parentId)
+            return it to false
+        }
+        val children = childrenByParent[parentId]
+        var total = 0
+        var hitCycle = false
+        if (children != null) {
+            for (child in children) {
+                if (child.running) total++
+                val (subCount, subCycle) = countFor(child.sessionId, visiting)
+                total += subCount
+                if (subCycle) hitCycle = true
+            }
+        }
+        visiting.remove(parentId)
+        if (!hitCycle) memo[parentId] = total
+        return total to hitCycle
+    }
+    val out = HashMap<String, Int>(childrenByParent.size)
+    val visiting = HashSet<String>(8)
+    for (parentId in childrenByParent.keys) {
+        val (count, _) = countFor(parentId, visiting)
+        if (count > 0) out[parentId] = count
+    }
+    return out
+}
+
 fun buildSubagentTree(sessions: List<MobileSession>, rootId: String?, seen: Set<String> = emptySet()): List<SubagentNode> {
     if (rootId.isNullOrBlank() || rootId in seen || !hostExposesSubagentParent(sessions)) return emptyList()
     val nextSeen = seen + rootId

@@ -182,49 +182,6 @@ fun WorkspaceScreen(
     // feedbackSupported=false 时（插件未提供 /feedback 路由）隐藏赞踩，避免死按钮。
     var messageFeedback by remember { mutableStateOf(emptyMap<String, Pair<String, String>>()) }
     var feedbackSupported by remember { mutableStateOf(false) }
-    LaunchedEffect(currentSessionId) {
-        val sid = currentSessionId
-        if (sid == null) {
-            messageFeedback = emptyMap()
-            feedbackSupported = false
-            return@LaunchedEffect
-        }
-        // 打开会话时订阅可能还没注册（插件对活跃订阅有校验），短暂重试；
-        // 路由不存在（404）则立即放弃并隐藏赞踩。
-        var result: Map<String, Pair<String, String>>? = null
-        var attempt = 0
-        while (result == null && attempt < 6) {
-            attempt++
-            val outcome: Pair<Map<String, Pair<String, String>>?, Boolean> = withContext(Dispatchers.IO) {
-                try {
-                    val root = client.getMessageFeedback(sid)
-                    val items = root.optJSONObject("value")?.optJSONArray("items") ?: org.json.JSONArray()
-                    val map = buildMap<String, Pair<String, String>> {
-                        for (i in 0 until items.length()) {
-                            val o = items.optJSONObject(i) ?: continue
-                            val id = o.optString("messageId")
-                            val rating = o.optString("rating")
-                            val ver = o.optString("version")
-                            if (id.isNotBlank() && rating.isNotBlank()) put(id, rating to ver)
-                        }
-                    }
-                    map to false
-                } catch (e: Exception) {
-                    val msg = e.message.orEmpty()
-                    null to (msg.contains("404") || msg.contains("not found"))
-                }
-            }
-            val map = outcome.first
-            if (map != null) {
-                result = map
-                break
-            }
-            if (outcome.second) break
-            kotlinx.coroutines.delay(1200)
-        }
-        messageFeedback = result ?: emptyMap()
-        feedbackSupported = result != null
-    }
     var loadOlderFailed by workspaceViewModel.loadOlderFailed
     // 首次加载（当前会话有内容前的第一条 history 请求 in-flight）：驱动 ChatLoadingSkeleton
     var initialLoadInFlight by workspaceViewModel.initialLoadInFlight
@@ -305,6 +262,44 @@ fun WorkspaceScreen(
     val displayDest = chrome.displayDest
     val showSessionHome = chrome.showSessionHome
     val chatVisible = chrome.chatVisible
+    LaunchedEffect(currentSessionId, chatVisible) {
+        val sid = currentSessionId
+        if (sid == null) {
+            messageFeedback = emptyMap()
+            feedbackSupported = false
+            return@LaunchedEffect
+        }
+        if (!chatVisible) return@LaunchedEffect
+        var result: Map<String, Pair<String, String>>? = null
+        var attempt = 0
+        while (result == null && attempt < 6) {
+            attempt++
+            val outcome: Pair<Map<String, Pair<String, String>>?, Boolean> = withContext(Dispatchers.IO) {
+                try {
+                    val root = client.getMessageFeedback(sid)
+                    val items = root.optJSONObject("value")?.optJSONArray("items") ?: org.json.JSONArray()
+                    val map = buildMap<String, Pair<String, String>> {
+                        for (i in 0 until items.length()) {
+                            val o = items.optJSONObject(i) ?: continue
+                            val id = o.optString("messageId")
+                            val rating = o.optString("rating")
+                            val ver = o.optString("version")
+                            if (id.isNotBlank() && rating.isNotBlank()) put(id, rating to ver)
+                        }
+                    }
+                    map to false
+                } catch (e: Exception) {
+                    val msg = e.message.orEmpty()
+                    null to (msg.contains("404") || msg.contains("not found"))
+                }
+            }
+            if (outcome.first != null) { result = outcome.first; break }
+            if (outcome.second) break
+            delay(1200)
+        }
+        messageFeedback = result ?: emptyMap()
+        feedbackSupported = result != null
+    }
     PersistComposerDrafts(
         prefs = workspacePrefs,
         slotKey = host.slotKey,
@@ -387,7 +382,9 @@ fun WorkspaceScreen(
     }
     /** 服务端已注册工作区（含 sessionIds；侧栏 / 选择器以此为准）。 */
     var workspaceCatalogItems by remember { mutableStateOf<List<MobileWorkspace>>(emptyList()) }
-    val workspaceRegistry = workspaceCatalogItems.map { normalizeWorkspacePath(it.path) }.filter { it.isNotBlank() }
+    val workspaceRegistry = remember(workspaceCatalogItems) {
+        workspaceCatalogItems.map { normalizeWorkspacePath(it.path) }.filter { it.isNotBlank() }
+    }
     val workspaceAccounts = remember(workspaceCatalogItems) {
         workspaceCatalogItems.map { WorkspaceAccount(it.path, it.sessionIds) }
     }
@@ -522,7 +519,8 @@ fun WorkspaceScreen(
         takePictureLauncher.launch(uri)
     }
     val listState = rememberLazyListState()
-    var elapsedSec by remember { mutableStateOf(0L) }
+    val homeListState = rememberLazyListState()
+    val sidebarListState = rememberLazyListState()
     // WI-003：尾部定位请求（每次自增触发一次"等待布局后再滚底"）；0 表示无请求
     var tailRequestId by remember { mutableStateOf(0) }
     var lastTailRequestId by remember { mutableStateOf(0) }
@@ -556,8 +554,8 @@ fun WorkspaceScreen(
     val streamClient = currentSessionId?.takeIf { chatVisible }?.let { workspaceViewModel.acquireStream(it) }
     var streamEverConnected by remember(currentSessionId) { mutableStateOf(false) }
     var streamQuietElapsed by remember(currentSessionId) { mutableStateOf(false) }
-    // 最近一次 SSE 活动（任意事件帧）；看门狗用它识别「连接看似健康但事件停流」的半开状态。
-    var lastStreamEventAt by remember(currentSessionId) { mutableLongStateOf(0L) }
+    // 最近一次 SSE 活动（任意事件帧）；看门狗用它识别「连接看似健康但事件停流」的半开状态（不走 Compose State，避免流式高频写快照锁）。
+    val lastStreamEventAt = remember(currentSessionId) { java.util.concurrent.atomic.AtomicLong(0L) }
     LaunchedEffect(currentSessionId) {
         streamQuietElapsed = false
         delay(1_500)
@@ -744,8 +742,9 @@ fun WorkspaceScreen(
     workspaceViewModel.authListener = { error -> onAuthExpired(error) }
 
     fun applySessionList(list: List<MobileSession>, selectLatest: Boolean = false): String? {
+        if (list === sessions && !selectLatest) return currentSessionId
         val previousSessionId = currentSessionId
-        sessions = list
+        if (list != sessions) sessions = list
         val nextSessionId = reconciledSessionId(
             currentSessionId = previousSessionId,
             sessions = list,
@@ -794,7 +793,7 @@ fun WorkspaceScreen(
         }.filter { it.path.isNotBlank() }
         val nextPaths = nextItems.map { it.path }
         val nextSet = nextPaths.toSet()
-        workspaceCatalogItems = nextItems
+        if (nextItems != workspaceCatalogItems) workspaceCatalogItems = nextItems
         workspaceRegistryReady = true
         val reconciled = reconcileDeletedWorkspaces(nextPaths, deletedWorkspaces)
         if (reconciled != deletedWorkspaces) {
@@ -1417,7 +1416,7 @@ fun WorkspaceScreen(
     fun applyStreamItem(item: SessionStreamClient.Item) {
         when (item) {
             is SessionStreamClient.Item.Ready -> {
-                lastStreamEventAt = System.currentTimeMillis()
+                lastStreamEventAt.set(System.currentTimeMillis())
                 workspaceViewModel.refreshRequestSnapshot()
                 // 服务端 stream 游标领先本地 history 标记时补一次全量（多设备/重启）
                 if (seedMaxSeq > 0 && item.resumeSeq > seedMaxSeq) {
@@ -1428,7 +1427,7 @@ fun WorkspaceScreen(
             // 交给下方「SSE 未就绪时」的 2s 轮询兜底，避免风暴 + 后台 binder 流量。
             is SessionStreamClient.Item.Disconnected -> {}
             is SessionStreamClient.Item.Stats -> {
-                lastStreamEventAt = System.currentTimeMillis()
+                lastStreamEventAt.set(System.currentTimeMillis())
                 sessionStats = parseMobileSessionStats(item.projections).also { workspaceViewModel.sessionControl.applyProjections(item.projections) }
             }
             is SessionStreamClient.Item.Question -> {
@@ -1474,7 +1473,7 @@ fun WorkspaceScreen(
                 refreshMessages(autoScroll = false, replaceInFlight = true)
             }
             is SessionStreamClient.Item.Message -> {
-                lastStreamEventAt = System.currentTimeMillis()
+                lastStreamEventAt.set(System.currentTimeMillis())
                 handleStreamMessage(item)
                 streamClient?.noteCommittedSeq(item.seq)
             }
@@ -1651,6 +1650,13 @@ fun WorkspaceScreen(
             pollTick++
             val sid = currentSessionId
             if (!isForeground) continue
+            if (!chatVisible) {
+                if (pollTick % 5 == 0) refreshWorkspaces()
+                if (!homeListState.isScrollInProgress && !sidebarListState.isScrollInProgress) {
+                    refreshSessions(reportFailure = false)
+                }
+                continue
+            }
             val streamClientRef = streamClient
             val streamReady = streamClientRef != null && streamClientRef.isConnected && streamClientRef.isSeeded
             // Web delete/archive is represented only by workspace.archivedSessionIds;
@@ -1670,9 +1676,10 @@ fun WorkspaceScreen(
             // 停在错误编号空间导致事件全被去重丢弃（实机曾见 maxSeq≫stream seq）。
             // 强制 resync（清游标 + 从历史页重播种）并刷新消息，避免视图冻结到重进会话。
             val busyNow = liveRunning || isSending || (sessions.find { it.sessionId == sid }?.running == true)
-            if (busyNow && lastStreamEventAt > 0 && System.currentTimeMillis() - lastStreamEventAt > 12_000) {
-                Log.w("WorkspaceActivity", "stream watchdog: running but silent ${System.currentTimeMillis() - lastStreamEventAt}ms sid=${sid.take(8)}, forcing resync")
-                lastStreamEventAt = System.currentTimeMillis()
+            val lastEventMs = lastStreamEventAt.get()
+            if (busyNow && lastEventMs > 0 && System.currentTimeMillis() - lastEventMs > 12_000) {
+                Log.w("WorkspaceActivity", "stream watchdog: running but silent ${System.currentTimeMillis() - lastEventMs}ms sid=${sid.take(8)}, forcing resync")
+                lastStreamEventAt.set(System.currentTimeMillis())
                 streamClientRef.pauseForResync()
                 refreshMessages(autoScroll = true)
                 continue
@@ -1759,23 +1766,12 @@ fun WorkspaceScreen(
         wasRunning = running
     }
 
-    // 正在执行时的计时器（从 running 变 true 起算）
-    var turnStartTime by remember { mutableStateOf(0L) }
-    LaunchedEffect(running) {
-        if (running) turnStartTime = System.currentTimeMillis()
-        if (!running) {
-            elapsedSec = 0L
-            return@LaunchedEffect
-        }
-        while (true) {
-            delay(1000)
-            elapsedSec = (System.currentTimeMillis() - turnStartTime) / 1000
-        }
-    }
+    // 正在执行时的计时器（读秒状态隔离在 TurnElapsedTimer 内，避免每秒唤醒整棵 WorkspaceScreen）
+    val elapsedTimer = rememberTurnElapsedTimer(running)
 
     // ===== 整体框架：宽屏常驻侧栏；手机/Medium 是会话列表 → 聊天的返回栈 =====
     // （布局 / displayDest / showSessionHome 已在文件前部推导，S6 起 chatVisible 供预加载判断。）
-    val changesProgress by changesPanel.progress.asState()
+    val changesPanelClosed by remember { derivedStateOf { changesPanel.progress.value <= 0f } }
     val navMotionMs = motionDuration(DshDuration.slow)
     var sidebarCollapsed by remember { mutableStateOf(false) }
     // 归档撤销 Snackbar + 下拉刷新/输入区测量状态。
@@ -1802,7 +1798,7 @@ fun WorkspaceScreen(
     }
 
     var showShareSheet by remember { mutableStateOf(false) }
-    val sidebarActions = WorkspaceSidebarActions(
+    val sidebarActions = rememberStableSidebarActions(WorkspaceSidebarActions(
         onOpenDevice = { onOpenDevice(null) },
         onNewSession = { openNewTaskDraft() },
         onSelectSession = { sid ->
@@ -1846,7 +1842,7 @@ fun WorkspaceScreen(
         onRetrySessions = { refreshSessions() },
         onAddWorkspace = { showAddWorkspace = true },
         onOpenSettings = onOpenSettings,
-    )
+    ))
 
     // 首页顶栏连接状态（稿 01/08）：首页没有会话 SSE，在线与延迟只能来自 30s 一次的健康探测；
     // 探测不到就按离线显示，并用 LastOnlineStore 的时间戳写「离线 · N 分钟前在线」。
@@ -2009,13 +2005,24 @@ fun WorkspaceScreen(
                 }
 
     // 空态起手式（W4）：带着那句话去开新任务，而不是丢掉参数只开面板。
-    val onPickStarter: (String) -> Unit = { text -> openNewTaskDraft(prefill = text) }
+    val currentOpenStarter by rememberUpdatedState { text: String -> openNewTaskDraft(prefill = text) }
+    val onPickStarter: (String) -> Unit = remember { { text -> currentOpenStarter(text) } }
+    val onSelectHomeWorkspace: (String?) -> Unit = remember { { selectedHomeWorkspace = it } }
+    val onOpenArchivedSheet: () -> Unit = remember { { showArchivedSheet = true } }
+    val currentSidForApproval by rememberUpdatedState(currentSessionId)
+    val onAnswerHomeApproval: (String, String, (Boolean) -> Unit) -> Unit = remember(workspaceViewModel) {
+        { approvalId, outcome, onDone ->
+            val sid = currentSidForApproval
+            if (sid == null) onDone(false)
+            else workspaceViewModel.answerApproval(sid, approvalId, outcome, onDone)
+        }
+    }
 
     // 根容器：承载抽屉框架与置顶 Snackbar
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .onGloballyPositioned { rootHeightPx = it.size.height },
+            .onSizeChanged { if (rootHeightPx != it.height) rootHeightPx = it.height },
     ) {
     DshAdaptiveShell(
         layout = dshLayout,
@@ -2041,23 +2048,20 @@ fun WorkspaceScreen(
                 viaRemote = dev.deeplinks.native.util.HostConnectivity.viaRemote,
                 offlineSinceLabel = offlineSinceLabel,
                 selectedWorkspace = selectedHomeWorkspace,
-                onSelectWorkspace = { selectedHomeWorkspace = it },
-                onOpenArchived = { showArchivedSheet = true },
+                onSelectWorkspace = onSelectHomeWorkspace,
+                onOpenArchived = onOpenArchivedSheet,
                 onPickStarter = onPickStarter,
                 activeApproval = homePendingApproval,
-                onAnswerApproval = { approvalId, outcome, onDone ->
-                    val sid = currentSessionId
-                    if (sid == null) onDone(false)
-                    else workspaceViewModel.answerApproval(sid, approvalId, outcome, onDone)
-                },
+                onAnswerApproval = onAnswerHomeApproval,
                 containerColor = Dsh.bgDrawer,
                 collapsed = sidebarCollapsed,
                 goalSummaries = workspaceViewModel.goalSummaries.value,
+                listState = sidebarListState,
                 actions = sidebarActions,
             )
         },
     ) {
-        BackHandler(enabled = !dshLayout.persistentSidebar && !showSessionHome && changesProgress <= 0f) {
+        BackHandler(enabled = !dshLayout.persistentSidebar && !showSessionHome && changesPanelClosed) {
             showPhoneSessions()
         }
         AnimatedContent(
@@ -2102,18 +2106,15 @@ fun WorkspaceScreen(
                     viaRemote = dev.deeplinks.native.util.HostConnectivity.viaRemote,
                     offlineSinceLabel = offlineSinceLabel,
                     selectedWorkspace = selectedHomeWorkspace,
-                    onSelectWorkspace = { selectedHomeWorkspace = it },
-                    onOpenArchived = { showArchivedSheet = true },
+                    onSelectWorkspace = onSelectHomeWorkspace,
+                    onOpenArchived = onOpenArchivedSheet,
                     onPickStarter = onPickStarter,
                     activeApproval = homePendingApproval,
-                    onAnswerApproval = { approvalId, outcome, onDone ->
-                        val sid = currentSessionId
-                        if (sid == null) onDone(false)
-                        else workspaceViewModel.answerApproval(sid, approvalId, outcome, onDone)
-                    },
+                    onAnswerApproval = onAnswerHomeApproval,
                     containerColor = Dsh.bgBase,
                     collapsed = false,
                     goalSummaries = workspaceViewModel.goalSummaries.value,
+                    listState = homeListState,
                     actions = sidebarActions,
                 )
             }
@@ -2201,7 +2202,7 @@ fun WorkspaceScreen(
                 } else if (composeNewSession && currentSessionId == null) {
                     hostLabel
                 } else {
-                    chatTopSubtitle(running, currentSession?.cwd?.trimEnd('/')?.substringAfterLast('/'), hostLabel, currentSession?.activity, elapsedSec)
+                    chatTopSubtitle(running, currentSession?.cwd?.trimEnd('/')?.substringAfterLast('/'), hostLabel, currentSession?.activity, elapsedTimer.subtitleBucket)
                 },
                 onNavigate = {
                     if (traceOpen) {
@@ -2298,29 +2299,25 @@ fun WorkspaceScreen(
                             compact = false,
                         )
                     }
-                    ChatCanvasKind.Working -> Box(
-                        modifier = Modifier.fillMaxSize(),
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        ThinkingStatusRow(elapsedSec)
+                    ChatCanvasKind.Working -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        ThinkingStatusRow(elapsedTimer)
                     }
                     ChatCanvasKind.Empty, ChatCanvasKind.Content -> TrajectoryView(
                         messages = messages,
                         running = running,
-                        elapsedSec = elapsedSec,
+                        elapsedSec = 0L,
                         modifier = Modifier.fillMaxSize(),
+                        elapsedTimer = elapsedTimer,
                     )
                 }
             }
             else -> {
-
             // ===== 消息流（max-width 748 居中） =====
-            // 消息流数据推导（纯函数，见 ChatFeedDerivation.kt）：
-            // 合并历史页 → 丢弃空思考行 → 按相邻工具调用聚合 → 过滤上下文注入（C3）
-            val chatFeed = remember(olderMessages, messages) {
-                deriveChatFeed(olderMessages, messages)
-            }
+            // 消息流数据推导与折叠切块均在 LazyColumn 外 remember，避免滚动或底栏高度微调重跑
+            val chatFeed = remember(olderMessages, messages) { deriveChatFeed(olderMessages, messages) }
             val visibleGroups = chatFeed.visibleGroups
+            val preparedChatFeed = remember(visibleGroups, running) { prepareChatFeed(visibleGroups, isRunning = running) }
+            val sweepingId = remember(messages, running) { resolveSweepingId(messages, running) }
             // 消息渲染的副作用集合（COM-001 拆解）：状态用 getter/setter 注入，调用时读最新值
             val chatActions = remember(client, host, context) {
                 ChatFeedActions(
@@ -2400,43 +2397,24 @@ fun WorkspaceScreen(
                             hasHistoryError = historyLoadError != null,
                             working = running || isSending,
                         ),
-                        elapsedSec = elapsedSec,
                         historyLoadError = historyLoadError,
                         onRetry = { refreshMessages() },
+                        elapsedTimer = elapsedTimer,
                     )
                     }
             } else { // 闭合 if (messages.isEmpty())，打开 else 分支
-                    // 会话标题只保留在顶栏；消息流不再重复大标题
-                    // 加载更早（DSH chat.loadOlder：hasMore 时显示在消息流顶部，点击向前翻页）
                     if (hasMoreMessages) {
-                        item(key = "load-older") {
-                            LoadOlderRow(
-                                loading = isLoadingOlder,
-                                failed = loadOlderFailed,
-                                onClick = { loadOlderMessages() }
-                            )
+                        item(key = "load-older", contentType = "load-older") {
+                            LoadOlderRow(loading = isLoadingOlder, failed = loadOlderFailed, onClick = { loadOlderMessages() })
                         }
                     }
-                    // 只扫正在生成的工具/思考行；已定稿的「已思考」不能抢状态条
-                    val sweepingId = resolveSweepingId(messages, running)
-                    chatMessageItems(
-                        visibleGroups = visibleGroups,
-                        sweepingId = sweepingId,
-                        actions = chatActions,
-                        isRunning = running,
-                    )
-                    // 对齐网页 TurnStatus（Deep diving...）：整轮生成期间都在流尾显示思考中扫光
+                    chatMessageItems(prepared = preparedChatFeed, sweepingId = sweepingId, actions = chatActions)
                     if (shouldShowTurnStatus(messages, running || isSending)) {
-                        item(key = "turn-status") {
-                            ThinkingStatusRow(elapsedSec)
-                        }
+                        item(key = "turn-status", contentType = "turn-status") { ThinkingStatusRow(elapsedTimer) }
                     }
-                    // 已停止标记：仅在非执行态展示，避免等待新回复时误显示旧 turn 的停止态
                     val badgeReason = parseStoppedReason(stoppedReason)
                     if (badgeReason != null && !running && !isSending) {
-                        item(key = "stopped-badge") {
-                            StoppedBadge(reason = badgeReason)
-                        }
+                        item(key = "stopped-badge", contentType = "stopped-badge") { StoppedBadge(reason = badgeReason) }
                     }
                 }
             }
@@ -2533,7 +2511,7 @@ fun WorkspaceScreen(
                     .fillMaxWidth()
                     .navigationBarsPadding()
                     .imePadding()
-                    .onGloballyPositioned { composerTopPx = it.positionInRoot().y }
+                    .onGloballyPositioned { val y = it.positionInRoot().y; if (kotlin.math.abs(composerTopPx - y) >= 1f) composerTopPx = y }
             ) {
                 // 工作区 + Harness 模式（新会话草稿模式下置于输入卡上方，开聊后收拢隐藏）
                 // 发送中不堆 QueueDock；插话/引导/排队由发送槽转圈表示（状态写进动作）

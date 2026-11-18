@@ -1065,29 +1065,27 @@ private fun ManagedSessionRow(
                 Icon(EllipsisOutline16, contentDescription = null, tint = Dsh.labelTertiary, modifier = Modifier.size(DshIconSize.md))
             },
         )
-        Box(Modifier.align(Alignment.BottomEnd).padding(end = DshSpace.s16)) {
-            DshMenu(
-                expanded = menuOpen,
-                onDismiss = { menuOpen = false },
-                offset = DpOffset(0.dp, 4.dp),
-                items = listOf(
-                    DshMenuItem(UnarchiveOutline16, s.restoreToSidebar) {
-                        menuOpen = false
-                        onRestore()
-                    },
-                    DshMenuItem(TrashOutline16, s.removeFromLocalList, danger = true) {
-                        menuOpen = false
-                        onClear()
-                    },
-                ),
-            )
+        if (menuOpen) {
+            Box(Modifier.align(Alignment.BottomEnd).padding(end = DshSpace.s16)) {
+                DshMenu(
+                    expanded = true,
+                    onDismiss = { menuOpen = false },
+                    offset = DpOffset(0.dp, 4.dp),
+                    items = listOf(
+                        DshMenuItem(UnarchiveOutline16, s.restoreToSidebar) {
+                            menuOpen = false
+                            onRestore()
+                        },
+                        DshMenuItem(TrashOutline16, s.removeFromLocalList, danger = true) {
+                            menuOpen = false
+                            onClear()
+                        },
+                    ),
+                )
+            }
         }
     }
 }
 
-private fun formatSessionTime(timestamp: Long): String {
-    if (timestamp <= 0L) return ""
-    val millis = if (timestamp < 1_000_000_000_000L) timestamp * 1000 else timestamp
-    val sdf = java.text.SimpleDateFormat("MM-dd HH:mm", java.util.Locale.getDefault())
-    return sdf.format(java.util.Date(millis))
-}
+private fun formatSessionTime(timestamp: Long): String =
+    dev.deeplinks.native.util.formatMonthDayTime(timestamp)

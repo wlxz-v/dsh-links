@@ -37,9 +37,25 @@ class SubagentTreeTest {
         assertEquals(listOf("a", "b"), tree.map { it.sessionId })
         assertEquals(listOf("a1"), tree.first().children.map { it.sessionId })
         assertEquals(2, runningSubagentCount(sessions, "root"))
+        val batch = runningSubagentCountsByParent(sessions)
+        assertEquals(2, batch["root"])
+        assertEquals(1, batch["a"])
+        assertEquals(null, batch["else"])
+        assertTrue(runningSubagentCountsByParent(listOf(session("root"), session("plain"))).isEmpty())
         assertTrue(hostExposesSubagentParent(sessions))
         assertFalse(hostExposesSubagentParent(listOf(session("root"), session("plain"))))
         assertTrue(hostExposesSubagentParent(emptyList()))
         assertEquals(emptyList<SubagentNode>(), buildSubagentTree(listOf(session("root")), "root"))
+    }
+
+    @Test
+    fun batchSubagentCountsGuardAgainstCycles() {
+        val cyclic = listOf(
+            session("s1", origin = "subagent", parent = "s2", running = true),
+            session("s2", origin = "subagent", parent = "s1", running = true),
+        )
+        val counts = runningSubagentCountsByParent(cyclic)
+        assertEquals(2, counts["s1"])
+        assertEquals(2, counts["s2"])
     }
 }

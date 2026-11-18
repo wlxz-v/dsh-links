@@ -1,11 +1,14 @@
 package dev.deeplinks.native
 
+import androidx.compose.runtime.Immutable
 import dev.deeplinks.core.DshStrings
 import dev.deeplinks.core.L
 import dev.deeplinks.native.util.optNullableString
 import dev.deeplinks.native.util.optStringOrEmpty
 import dev.deeplinks.native.util.presentOrNull
 import org.json.JSONObject
+
+@Immutable
 data class MobileMessage(
     val id: String,
     val role: String, // "user", "assistant", "tool_call", "tool_result", "reasoning", "approval", "question", "compaction", "todo", "goal"
@@ -61,8 +64,10 @@ data class MobileMessage(
     val goalObjective: String? = null,
 )
 
+@Immutable
 data class MobileTodoItem(val content: String, val status: String = "pending")
 
+@Immutable
 data class HistoryResult(
     val messages: List<MobileMessage>,
     val stats: MobileSessionStats,
@@ -77,6 +82,7 @@ data class HistoryResult(
     val goalKnown: Boolean = false,
 )
 
+@Immutable
 data class MobileSession(
     val sessionId: String,
     val title: String,
@@ -105,6 +111,7 @@ data class MobileSession(
 )
 
 /** 会话当前步骤：`kind` 决定文案，`tool` 时 [label] 是命令或参数摘要。 */
+@Immutable
 data class MobileSessionActivity(
     val kind: String,
     val label: String? = null,
@@ -115,6 +122,7 @@ data class MobileSessionActivity(
 }
 
 /** 会话结果一句话：文本与改动统计都可缺。 */
+@Immutable
 data class MobileSessionResult(
     val text: String? = null,
     val files: Long? = null,
@@ -122,6 +130,7 @@ data class MobileSessionResult(
     val deleted: Long? = null,
 )
 
+@Immutable
 data class MobilePairedDevice(
     val deviceId: String,
     val name: String,
@@ -131,6 +140,7 @@ data class MobilePairedDevice(
     val via: String = "lan",
 )
 
+@Immutable
 data class MobileSearchResult(val sessionId: String, val snippet: String)
 
 data class MobilePreview(val previewId: String, val label: String, val port: Int, val expiresAt: Long)
@@ -208,6 +218,7 @@ internal fun parseSessionRequestSnapshot(root: JSONObject): SessionRequestSnapsh
     )
 }
 
+@Immutable
 data class MobileWorkspace(
     val workspaceId: String,
     val path: String,
@@ -215,6 +226,7 @@ data class MobileWorkspace(
     val sessionIds: List<String> = emptyList(),
 )
 
+@Immutable
 data class MobileWorkspaceCatalog(
     val workspaces: List<MobileWorkspace>,
     val archivedSessionIds: Set<String> = emptySet(),
@@ -223,6 +235,7 @@ data class MobileWorkspaceCatalog(
     val paths: List<String> get() = workspaces.map { it.path }
 }
 
+@Immutable
 data class MobileSessionSnapshot(
     val sessions: List<MobileSession>,
     val archivedSessionIds: Set<String> = emptySet(),

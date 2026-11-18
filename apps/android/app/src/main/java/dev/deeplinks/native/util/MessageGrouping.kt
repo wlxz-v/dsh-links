@@ -1,5 +1,6 @@
 package dev.deeplinks.native.util
 
+import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.Stable
 import dev.deeplinks.native.MobileMessage
 
@@ -15,17 +16,20 @@ import dev.deeplinks.native.MobileMessage
  * 纯函数 + 数据类，无 Android 依赖 → 可 JVM 单测。
  */
 @Stable
-interface MessageGroup {
+sealed interface MessageGroup {
     val groupKey: String
 
+    @Immutable
     data class Single(val msg: MobileMessage) : MessageGroup {
         override val groupKey: String get() = msg.id
     }
 
+    @Immutable
     data class ToolGroup(val items: List<MobileMessage>) : MessageGroup {
         override val groupKey: String get() = items.first().id + "-group"
     }
 
+    @Immutable
     data class ToolSummary(
         /** 本批第一条工具消息 id：做 LazyColumn key，保证同一会话里多轮相同工具组合也不撞 key。 */
         val firstId: String,
@@ -205,6 +209,7 @@ fun classifyTool(name: String?): ToolKind {
 }
 
 /** 一段工具活动的分类计数。 */
+@Immutable
 data class ActivityCounts(
     val command: Int = 0,
     val search: Int = 0,

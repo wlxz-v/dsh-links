@@ -60,8 +60,7 @@ import dev.deeplinks.native.ui.v4.DlChip
 import dev.deeplinks.native.ui.v4.DlChipStyle
 import dev.deeplinks.native.ui.v4.DlLabelStrong
 import dev.deeplinks.native.ui.v4.DlSpinner
-import java.text.SimpleDateFormat
-import java.util.Date
+import dev.deeplinks.native.util.formatClockTime
 
 internal fun formatTraceDuration(ms: Long): String = when {
     ms >= 1000 -> String.format(Locale.US, "+%.1fs", ms / 1000.0)
@@ -225,6 +224,7 @@ internal fun TrajectoryView(
     running: Boolean,
     elapsedSec: Long,
     modifier: Modifier = Modifier,
+    elapsedTimer: TurnElapsedTimer? = null,
 ) {
     var query by rememberSaveable { mutableStateOf("") }
     var filter by rememberSaveable { mutableStateOf(TraceFilter.All) }
@@ -240,11 +240,11 @@ internal fun TrajectoryView(
     }
 
     LazyColumn(modifier = modifier.fillMaxWidth()) {
-        item(key = "trace-search") { TraceSearchField(value = query, onValueChange = { query = it }) }
-        item(key = "trace-filters") { TraceFilterChips(filter, errorCount) { filter = it } }
+        item(key = "trace-search", contentType = "trace-search") { TraceSearchField(value = query, onValueChange = { query = it }) }
+        item(key = "trace-filters", contentType = "trace-filters") { TraceFilterChips(filter, errorCount) { filter = it } }
         when {
-            messages.isEmpty() -> item(key = "trace-empty") { TraceEmptyState() }
-            visibleTurns.isEmpty() -> item(key = "trace-filter-empty") {
+            messages.isEmpty() -> item(key = "trace-empty", contentType = "trace-status") { TraceEmptyState() }
+            visibleTurns.isEmpty() -> item(key = "trace-filter-empty", contentType = "trace-status") {
                 Text(
                     L.noTraceFilterEmpty,
                     color = Dsh.labelSecondary,
@@ -257,12 +257,14 @@ internal fun TrajectoryView(
             }
             else -> {
                 if (running) {
-                    item(key = "trace-running") {
-                        Column(Modifier.padding(horizontal = DshSpace.s16, vertical = DshSpace.s4)) { ThinkingStatusRow(elapsedSec) }
+                    item(key = "trace-running", contentType = "trace-running") {
+                        Column(Modifier.padding(horizontal = DshSpace.s16, vertical = DshSpace.s4)) {
+                            if (elapsedTimer != null) ThinkingStatusRow(elapsedTimer) else ThinkingStatusRow(elapsedSec)
+                        }
                     }
                 }
                 visibleTurns.forEach { (turn, rows) ->
-                    item(key = "trace-turn-" + turn.index) { TraceRoundHeader(turn) }
+                    item(key = "trace-turn-" + turn.index, contentType = "trace-turn-header") { TraceRoundHeader(turn) }
                     items(items = rows.asReversed(), key = { it.key }, contentType = { "trace-row" }) { row ->
                         val open = row.key in expanded
                         TraceListRow(
@@ -274,7 +276,7 @@ internal fun TrajectoryView(
                         )
                     }
                 }
-                item(key = "trace-bottom-space") { Spacer(Modifier.height(DshSpace.s24)) }
+                item(key = "trace-bottom-space", contentType = "trace-spacer") { Spacer(Modifier.height(DshSpace.s24)) }
             }
         }
     }
@@ -310,7 +312,7 @@ private fun TraceFilterChips(selected: TraceFilter, errorCount: Int, onSelect: (
 @Composable
 private fun TraceRoundHeader(turn: TraceTurn) {
     val start = turn.steps.firstOrNull { it.time > 0 }?.time
-    val time = start?.let { remember(it) { SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(it)) } }
+    val time = start?.let { remember(it) { formatClockTime(it) } }
     Row(
         modifier = Modifier
             .fillMaxWidth()

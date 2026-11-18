@@ -16,6 +16,8 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.Immutable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -39,6 +41,7 @@ import dev.deeplinks.native.DshSpace
 enum class DlTopBarNav { Back, Close, None }
 
 /** 顶栏右侧动作（最多 2 个）。 */
+@Immutable
 data class DlTopBarAction(
     val icon: ImageVector,
     val contentDescription: String,
@@ -49,6 +52,7 @@ data class DlTopBarAction(
 )
 
 /** 对话页 diff 角标：`+n −m`。 */
+@Immutable
 data class DlDiffStat(val added: Int, val removed: Int, val onClick: () -> Unit)
 
 /**

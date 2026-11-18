@@ -1,11 +1,16 @@
 package dev.deeplinks.native
 
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
+import androidx.compose.runtime.Stable
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import kotlinx.coroutines.delay
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalWindowInfo
 import androidx.compose.ui.unit.Dp
@@ -61,4 +66,34 @@ internal fun rememberWorkspaceChrome(
         showSessionHome = !layout.persistentSidebar && displayDest == sessionsDest,
         chatVisible = isChatVisible(layout.persistentSidebar, displayDest, chatDest),
     )
+}
+
+/**
+ * 执行中读秒状态隔离器：每秒递增只唤醒真正展示秒数的叶子节点（[ThinkingStatusRow]），
+ * 顶栏副标题只按分钟分桶订阅 [subtitleBucket]，避免整棵 WorkspaceScreen 与 LazyColumn 每秒重组。
+ */
+@Stable
+internal class TurnElapsedTimer {
+    var seconds by mutableLongStateOf(0L)
+    val subtitleBucket: Long by derivedStateOf {
+        val s = seconds
+        if (s <= 0L) 0L else (s / 60L).coerceAtLeast(1L) * 60L
+    }
+}
+
+@Composable
+internal fun rememberTurnElapsedTimer(running: Boolean): TurnElapsedTimer {
+    val timer = remember { TurnElapsedTimer() }
+    LaunchedEffect(running) {
+        if (!running) {
+            timer.seconds = 0L
+            return@LaunchedEffect
+        }
+        val startMs = System.currentTimeMillis()
+        while (true) {
+            delay(1000)
+            timer.seconds = (System.currentTimeMillis() - startMs) / 1000L
+        }
+    }
+    return timer
 }

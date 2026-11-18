@@ -16,6 +16,7 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.ReadOnlyComposable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -69,6 +70,7 @@ internal fun DlSpinner(modifier: Modifier = Modifier) {
 enum class DlButtonStyle { Filled, Tonal, Text, Danger }
 
 /** 一个按钮动作：组件参数用，页面不直接画按钮。 */
+@Immutable
 data class DlAction(
     val label: String,
     val onClick: () -> Unit,

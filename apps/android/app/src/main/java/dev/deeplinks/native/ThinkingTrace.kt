@@ -143,6 +143,14 @@ internal fun ThinkingTrace(
 /** 等待首 token：四角星 + 扫光「思考中」+ 计时（安静 chrome，不用像素格）。 */
 @Composable
 internal fun ThinkingStatusRow(
+    timer: TurnElapsedTimer,
+    modifier: Modifier = Modifier,
+) {
+    ThinkingStatusRow(elapsedSec = timer.seconds, modifier = modifier)
+}
+
+@Composable
+internal fun ThinkingStatusRow(
     elapsedSec: Long,
     modifier: Modifier = Modifier,
 ) {

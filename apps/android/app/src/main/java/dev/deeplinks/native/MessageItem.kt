@@ -204,63 +204,66 @@ internal fun MessageItem(
             }
         }
 
-        DshMenu(
-            expanded = menuOpen,
-            onDismiss = { menuOpen = false },
-            items = buildList {
-                add(DshMenuItem(CopyOutline16, L.copy) {
-                    menuOpen = false
-                    dshHaptic(DshHaptic.Confirm)
-                    onCopy()
-                })
-                add(DshMenuItem(FontOutline16, L.selectText) {
-                    menuOpen = false
-                    selectOpen = true
-                })
-                add(DshMenuItem(ShareOutline16, L.shareMessage) {
-                    menuOpen = false
-                    ShareIntents.shareText(context, msg.text, L.shareMessage)
-                })
-                add(DshMenuItem(QuoteOutline16, L.quote) {
-                    menuOpen = false
-                    onQuote()
-                })
-                add(DshMenuItem(BranchOutline16, L.forkSession) {
-                    menuOpen = false
-                    onFork()
-                })
-                if (onRegenerate != null) {
-                    add(DshMenuItem(RefreshOutline16, L.regenerate) {
+        // 菜单浮层只在打开时才实例化，避免每条历史消息在滚动入屏时构建 DshMenuItem 列表与 Popup 状态
+        if (menuOpen) {
+            DshMenu(
+                expanded = true,
+                onDismiss = { menuOpen = false },
+                items = buildList {
+                    add(DshMenuItem(CopyOutline16, L.copy) {
                         menuOpen = false
-                        onRegenerate()
+                        dshHaptic(DshHaptic.Confirm)
+                        onCopy()
                     })
+                    add(DshMenuItem(FontOutline16, L.selectText) {
+                        menuOpen = false
+                        selectOpen = true
+                    })
+                    add(DshMenuItem(ShareOutline16, L.shareMessage) {
+                        menuOpen = false
+                        ShareIntents.shareText(context, msg.text, L.shareMessage)
+                    })
+                    add(DshMenuItem(QuoteOutline16, L.quote) {
+                        menuOpen = false
+                        onQuote()
+                    })
+                    add(DshMenuItem(BranchOutline16, L.forkSession) {
+                        menuOpen = false
+                        onFork()
+                    })
+                    if (onRegenerate != null) {
+                        add(DshMenuItem(RefreshOutline16, L.regenerate) {
+                            menuOpen = false
+                            onRegenerate()
+                        })
+                    }
+                    if (onRate != null) {
+                        val positive = feedbackRating == "positive"
+                        add(DshMenuItem(
+                            if (positive) LikeFill16 else LikeOutline16,
+                            if (positive) L.feedbackRetract else L.feedbackLike,
+                        ) {
+                            menuOpen = false
+                            if (positive) onRetract?.invoke() else onRate("positive")
+                        })
+                        val negative = feedbackRating == "negative"
+                        add(DshMenuItem(
+                            if (negative) DislikeFill16 else DislikeOutline16,
+                            if (negative) L.feedbackRetract else L.feedbackDislike,
+                        ) {
+                            menuOpen = false
+                            if (negative) onRetract?.invoke() else onRate("negative")
+                        })
+                    }
+                    if (onFeedback != null) {
+                        add(DshMenuItem(FeedbackOutline16, L.messageFeedback) {
+                            menuOpen = false
+                            onFeedback()
+                        })
+                    }
                 }
-                if (onRate != null) {
-                    val positive = feedbackRating == "positive"
-                    add(DshMenuItem(
-                        if (positive) LikeFill16 else LikeOutline16,
-                        if (positive) L.feedbackRetract else L.feedbackLike,
-                    ) {
-                        menuOpen = false
-                        if (positive) onRetract?.invoke() else onRate("positive")
-                    })
-                    val negative = feedbackRating == "negative"
-                    add(DshMenuItem(
-                        if (negative) DislikeFill16 else DislikeOutline16,
-                        if (negative) L.feedbackRetract else L.feedbackDislike,
-                    ) {
-                        menuOpen = false
-                        if (negative) onRetract?.invoke() else onRate("negative")
-                    })
-                }
-                if (onFeedback != null) {
-                    add(DshMenuItem(FeedbackOutline16, L.messageFeedback) {
-                        menuOpen = false
-                        onFeedback()
-                    })
-                }
-            }
-        )
+            )
+        }
         if (selectOpen) {
             SelectTextDialog(text = msg.text, onDismiss = { selectOpen = false }, onCopy = onCopy, onQuote = onQuote)
         }
@@ -269,12 +272,15 @@ internal fun MessageItem(
 
 @Composable
 private fun turnEndMeta(msg: MobileMessage, turnModelLabel: String?): String {
-    val meta = remember(msg.durationMs) { buildAnswerMeta(msg.durationMs) }
-    return listOfNotNull(
-        turnModelLabel?.takeIf { it.isNotBlank() },
-        formatClockTime(msg.time).takeIf { it.isNotBlank() },
-        meta?.let { answerMetaSummary(it) }?.takeIf { it.isNotBlank() },
-    ).joinToString(" · ")
+    val s = L
+    return remember(msg.time, msg.durationMs, turnModelLabel, s) {
+        val meta = buildAnswerMeta(msg.durationMs)
+        listOfNotNull(
+            turnModelLabel?.takeIf { it.isNotBlank() },
+            formatClockTime(msg.time).takeIf { it.isNotBlank() },
+            meta?.let { answerMetaSummary(it) }?.takeIf { it.isNotBlank() },
+        ).joinToString(" · ")
+    }
 }
 
 /** 轮尾元信息 + 文字按钮（4.2）：灰字一行，下面是复制 / 重新生成 / 分享，其余收进 ⋯。 */

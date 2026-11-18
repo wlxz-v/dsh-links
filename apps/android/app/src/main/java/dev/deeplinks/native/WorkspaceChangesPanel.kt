@@ -183,10 +183,11 @@ internal fun ChangesSwipeArea(
     val edgeLeft by rememberUpdatedState(gestures.getLeft(density, layoutDirection).toFloat())
     val edgeRight by rememberUpdatedState(gestures.getRight(density, layoutDirection).toFloat())
     val panelWidthPx = with(density) { changesPanelWidthDp(windowWidth / density.density).dp.toPx() }
-    var originX by remember { mutableStateOf(0f) }
+    // 仅在手势判定时读取，不放进 Compose State，避免页面横滑转场期间每帧触发整棵聊天树重组
+    val originX = remember { FloatArray(1) }
     Box(
         modifier = modifier
-            .onGloballyPositioned { originX = it.positionInWindow().x }
+            .onGloballyPositioned { originX[0] = it.positionInWindow().x }
             .pointerInput(enabled, panelWidthPx) {
                 if (!enabled) return@pointerInput
                 detectPanelSwipe(
@@ -194,7 +195,7 @@ internal fun ChangesSwipeArea(
                     scope = scope,
                     panelWidthPx = panelWidthPx,
                     opening = true,
-                    inSystemEdge = { x -> val wx = originX + x; wx < edgeLeft || wx > windowWidth - edgeRight },
+                    inSystemEdge = { x -> val wx = originX[0] + x; wx < edgeLeft || wx > windowWidth - edgeRight },
                 )
             },
         content = content,

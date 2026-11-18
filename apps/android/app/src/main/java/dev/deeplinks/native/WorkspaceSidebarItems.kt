@@ -18,6 +18,7 @@ import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
@@ -56,6 +57,7 @@ internal enum class HomePendingKind { None, Approval, Question }
  * - [preview]：进行中写当前步骤（离线加「最后看到：」），结束写结果一句话，提问写「问：…」。
  * - [command]：审批的命令（等宽块）；拿不到参数时退回工具名。
  */
+@Immutable
 internal data class HomeInboxTexts(
     val status: String?,
     val tone: DlTone,

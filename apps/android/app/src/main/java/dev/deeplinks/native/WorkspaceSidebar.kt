@@ -11,8 +11,12 @@ import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListScope
+import androidx.compose.foundation.lazy.LazyListState
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.Stable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -21,12 +25,12 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import dev.deeplinks.core.Dsh
+import dev.deeplinks.core.DshS
 import dev.deeplinks.core.DshType
 import dev.deeplinks.core.L
 import dev.deeplinks.native.util.HostConnectivity
 import dev.deeplinks.native.util.SessionListKind
 import dev.deeplinks.native.util.WorkspaceAccount
-import dev.deeplinks.native.util.homeSections
 import dev.deeplinks.native.util.sessionListKind
 import dev.deeplinks.native.util.sessionShowsRefreshBanner
 import dev.deeplinks.native.util.sessionsInWorkspace
@@ -34,6 +38,7 @@ import dev.deeplinks.native.util.visibleUserWorkspaces
 import dev.deeplinks.native.util.workspaceDisplayName
 
 /** 侧栏回调集合（对齐 [ChatFeedActions] 模式：状态由参数注入，动作由此承载）。 */
+@Stable
 internal class WorkspaceSidebarActions(
     val onOpenDevice: () -> Unit,
     val onNewSession: () -> Unit,
@@ -88,6 +93,7 @@ internal fun WorkspaceSidebar(
     containerColor: Color,
     collapsed: Boolean = false,
     goalSummaries: Map<String, String> = emptyMap(),
+    listState: LazyListState = rememberLazyListState(),
     actions: WorkspaceSidebarActions,
 ) {
     if (collapsed) {
@@ -156,6 +162,7 @@ internal fun WorkspaceSidebar(
                 offlineSinceLabel = offlineSinceLabel,
                 pending = activeApproval,
                 goalSummaries = goalSummaries,
+                listState = listState,
                 onAnswerApproval = onAnswerApproval,
                 onSelectWorkspace = onSelectWorkspace,
                 onPickStarter = onPickStarter,
@@ -219,6 +226,7 @@ private fun HomeInboxPage(
     offlineSinceLabel: String?,
     pending: MobileMessage?,
     goalSummaries: Map<String, String>,
+    listState: LazyListState,
     onAnswerApproval: (String, String, (Boolean) -> Unit) -> Unit,
     onSelectWorkspace: (String?) -> Unit,
     onPickStarter: (String) -> Unit,
@@ -227,64 +235,69 @@ private fun HomeInboxPage(
     actions: WorkspaceSidebarActions,
     statusItems: LazyListScope.(Boolean) -> Unit,
 ) {
-    val sections = remember(scoped) { homeSections(scoped) }
+    val s = DshS
+    val sections = remember(scoped, allSessions, goalSummaries, online, s) {
+        prepareHomeSections(scoped, allSessions, goalSummaries, online)
+    }
     Box(Modifier.fillMaxSize()) {
         Column(Modifier.fillMaxSize()) {
             HomeHeader(
                 hostName = hostName,
                 online = online,
                 onOpenComputer = onOpenComputer,
-                onOpenSearch = { actions.onToggleSearch() },
-                onOpenSettings = { actions.onOpenSettings() },
+                onOpenSearch = actions.onToggleSearch,
+                onOpenSettings = actions.onOpenSettings,
             )
             HomeCrashBanner()
             LazyColumn(
+                state = listState,
                 modifier = Modifier.weight(1f).fillMaxWidth(),
                 contentPadding = PaddingValues(bottom = DshSpace.s32 + DshSpace.s32 + DshSpace.s32),
             ) {
                 if (!online) {
-                    item(key = "home-offline") {
+                    item(key = "home-offline", contentType = "home-offline") {
                         HomeOfflineBanner(
                             hostName = hostName,
                             sinceLabel = offlineSinceLabel,
                             onRetry = { HostConnectivity.requestProbe(); actions.onRetrySessions() },
-                            onDiagnose = { actions.onOpenDevice() },
+                            onDiagnose = actions.onOpenDevice,
                         )
                     }
                 }
-                item(key = "home-balance") { HomeBalanceNotice(onOpenSettings = { actions.onOpenSettings() }) }
+                item(key = "home-balance", contentType = "home-balance") {
+                    HomeBalanceNotice(onOpenSettings = actions.onOpenSettings)
+                }
                 statusItems(sections.isEmpty())
                 if (activeWorkspace != null) {
-                    item(key = "home-workspace-filter-chip") {
+                    item(key = "home-workspace-filter-chip", contentType = "home-filter-chip") {
                         HomeWorkspaceFilterChip(label = workspaceDisplayName(activeWorkspace), onClear = { onSelectWorkspace(null) })
                     }
                 }
                 if (activeWorkspace != null && scoped.isEmpty()) {
-                    item(key = "home-workspace-empty") {
+                    item(key = "home-workspace-empty", contentType = "home-empty") {
                         HomeWorkspaceEmpty({ actions.onCreateSessionIn(activeWorkspace) }, { onSelectWorkspace(null) })
                     }
                 } else if (sections.isEmpty()) {
-                    item(key = "home-empty") { HomeEmptyStarters(onPick = onPickStarter) }
+                    item(key = "home-empty", contentType = "home-empty") { HomeEmptyStarters(onPick = onPickStarter) }
                 }
-                sections.forEach { (section, rows) ->
-                    item(key = "home-section-${section.name}") { HomeSectionHeader(section, rows.size) }
-                    rows.forEachIndexed { index, s ->
-                        item(key = "home-row-${s.sessionId}") {
-                            Column(Modifier.animateItem()) {
-                                if (index > 0) HomeDivider()
-                                val rowPending = pending?.takeIf { s.sessionId == currentSessionId }
-                                HomeInboxRow(
-                                    session = s.copy(subagentCount = runningSubagentCount(allSessions, s.sessionId).takeIf { it > 0 }),
-                                    pending = rowPending,
-                                    online = online,
-                                    goalSummary = goalSummaries[s.sessionId],
-                                    onClick = { actions.onSelectSession(s.sessionId) },
-                                    onLongClick = { onLongPress(s) },
-                                    onReject = { rowPending?.approvalId?.let { onAnswerApproval(it, "rejected") {} } },
-                                    onApprove = { rowPending?.approvalId?.let { onAnswerApproval(it, "allowed-once") {} } },
-                                )
-                            }
-                        }
+                sections.forEach { section ->
+                    item(key = "home-section-${section.section.name}", contentType = "home-section-header") {
+                        HomeSectionHeader(section.section, section.rows.size)
+                    }
+                    items(
+                        items = section.rows,
+                        key = { "home-row-${it.session.sessionId}" },
+                        contentType = { "home-inbox-row" },
+                    ) { row ->
+                        PreparedHomeInboxItem(
+                            row = row,
+                            pending = pending?.takeIf { row.session.sessionId == currentSessionId },
+                            online = online,
+                            goalSummary = goalSummaries[row.session.sessionId],
+                            onSelectSession = actions.onSelectSession,
+                            onLongPress = onLongPress,
+                            onAnswerApproval = onAnswerApproval,
+                        )
                     }
                 }
             }
@@ -312,58 +325,37 @@ private fun LazyListScope.homeStatusItems(
     onRetrySessions: () -> Unit,
 ) {
     if (searchNeedle.isNotEmpty() && searchShowsDegradedHint(searchState)) {
-        item(key = "sidebar-search-degraded") {
+        item(key = "sidebar-search-degraded", contentType = "sidebar-status") {
             Box(Modifier.padding(horizontal = DshSpace.s12, vertical = DshSpace.s4)) {
-                SearchStatusBanner(
-                    message = L.fullTextSearchUnavailable,
-                    onRetry = onRetrySearch,
-                )
+                SearchStatusBanner(message = L.fullTextSearchUnavailable, onRetry = onRetrySearch)
             }
         }
     }
     if (searchNeedle.isNotEmpty() && sectionsEmpty) {
-        item(key = "sidebar-search-empty") {
+        item(key = "sidebar-search-empty", contentType = "sidebar-status") {
             val searchError = searchState as? SearchUiState.Error
             if (searchError != null) {
-                ChatHistoryError(
-                    title = L.searchFailed,
-                    message = searchError.message,
-                    onRetry = onRetrySearch,
-                )
+                ChatHistoryError(title = L.searchFailed, message = searchError.message, onRetry = onRetrySearch)
             } else {
                 Text(
                     if (searchState is SearchUiState.Loading) L.searching else L.noMatchingSessions,
                     color = Dsh.labelTertiary,
                     style = DshType.body,
-                    modifier = Modifier.padding(horizontal = DshSpace.s20, vertical = DshSpace.s20)
+                    modifier = Modifier.padding(horizontal = DshSpace.s20, vertical = DshSpace.s20),
                 )
             }
         }
     } else if (sessionKind == SessionListKind.Loading) {
-        item(key = "sidebar-sessions-loading") {
-            Text(
-                L.loading,
-                color = Dsh.labelTertiary,
-                style = DshType.body,
-                modifier = Modifier.padding(horizontal = DshSpace.s20, vertical = DshSpace.s20)
-            )
+        item(key = "sidebar-sessions-loading", contentType = "sidebar-status") {
+            Text(L.loading, color = Dsh.labelTertiary, style = DshType.body, modifier = Modifier.padding(horizontal = DshSpace.s20, vertical = DshSpace.s20))
         }
     } else if (sessionKind == SessionListKind.Error) {
-        item(key = "sidebar-sessions-error") {
-            ChatHistoryError(
-                title = L.loadSessionListFailed,
-                message = sessionsLoadError,
-                onRetry = onRetrySessions,
-            )
+        item(key = "sidebar-sessions-error", contentType = "sidebar-status") {
+            ChatHistoryError(title = L.loadSessionListFailed, message = sessionsLoadError, onRetry = onRetrySessions)
         }
     } else if (sessionShowsRefreshBanner(hasSessions, sessionsLoadError != null)) {
-        item(key = "sidebar-sessions-refresh") {
-            LoadOlderRow(
-                loading = false,
-                failed = true,
-                failedMessage = sessionsLoadError,
-                onClick = onRetrySessions,
-            )
+        item(key = "sidebar-sessions-refresh", contentType = "sidebar-status") {
+            LoadOlderRow(loading = false, failed = true, failedMessage = sessionsLoadError, onClick = onRetrySessions)
         }
     }
 }
