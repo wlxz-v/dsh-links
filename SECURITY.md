@@ -62,4 +62,4 @@ On the host, enable「配对需本机确认」so an unexpected device still need
 
 ## Reporting
 
-If you find a vulnerability in the plugin, docs, or the official APK, open a private report to the maintainer of [`lunaship/dsh-links`](https://github.com/lunaship/dsh-links) (or email the owner listed on the GitHub profile). Please include repro steps and impact; avoid filing public issues for exploitable auth or proxy bypasses until a fix is available.
+If you find a vulnerability in the plugin, docs, or the official APK, open a private report to the maintainer of [`wlxz-v/dsh-links`](https://github.com/wlxz-v/dsh-links) (or email the owner listed on the GitHub profile). Please include repro steps and impact; avoid filing public issues for exploitable auth or proxy bypasses until a fix is available.

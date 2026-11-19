@@ -1,8 +1,8 @@
 # Release 核对
 
-GitHub `lunaship/dsh-links` = **插件源码、DLP/1 中继源码（`relay/`）、Android 源码（`apps/android/`）与文档**。不得提交 `state.json`（含插件的远程主机密钥）或服务器凭据。
+GitHub `wlxz-v/dsh-links` = **插件源码、DLP/1 中继源码（`relay/`）、Android 源码（`apps/android/`）与文档**。不得提交 `state.json`（含插件的远程主机密钥）或服务器凭据。
 
-**分发方式：全部走本仓库**。插件不发布到 npm registry，用户以 git 源安装（`dsh plugin add github:lunaship/dsh-links`，见 `README.md`）；中继单独部署（`relay/README.md`），不随插件发版；Android 只发本机签名 APK，附在 `app-v*` Release 上。
+**分发方式：全部走本仓库**。插件不发布到 npm registry，用户以 git 源安装（`dsh plugin add github:wlxz-v/dsh-links`，见 `README.md`）；中继单独部署（`relay/README.md`），不随插件发版；Android 只发本机签名 APK，附在 `app-v*` Release 上。
 
 ## 插件改动
 
@@ -10,7 +10,7 @@ GitHub `lunaship/dsh-links` = **插件源码、DLP/1 中继源码（`relay/`）�
 - [ ] `npm test` 通过；`npm run prepack`（= build-client + 全量测试）通过，且 `pnpm build:client && git diff --exit-code -- src/client.js` 干净（`src/client.js` 是提交进仓库的产物）。
 - [ ] 合并到 `main` 后，用户以 git 源重装插件并重启 host 才生效（见根 `CLAUDE.md` 红线）。
 - [ ] 每次准备让用户升级，都要打 `v<version>` tag，并同步更新 README 的安装命令。
-- [ ] `main` 不是发布渠道。用户安装写死的 tag；`github:lunaship/dsh-links`（main）只给想跟开发版的人，不保证稳定。
+- [ ] `main` 不是发布渠道。用户安装写死的 tag；`github:wlxz-v/dsh-links`（main）只给想跟开发版的人，不保证稳定。
 
 ## App 发版流程
 

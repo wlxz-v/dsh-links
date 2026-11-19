@@ -19,7 +19,7 @@ private const val KEY_CHECKED = "update_last_checked_at"
 private const val KEY_TAG = "update_latest_tag"
 private const val KEY_URL = "update_latest_url"
 
-const val GITHUB_RELEASES_URL = "https://api.github.com/repos/lunaship/dsh-links/releases?per_page=10"
+const val GITHUB_RELEASES_URL = "https://api.github.com/repos/wlxz-v/dsh-links/releases?per_page=10"
 
 /** 只认 App 的 `app-v*` 正式发布，插件 tag 和草稿都丢掉。 */
 fun parseReleases(json: String): List<AppRelease> {

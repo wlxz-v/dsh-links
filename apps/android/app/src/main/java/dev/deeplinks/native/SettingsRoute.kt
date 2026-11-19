@@ -773,7 +773,7 @@ internal fun NotificationSettings() {
                 onClick = {
                     openReleasePage(
                         notifyContext,
-                        "https://github.com/lunaship/dsh-links/blob/main/docs/android-background.md",
+                        "https://github.com/wlxz-v/dsh-links/blob/main/docs/android-background.md",
                     )
                 },
             )

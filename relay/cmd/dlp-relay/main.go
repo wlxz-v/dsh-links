@@ -10,7 +10,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/lunaship/dsh-links/relay/internal/dlp"
+	"github.com/wlxz-v/dsh-links/relay/internal/dlp"
 )
 
 // 构建时注入：go build -ldflags "-X main.version=2026-09-30"

@@ -22,14 +22,14 @@ class UpdateCheckTest {
     fun parseKeepsAppTagsAndDropsPluginTagsAndDrafts() {
         val json = """
             [
-              {"tag_name":"v0.1.0-beta.19","draft":false,"html_url":"https://github.com/lunaship/dsh-links/releases/tag/v0.1.0-beta.19","published_at":"2026-09-30T00:00:00Z"},
-              {"tag_name":"app-v0.5.0-beta.24","draft":true,"html_url":"https://github.com/lunaship/dsh-links/releases/tag/app-v0.5.0-beta.24","published_at":"2026-09-30T00:00:00Z"},
-              {"tag_name":"app-v0.5.0-beta.23","draft":false,"html_url":"https://github.com/lunaship/dsh-links/releases/tag/app-v0.5.0-beta.23","published_at":"2026-09-29T00:00:00Z"}
+              {"tag_name":"v0.1.0-beta.19","draft":false,"html_url":"https://github.com/wlxz-v/dsh-links/releases/tag/v0.1.0-beta.19","published_at":"2026-09-30T00:00:00Z"},
+              {"tag_name":"app-v0.5.0-beta.24","draft":true,"html_url":"https://github.com/wlxz-v/dsh-links/releases/tag/app-v0.5.0-beta.24","published_at":"2026-09-30T00:00:00Z"},
+              {"tag_name":"app-v0.5.0-beta.23","draft":false,"html_url":"https://github.com/wlxz-v/dsh-links/releases/tag/app-v0.5.0-beta.23","published_at":"2026-09-29T00:00:00Z"}
             ]
         """.trimIndent()
         val releases = parseReleases(json)
         assertEquals(listOf("app-v0.5.0-beta.23"), releases.map { it.tagName })
-        assertEquals("https://github.com/lunaship/dsh-links/releases/tag/app-v0.5.0-beta.23", releases.single().htmlUrl)
+        assertEquals("https://github.com/wlxz-v/dsh-links/releases/tag/app-v0.5.0-beta.23", releases.single().htmlUrl)
     }
 
     @Test
