@@ -1,5 +1,24 @@
 ## 未发布（main）
 
+**原作者致谢与社区分支声明**：
+- **原项目与原作者**：原作者为 **lunaship**（原仓库：`https://github.com/lunaship/dsh-links`，遵循 **MIT License**）。因原作者在 GitHub 下架原项目，本项目由社区接盘继续维护。
+- **各项优化参考对象与技术规范**：
+  - **Android Jetpack Compose 官方性能规范**：对标 Compose 布局与重组最佳实践，消除列表滑动中的 $O(N^2)$ 全表扫描与无条件放置动画，启用槽位复用与单段快速测量。
+  - **HTTP RFC 7234 / RFC 9110 / RFC 9111 条件请求与缓存规范**：落地双端弱 ETag 协商与 `304 Not Modified` 快速短路机制，零同步压缩、零反序列化。
+  - **网络弹性规范 (RFC 6455 & SSE)**：消除 Windows 套接字绑定竞争（TOCTOU 顺延自愈），完善游标断线补发与背压保护。
+  - **DeepSeek Harness 0.2.x 宿主扩展规范**：网关 Peer 懒加载、多轮澄清多题依次下发、双端协同审批、PDF 原生预览与系统 Intent 唤起。
+  - **社区生态参考**：局域网可用性评分参考 `lrxG/dsh-app`；重复错误通知抑制参考 `dsh-meow-smooth`。
+
+**Android 首页会话列表与全局 UI 滑动流畅度优化**：
+- **消除滑动帧内 $O(N^2)$ 子智能体全表扫描**：在 `SubagentTree.kt` 新增 `runningSubagentCountsByParent` 单遍建索引 + 环安全记忆化聚合，仅在数据变更时计算一次，彻底消除 500+ 会话滑动入屏时的全表扫描与数据类拷贝。
+- **启用 `LazyColumn` 批量区间与显式 `contentType` 槽位复用**：为首页行、搜索行、对话消息行分别声明独立 `contentType`，并移除滚动行上无条件的 `animateItem()` 放置动画，大幅削减高速惯性滑动（fling）时的测量排版与 Composable 槽位重建开销。
+- **首页单段文本快速测量路径**：无搜索词时直接走 `Text(String)` 的 `TextStringSimpleElement` 快速布局路径，规避强制 `MultiParagraph` 与 `AnnotatedString` 分配。
+- **行模型预计算层 `HomeInboxPrep.kt`**：使用 `@Immutable` 预计算模型收敛相对时间格式化（`HomeTimeClock` 批量缓存）、标题清理与分割线标记，消除逐行时区锁（`ZoneId.systemDefault()`）与 `SimpleDateFormat` 重复分配。
+
+**插件网络层 TOCTOU 端口绑定消除与协商加速**：
+- **Winsock 独占绑定与顺延自愈**：`src/lan-address.js` 端口探测声明 `exclusive: true` 消除 Windows 共享套接字假阳性；`src/index.js` 引入自愈式顺延绑定重试，消除探测关闭与正式监听间的 TOCTOU 竞态。
+- **Accept-Encoding 零分配解析**：针对常见客户端头部提供轻量快速路径，规避每次请求的冗余正则执行与参数切片分配。
+
 **全量梳理优化：修复 2c86839 网络层回归、Windows 会话日志兼容、选路与缓存有界化（0.1.0-beta.20）**
 
 - **修复 Android 写请求与 304 回归（P0）**：`MobileApiClient.request()` 仅对幂等 `GET` 调用 `conditionalJsonGet()`，命中 `304` 且本地有副本时直接返回缓存 JSON（不再误入 `!in 200..299` 抛错）；`POST` / `PUT` / `DELETE` 走独立 `HostHttp.execute()` 保留原始方法与 UTF-8 JSON 请求体，无请求体的 `DELETE`（如删除定时任务）自动附带 `Content-Type: application/json; charset=utf-8` 以通过服务端 `requireJsonWrite` 门禁。新增 `MobileApiRequestTest` 守护上述契约。

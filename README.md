@@ -13,11 +13,22 @@
   </p>
 
   <p>
-    <a href="https://github.com/lunaship/dsh-links/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/lunaship/dsh-links/ci.yml?style=flat-square&label=plugin%20CI" alt="Plugin CI" /></a>
-    <a href="https://github.com/lunaship/dsh-links/actions/workflows/ci-android.yml"><img src="https://img.shields.io/github/actions/workflow/status/lunaship/dsh-links/ci-android.yml?style=flat-square&label=android%20CI" alt="Android CI" /></a>
-    <a href="https://github.com/lunaship/dsh-links/releases?q=app-v&expanded=true"><img src="https://img.shields.io/badge/APK-GitHub%20Releases-0D96F6?style=flat-square&logo=github" alt="下载 APK" /></a>
+    <a href="https://github.com/wlxz-v/dsh-links/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/wlxz-v/dsh-links/ci.yml?style=flat-square&label=plugin%20CI" alt="Plugin CI" /></a>
+    <a href="https://github.com/wlxz-v/dsh-links/actions/workflows/ci-android.yml"><img src="https://img.shields.io/github/actions/workflow/status/wlxz-v/dsh-links/ci-android.yml?style=flat-square&label=android%20CI" alt="Android CI" /></a>
+    <a href="https://github.com/wlxz-v/dsh-links/releases?q=app-v&expanded=true"><img src="https://img.shields.io/badge/APK-GitHub%20Releases-0D96F6?style=flat-square&logo=github" alt="下载 APK" /></a>
   </p>
 </div>
+
+> [!NOTE]
+> ### 📢 原作者致谢与社区分支声明 (Community Fork & Attribution)
+> - **原项目与原作者**：本项目分叉自原作者 **lunaship** 开源的 [`dsh-links`](https://github.com/lunaship/dsh-links) 项目（遵循 **MIT License**）。
+> - **维护背景**：原作者已在 GitHub 下架原仓库。为保障广大 DeepSeek Harness (DSH) 用户与移动端生态的长期可用性与体验，本项目由社区接盘继续维护，并在原有基础上进行了深度的全栈性能重构与缺陷修复。
+> - **优化参考对象与规范 (Optimization References & Standards)**：
+>   1. **Android Jetpack Compose 官方性能规范**：对标 Compose 布局与重组生命周期最佳实践，消除会话列表滑动中的 $O(N^2)$ 子智能体全表扫描；`LazyColumn` 启用显式 `contentType` 槽位复用并剥离非必要的 `animateItem()` 放置动画；引入 `HomeInboxPrep` 预计算层与单段快速测量路径（`TextStringSimpleElement`），消减 500+ 会话下的滑动掉帧与 GC 抖动。
+>   2. **HTTP RFC 7234 / RFC 9110 / RFC 9111 条件请求与缓存规范**：在服务端与 Android 客户端完整落地弱 ETag 协商与 `304 Not Modified` 快速短路机制，零主线程同步压缩、零冗余 JSON 反序列化；优化 `Accept-Encoding` 压缩协商解析路径。
+>   3. **网络弹性与高可用连接规范 (RFC 6455 & SSE)**：消除 Windows Winsock 套接字绑定竞争（TOCTOU race free 端口顺延）；完善 SSE 游标断线补发（`Last-Event-ID` / `?since=<seq>`）、有界环形缓冲及慢消费者背压处理。
+>   4. **DeepSeek Harness 0.2.x 宿主扩展规范**：适配网关 Peer 懒加载与自动重建；支持双端协同审批与多轮澄清题目依次下发；实现手机端 PDF 原生预览及外部系统应用文件唤起。
+>   5. **社区生态参考**：局域网地址可用性评分与网段过滤参考 `lrxG/dsh-app`；会话状态防抖与重复通知抑制参考 `dsh-meow-smooth`。
 
 <p align="center"><sub>部分截图为设计稿，审批卡中的命令文本为示意；实际手机端不显示工具参数。
 截图基线由 <code>.github/workflows/regen-screenshots.yml</code> 自动生成，已覆盖浅色 / 深色、中文 / 英文、普通 / 大字号。</sub></p>
@@ -92,8 +103,8 @@
 
 | 发布物 | 位置 | 作用 | 分发 |
 |---|---|---|---|
-| **DSH 插件** `dsh-links` | [`src/`](src/) | 手机 HTTPS 接入代理、配对与设备状态机、电脑端「手机连接」面板 | 本仓 git 源（`github:lunaship/dsh-links`，固定版本见 [Releases](https://github.com/lunaship/dsh-links/releases)） |
-| **Android App** | [`apps/android/`](apps/android/) | 扫码配对、原生会话工作台、实时流、审批与提问 | 签名 APK，见 [Releases](https://github.com/lunaship/dsh-links/releases?q=app-v&expanded=true)（`app-v*`） |
+| **DSH 插件** `dsh-links` | [`src/`](src/) | 手机 HTTPS 接入代理、配对与设备状态机、电脑端「手机连接」面板 | 本仓 git 源（`github:wlxz-v/dsh-links`，固定版本见 [Releases](https://github.com/wlxz-v/dsh-links/releases)） |
+| **Android App** | [`apps/android/`](apps/android/) | 扫码配对、原生会话工作台、实时流、审批与提问 | 签名 APK，见 [Releases](https://github.com/wlxz-v/dsh-links/releases?q=app-v&expanded=true)（`app-v*`） |
 | **Relay** | [`relay/`](relay/) | 远程连接的哑管道中继（DLP/1，`cmd/dlp-relay`），只拼接两条 WSS | 源码公开；可用官方中继或自建，无需接入码 |
 
 ---

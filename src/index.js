@@ -2056,21 +2056,34 @@ export function apply(ctx, config) {
     }
     portState.value = candidatePort
     portState.shifted = candidatePort !== config.port
-    await new Promise((resolve, reject) => {
-      const onError = (error) => {
-        proxy.removeListener("listening", onListening)
-        reject(error)
+    let boundPortNumber = candidatePort
+    for (let p = candidatePort; p < config.port + PORT_LISTEN_ATTEMPTS; p += 1) {
+      try {
+        await new Promise((resolve, reject) => {
+          const onError = (error) => {
+            proxy.removeListener("listening", onListening)
+            reject(error)
+          }
+          const onListening = () => {
+            proxy.removeListener("error", onError)
+            resolve()
+          }
+          proxy.once("error", onError)
+          proxy.once("listening", onListening)
+          proxy.listen({ port: p, host: "0.0.0.0", exclusive: true })
+        })
+        boundPortNumber = p
+        break
+      } catch (error) {
+        if (error?.code === "EADDRINUSE" && p + 1 < config.port + PORT_LISTEN_ATTEMPTS) {
+          ctx.logger.warn(`dsh-links: 端口 ${p} 绑定冲突，继续顺延至 ${p + 1}`)
+          continue
+        }
+        throw error
       }
-      const onListening = () => {
-        proxy.removeListener("error", onError)
-        resolve()
-      }
-      proxy.once("error", onError)
-      proxy.once("listening", onListening)
-      proxy.listen(candidatePort, "0.0.0.0")
-    })
+    }
     {
-      const bound = proxy.address()?.port ?? candidatePort
+      const bound = proxy.address()?.port ?? boundPortNumber
       portState.value = bound
       portState.shifted = bound !== config.port
       const shiftedHint = portState.shifted ? `（配置端口 ${config.port} 被占用，已顺延）` : ""

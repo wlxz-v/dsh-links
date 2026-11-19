@@ -36,7 +36,7 @@ export async function findFreeListenPort(start, attempts) {
       let settled = false
       const done = (value) => { if (!settled) { settled = true; resolve(value) } }
       probe.once("error", () => { probe.removeAllListeners(); done(false) })
-      probe.listen(candidate, "0.0.0.0", () => probe.close(() => done(true)))
+      probe.listen({ port: candidate, host: "0.0.0.0", exclusive: true }, () => probe.close(() => done(true)))
     })
     if (free) return candidate
   }

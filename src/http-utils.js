@@ -11,12 +11,23 @@ const JSON_ENCODING_ORDER = ["zstd", "br", "gzip"]
 /** 解析 Accept-Encoding，返回 coding → q 的映射（同名取第一个出现的 q）。 */
 function parseAcceptEncoding(value) {
   const out = new Map()
-  for (const part of String(value ?? "").split(",")) {
-    const [name, ...params] = part.trim().toLowerCase().split(";")
+  const raw = String(value ?? "").trim()
+  if (!raw) return out
+  const parts = raw.split(",")
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i].trim().toLowerCase()
+    if (!part) continue
+    const semi = part.indexOf(";")
+    if (semi === -1) {
+      if (!out.has(part)) out.set(part, 1)
+      continue
+    }
+    const name = part.slice(0, semi).trim()
     if (!name) continue
     let q = 1
-    for (const param of params) {
-      const match = /^\s*q\s*=\s*([0-9.]+)\s*$/.exec(param)
+    const params = part.slice(semi + 1).split(";")
+    for (let j = 0; j < params.length; j++) {
+      const match = /^\s*q\s*=\s*([0-9.]+)\s*$/.exec(params[j])
       if (match) q = Number(match[1])
     }
     if (!out.has(name)) out.set(name, q)

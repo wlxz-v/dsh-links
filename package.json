@@ -10,13 +10,17 @@
     "./package.json": "./package.json"
   },
   "license": "MIT",
+  "author": "lunaship",
+  "contributors": [
+    "wlxz-v"
+  ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/lunaship/dsh-links.git"
+    "url": "git+https://github.com/wlxz-v/dsh-links.git"
   },
-  "homepage": "https://github.com/lunaship/dsh-links#readme",
+  "homepage": "https://github.com/wlxz-v/dsh-links#readme",
   "bugs": {
-    "url": "https://github.com/lunaship/dsh-links/issues"
+    "url": "https://github.com/wlxz-v/dsh-links/issues"
   },
   "keywords": [
     "deepseek-harness",
