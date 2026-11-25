@@ -73,6 +73,43 @@ async function nextStreamFrame(iter, controller, deadline, label) {
           controller.abort()
           reject(new Error(`${label} timed out`))
         }, remaining)
+        timeout.unref?.()
+      }),
+    ])
+  } finally {
+    clearTimeout(timeout)
+  }
+}
+
+function combineSignals(callerSignal, ac) {
+  if (!callerSignal) return ac.signal
+  if (callerSignal.aborted) {
+    ac.abort()
+    return ac.signal
+  }
+  if (typeof AbortSignal.any === "function") {
+    return AbortSignal.any([callerSignal, ac.signal])
+  }
+  callerSignal.addEventListener("abort", () => ac.abort(), { once: true })
+  return ac.signal
+}
+
+async function openStreamWithDeadline(request, controller, deadline, label) {
+  const remaining = deadline - Date.now()
+  if (remaining <= 0) {
+    controller.abort()
+    throw new Error(`${label} timed out`)
+  }
+  let timeout
+  try {
+    return await Promise.race([
+      Promise.resolve().then(() => runtime.stream(request)),
+      new Promise((_, reject) => {
+        timeout = setTimeout(() => {
+          controller.abort()
+          reject(new Error(`${label} timed out`))
+        }, remaining)
+        timeout.unref?.()
       }),
     ])
   } finally {
@@ -279,10 +316,11 @@ async function firstStreamValue(request) {
     throw new Error("stream Remote methods require typertGateway")
   }
   const ac = new AbortController()
+  const signal = combineSignals(request.signal, ac)
   const deadline = Date.now() + STREAM_FIRST_FRAME_TIMEOUT_MS
   let iter
   try {
-    iter = await runtime.stream({ ...request, signal: request.signal ?? ac.signal })
+    iter = await openStreamWithDeadline({ ...request, signal }, ac, deadline, "stream open")
     const first = await nextStreamFrame(iter, ac, deadline, "stream first frame")
     return first.value
   } finally {
@@ -291,8 +329,21 @@ async function firstStreamValue(request) {
   }
 }
 
-function postHttpRpc(targetPort, endpoint, args, pluginMethod) {
+function postHttpRpc(targetPort, endpoint, args, pluginMethod, { signal } = {}) {
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new LocalRpcError(pluginMethod, { code: "aborted", message: `RPC ${pluginMethod} aborted` }))
+      return
+    }
+    let settled = false
+    const finish = (fn, value) => {
+      if (settled) return
+      settled = true
+      if (signal && onAbort) {
+        try { signal.removeEventListener("abort", onAbort) } catch {}
+      }
+      fn(value)
+    }
     const rpcId = "mobile-" + randomBytes(12).toString("hex")
     const body = Buffer.from(JSON.stringify({
       type: "client-request",
@@ -317,39 +368,70 @@ function postHttpRpc(targetPort, endpoint, args, pluginMethod) {
         const chunks = []
         let received = 0
         response.on("data", (chunk) => {
+          if (settled) return
           received += chunk.length
           if (received > MAX_RPC_RESPONSE_BYTES) {
-            request.destroy(new Error("RPC " + pluginMethod + " response too large"))
+            const err = new Error("RPC " + pluginMethod + " response too large")
+            request.destroy(err)
+            finish(reject, err)
             return
           }
           chunks.push(chunk)
         })
+        response.on("error", (err) => finish(reject, err))
         response.on("end", () => {
+          if (settled) return
           try {
             if (response.statusCode === 401) {
-              reject(new LocalRpcError(pluginMethod, {
+              finish(reject, new LocalRpcError(pluginMethod, {
                 code: "gateway/unauthorized",
                 message: "DSH /api requires browser session cookie; bind typertGateway instead",
               }))
               return
             }
-            const frame = JSON.parse(Buffer.concat(chunks).toString("utf8"))
-            if (frame?.result?.ok) return resolve(frame.result.value)
+            const raw = Buffer.concat(chunks).toString("utf8")
+            let frame
+            try {
+              frame = JSON.parse(raw)
+            } catch (parseErr) {
+              if ((response.statusCode ?? 0) >= 400) {
+                finish(reject, new LocalRpcError(pluginMethod, {
+                  code: `http/${response.statusCode}`,
+                  message: `RPC ${pluginMethod} HTTP ${response.statusCode}`,
+                }))
+                return
+              }
+              finish(reject, parseErr)
+              return
+            }
+            if (frame?.result?.ok) return finish(resolve, frame.result.value)
             const error = frame?.result?.error
-            reject(new LocalRpcError(pluginMethod, error))
+            finish(reject, new LocalRpcError(pluginMethod, error))
           } catch (error) {
-            reject(error)
+            finish(reject, error)
           }
         })
       },
     )
-    request.setTimeout(25_000, () => request.destroy(new Error("RPC " + pluginMethod + " timed out")))
-    request.on("error", reject)
+    const onAbort = signal
+      ? () => {
+          const err = new LocalRpcError(pluginMethod, { code: "aborted", message: `RPC ${pluginMethod} aborted` })
+          request.destroy(err)
+          finish(reject, err)
+        }
+      : null
+    if (signal && onAbort) signal.addEventListener("abort", onAbort, { once: true })
+    request.setTimeout(25_000, () => {
+      const err = new Error("RPC " + pluginMethod + " timed out")
+      request.destroy(err)
+      finish(reject, err)
+    })
+    request.on("error", (err) => finish(reject, err))
     request.end(body)
   })
 }
 
-async function invokeMapped(targetPort, pluginMethod, payload) {
+async function invokeMapped(targetPort, pluginMethod, payload, options = {}) {
   const spec = WIRE[pluginMethod]
   if (!spec) throw new Error(`RPC method not mapped: ${pluginMethod}`)
   const args = spec.args(payload ?? {})
@@ -359,16 +441,17 @@ async function invokeMapped(targetPort, pluginMethod, payload) {
         namespace: spec.namespace,
         method: spec.method,
         args,
+        ...(options.signal ? { signal: options.signal } : {}),
       })
     } catch (error) {
       throw toLocalRpcError(pluginMethod, error)
     }
   }
-  return postHttpRpc(targetPort, `${spec.namespace}/${spec.method}`, args, pluginMethod)
+  return postHttpRpc(targetPort, `${spec.namespace}/${spec.method}`, args, pluginMethod, options)
 }
 
-async function sessionThroughSeq(targetPort, sessionId) {
-  const list = await invokeMapped(targetPort, "session.list", {})
+async function sessionThroughSeq(targetPort, sessionId, options = {}) {
+  const list = await invokeMapped(targetPort, "session.list", {}, options)
   const item = (list?.items ?? []).find((row) => row?.sessionId === sessionId)
   const asOf = item?.projections?.asOfSeq
   return {
@@ -377,7 +460,7 @@ async function sessionThroughSeq(targetPort, sessionId) {
   }
 }
 
-async function followHistorySnapshot(sessionId, maxMessages) {
+async function followHistorySnapshot(sessionId, maxMessages, options = {}) {
   const snapshot = await firstStreamValue({
     namespace: "session",
     method: "follow",
@@ -387,6 +470,7 @@ async function followHistorySnapshot(sessionId, maxMessages) {
         ...(maxMessages !== undefined ? { maxMessages } : {}),
       },
     },
+    ...(options.signal ? { signal: options.signal } : {}),
   })
   if (snapshot?.type !== "snapshot") return null
   return {
@@ -396,7 +480,7 @@ async function followHistorySnapshot(sessionId, maxMessages) {
   }
 }
 
-async function adaptSessionHistory(targetPort, payload) {
+async function adaptSessionHistory(targetPort, payload, options = {}) {
   const src = asObject(payload)
   const sessionId = src.sessionId
   if (!sessionId) {
@@ -410,7 +494,7 @@ async function adaptSessionHistory(targetPort, payload) {
 
   if (isUnboundedTail && typeof runtime?.stream === "function") {
     try {
-      const snapshot = await followHistorySnapshot(sessionId, maxMessages)
+      const snapshot = await followHistorySnapshot(sessionId, maxMessages, options)
       if (snapshot) return snapshot
     } catch {
       // follow 失败时回退 page（例如 AbortError 竞态）；list+page 仍能给出一页
@@ -419,12 +503,12 @@ async function adaptSessionHistory(targetPort, payload) {
 
   const hint = Number.isInteger(src.throughSeq)
     ? { throughSeq: src.throughSeq, projections: null }
-    : await sessionThroughSeq(targetPort, sessionId)
+    : await sessionThroughSeq(targetPort, sessionId, options)
 
   // list 没有 asOfSeq 时 page(throughSeq=-1) 是空页；冷会话或未入列表时再试一次 follow。
   if (hint.throughSeq < 0 && typeof runtime?.stream === "function") {
     try {
-      const snapshot = await followHistorySnapshot(sessionId, maxMessages)
+      const snapshot = await followHistorySnapshot(sessionId, maxMessages, options)
       if (snapshot) return snapshot
     } catch {
       // 仍回退 page；空页比抛错更接近旧 session.history 语义
@@ -442,12 +526,17 @@ async function adaptSessionHistory(targetPort, payload) {
     }
     if (typeof runtime?.invoke === "function") {
       try {
-        return await runtime.invoke({ namespace: "session", method: "page", args })
+        return await runtime.invoke({
+          namespace: "session",
+          method: "page",
+          args,
+          ...(options.signal ? { signal: options.signal } : {}),
+        })
       } catch (error) {
         throw toLocalRpcError("session.history", error)
       }
     }
-    return postHttpRpc(targetPort, "session/page", args, "session.history")
+    return postHttpRpc(targetPort, "session/page", args, "session.history", options)
   })()
 
   return {
@@ -457,19 +546,20 @@ async function adaptSessionHistory(targetPort, payload) {
   }
 }
 
-async function adaptWorkspaceList(targetPort) {
+async function adaptWorkspaceList(targetPort, options = {}) {
   if (typeof runtime?.stream === "function") {
     try {
       const ac = new AbortController()
+      const signal = combineSignals(options.signal, ac)
       const deadline = Date.now() + STREAM_FIRST_FRAME_TIMEOUT_MS
       let iter
       try {
-        iter = await runtime.stream({
+        iter = await openStreamWithDeadline({
           namespace: "workspace",
           method: "follow",
           args: {},
-          signal: ac.signal,
-        })
+          signal,
+        }, ac, deadline, "workspace.follow open")
         // Runtime adapters may emit a status frame before the durable baseline.
         // Never turn that transient frame into an authoritative empty snapshot.
         for (let index = 0; index < 32; index += 1) {
@@ -492,30 +582,28 @@ async function adaptWorkspaceList(targetPort) {
     }
   }
   // 单测假 HTTP 服务没有 stream；仍发一条可观察的 unary，便于路径锁定。
-  return postHttpRpc(targetPort, "workspace/follow", {}, "workspace.list")
+  return postHttpRpc(targetPort, "workspace/follow", {}, "workspace.list", options)
 }
 
-export function callLocalRpc(targetPort, method, payload) {
+export function callLocalRpc(targetPort, method, payload, options = {}) {
   if (!ALLOWED_METHODS.has(method)) {
     return Promise.reject(new Error(`RPC method not allowlisted: ${method}`))
   }
   return (async () => {
-    if (method === "session.history") return adaptSessionHistory(targetPort, payload)
-    if (method === "workspace.list") return adaptWorkspaceList(targetPort)
-    const value = await invokeMapped(targetPort, method, payload)
-    if (method === "session.models" || method === "llm.models") {
-      let current = value?.default ?? null
-      const sessionId = payload?.sessionId
-      if (method === "session.models" && sessionId) {
-        try {
-          const list = await invokeMapped(targetPort, "session.list", {})
-          const item = (list?.items ?? []).find((row) => row?.sessionId === sessionId)
-          current = item?.projections?.values?.modelSelection?.next ?? current
-        } catch {
-          // 目录本身仍可用
-        }
-      }
+    if (method === "session.history") return adaptSessionHistory(targetPort, payload, options)
+    if (method === "workspace.list") return adaptWorkspaceList(targetPort, options)
+    if (method === "session.models" && payload?.sessionId) {
+      const [value, list] = await Promise.all([
+        invokeMapped(targetPort, method, payload, options),
+        invokeMapped(targetPort, "session.list", {}, options).catch(() => null),
+      ])
+      const item = (list?.items ?? []).find((row) => row?.sessionId === payload.sessionId)
+      const current = item?.projections?.values?.modelSelection?.next ?? value?.default ?? null
       return adaptModelCatalog(value, current)
+    }
+    const value = await invokeMapped(targetPort, method, payload, options)
+    if (method === "session.models" || method === "llm.models") {
+      return adaptModelCatalog(value, value?.default ?? null)
     }
     return value
   })()

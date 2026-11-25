@@ -44,6 +44,11 @@ export class BootstrapTable {
     return true
   }
 
+  /** 禁用远程或重置远程身份时清空所有未消费的 bootstrap 种子。 */
+  clear() {
+    this.#entries = []
+  }
+
   #find(bootstrapId) {
     if (!Buffer.isBuffer(bootstrapId) || bootstrapId.length !== KEY_BYTES) return null
     return this.#entries.find((entry) => entry.id.equals(bootstrapId)) ?? null
@@ -75,6 +80,10 @@ export class NonceCache {
     if (this.#entries.size >= this.#max) return REJECT.SERVER_BUSY
     this.#entries.set(id, ts + CLOCK_SKEW_SEC)
     return null
+  }
+
+  clear() {
+    this.#entries.clear()
   }
 
   #prune(nowSec) {

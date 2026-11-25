@@ -9,11 +9,13 @@
  */
 import { request as httpRequest } from "node:http"
 import { randomBytes } from "node:crypto"
+import { StringDecoder } from "node:string_decoder"
 import { sseBacklogExceeded, sseMessageFrame } from "./stream-cursor.js"
 
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms))
-}
+const MAX_SSE_BUFFER_CHARS = 2 * 1024 * 1024
+const RECONNECT_MIN_MS = 1_000
+const RECONNECT_MAX_MS = 30_000
+const HEALTHY_SESSION_MS = 5_000
 
 function flushSse(res) {
   try { res.flush?.() } catch {}
@@ -21,6 +23,10 @@ function flushSse(res) {
 
 function writeSse(writers, frame) {
   for (const conn of [...writers]) {
+    if (conn.res?.destroyed || conn.res?.writableEnded) {
+      writers.delete(conn)
+      continue
+    }
     try {
       const ok = conn.res.write(frame)
       flushSse(conn.res)
@@ -44,10 +50,11 @@ export const SEED_QUEUE_MAX = 2000
 
 function parseSseBlocks(buf, onBlock) {
   let rest = buf
-  let idx
-  while ((idx = rest.indexOf("\n\n")) >= 0) {
-    const raw = rest.slice(0, idx)
-    rest = rest.slice(idx + 2)
+  const sepRe = /\r?\n\r?\n/
+  let match
+  while ((match = sepRe.exec(rest)) !== null) {
+    const raw = rest.slice(0, match.index)
+    rest = rest.slice(match.index + match[0].length)
     onBlock(raw)
   }
   return rest
@@ -67,7 +74,12 @@ function handleSessionEvent(payload, rt, requestPoll) {
   const writers = rt.sessionStreams.get(sessionId)
   if (!writers || writers.size === 0) return
   let needsPoll = false
+  let frame = null
   for (const conn of [...writers]) {
+    if (conn.res?.destroyed || conn.res?.writableEnded) {
+      writers.delete(conn)
+      continue
+    }
     if (!conn.seeded) {
       conn.missedWhileSeeding = true
       if (!Array.isArray(conn.seedQueue)) conn.seedQueue = []
@@ -75,13 +87,15 @@ function handleSessionEvent(payload, rt, requestPoll) {
       else conn.seedOverflow = true
       continue
     }
+    if (conn.catchupPaused) continue
     if (event.seq <= conn.lastSeq) continue
     if (event.seq > conn.lastSeq + 1) {
       needsPoll = true
       continue
     }
+    if (frame === null) frame = sseMessageFrame(event)
     try {
-      const ok = conn.res.write(sseMessageFrame(event))
+      const ok = conn.res.write(frame)
       flushSse(conn.res)
       conn.lastSeq = event.seq
       if (ok === false && sseBacklogExceeded(conn.res)) {
@@ -99,7 +113,7 @@ function handleSessionEvent(payload, rt, requestPoll) {
 /** SSE 块 → 帧。WebSocket 那条直接拿到帧对象，走 handleMuxFrame。 */
 export function handleMuxBlock(block, rt, logger, requestPoll) {
   const data = block
-    .split("\n")
+    .split(/\r?\n/)
     .filter((line) => line.startsWith("data:"))
     .map((line) => line.slice(5).replace(/^ /, ""))
     .join("\n")
@@ -115,13 +129,18 @@ export function handleMuxBlock(block, rt, logger, requestPoll) {
 }
 
 /** 补历史结束后把排队的 mux 事件按序补发，避免思考中的 delta 被丢掉。 */
-export function flushSeedQueue(conn, sessionId, requestPoll) {
+export function flushSeedQueue(conn, sessionId, requestPoll, writers) {
   const queued = conn.seedQueue ?? []
   conn.seedQueue = []
   conn.seeded = true
-  queued.sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0))
   const overflow = Boolean(conn.seedOverflow)
   conn.seedOverflow = false
+  if (conn.res?.destroyed || conn.res?.writableEnded) {
+    writers?.delete?.(conn)
+    return
+  }
+  if (conn.catchupPaused) return
+  queued.sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0))
   for (const event of queued) {
     if (typeof event?.seq !== "number" || event.seq <= conn.lastSeq) continue
     if (event.seq > conn.lastSeq + 1) {
@@ -133,10 +152,12 @@ export function flushSeedQueue(conn, sessionId, requestPoll) {
       flushSse(conn.res)
       conn.lastSeq = event.seq
       if (ok === false && sseBacklogExceeded(conn.res)) {
+        writers?.delete?.(conn)
         try { conn.res.destroy() } catch {}
         return
       }
     } catch {
+      writers?.delete?.(conn)
       try { conn.res.destroy() } catch {}
       return
     }
@@ -187,11 +208,33 @@ export function startMuxQuestionBridge({ targetPort, rt, logger, requestPoll }) 
   let stopped = false
   let activeReq = null
   let activeWs = null
-  // 0.1.2 走 /api/remote.mux；旧版 /api/events.mux。首连失败会翻到另一条
-  let muxPath = "/api/remote.mux"
-  let useWs = typeof globalThis.WebSocket === "function"
+  let waitTimer = null
+  let waitResolve = null
 
-  function connectWs() {
+  // 显式候选列表循环尝试，防止启动初期单次瞬断永久锁死在旧路径 /api/events.mux。
+  const candidates = typeof globalThis.WebSocket === "function"
+    ? [
+        { kind: "ws", path: "/api/remote.mux" },
+        { kind: "ws", path: "/api/events.mux" },
+        { kind: "sse", path: "/api/events.mux" },
+      ]
+    : [{ kind: "sse", path: "/api/events.mux" }]
+  let candidateIdx = 0
+
+  function cancellableSleep(ms) {
+    return new Promise((resolve) => {
+      if (stopped) return resolve()
+      waitResolve = resolve
+      waitTimer = setTimeout(() => {
+        waitTimer = null
+        waitResolve = null
+        resolve()
+      }, ms)
+      waitTimer.unref?.()
+    })
+  }
+
+  function connectWs(muxPath, onActivity) {
     return new Promise((resolve, reject) => {
       let ws
       try {
@@ -217,6 +260,10 @@ export function startMuxQuestionBridge({ targetPort, rt, logger, requestPoll }) 
         fn(arg)
       }
       ws.addEventListener("open", () => {
+        if (stopped) {
+          try { ws.close() } catch {}
+          return
+        }
         opened = true
         clearTimeout(handshakeTimer)
         logger?.info?.(`dsh-links: mux 桥已连接（WebSocket ${muxPath}）`)
@@ -232,8 +279,9 @@ export function startMuxQuestionBridge({ targetPort, rt, logger, requestPoll }) 
         }
       })
       ws.addEventListener("message", (ev) => {
-        if (done && !opened) return
+        if (stopped || (done && !opened)) return
         if (typeof ev.data !== "string") return
+        onActivity()
         let frame
         try {
           frame = JSON.parse(ev.data)
@@ -254,13 +302,13 @@ export function startMuxQuestionBridge({ targetPort, rt, logger, requestPoll }) 
     })
   }
 
-  function connectSse() {
+  function connectSse(ssePath, onActivity) {
     return new Promise((resolve, reject) => {
       const req = httpRequest(
         {
           host: "127.0.0.1",
           port: targetPort,
-          path: "/api/events.mux",
+          path: ssePath,
           method: "GET",
           headers: {
             host: "127.0.0.1:" + targetPort,
@@ -270,18 +318,39 @@ export function startMuxQuestionBridge({ targetPort, rt, logger, requestPoll }) 
         },
         (res) => {
           clearTimeout(connectTimer)
+          if (stopped) {
+            res.resume()
+            resolve()
+            return
+          }
           if (res.statusCode !== 200) {
             reject(new Error("mux HTTP " + res.statusCode))
             res.resume()
             return
           }
           logger?.info?.("dsh-links: mux 桥已连接（SSE）")
+          const decoder = new StringDecoder("utf8")
           let buf = ""
           res.on("data", (chunk) => {
-            buf += chunk.toString("utf8")
+            if (stopped) return
+            onActivity()
+            buf += typeof chunk === "string" ? chunk : decoder.write(chunk)
+            if (buf.length > MAX_SSE_BUFFER_CHARS) {
+              req.destroy(new Error("mux sse buffer overflow"))
+              return
+            }
             buf = parseSseBlocks(buf, (block) => handleMuxBlock(block, rt, logger, requestPoll))
           })
-          res.on("end", () => resolve())
+          res.on("end", () => {
+            if (!stopped) {
+              const tail = decoder.end()
+              if (tail) {
+                buf += tail
+                parseSseBlocks(buf, (block) => handleMuxBlock(block, rt, logger, requestPoll))
+              }
+            }
+            resolve()
+          })
           res.on("error", reject)
         },
       )
@@ -301,30 +370,59 @@ export function startMuxQuestionBridge({ targetPort, rt, logger, requestPoll }) 
   }
 
   ;(async () => {
-    let everConnected = false
+    let failures = 0
+    let confirmedIdx = -1
     while (!stopped) {
+      const idx = confirmedIdx >= 0 ? confirmedIdx : candidateIdx
+      const target = candidates[idx]
+      const startedAt = Date.now()
+      let sawActivity = false
+      const markActive = () => { sawActivity = true }
+      let succeeded = false
       try {
-        await (useWs ? connectWs() : connectSse())
-        everConnected = true
+        if (target.kind === "ws") await connectWs(target.path, markActive)
+        else await connectSse(target.path, markActive)
+        succeeded = true
       } catch (err) {
         if (!stopped) {
-          logger?.warn?.(`dsh-links: mux 桥（${useWs ? "ws " + muxPath : "sse"}）：${err?.message ?? err}`)
-          if (!everConnected) {
-            if (useWs && muxPath === "/api/remote.mux") muxPath = "/api/events.mux"
-            else if (typeof globalThis.WebSocket === "function") useWs = !useWs
-          }
+          logger?.warn?.(`dsh-links: mux 桥（${target.kind} ${target.path}）：${err?.message ?? err}`)
         }
       }
       activeReq = null
       activeWs = null
       if (stopped) break
-      await sleep(2_000)
+      const healthy = succeeded && (sawActivity || Date.now() - startedAt >= HEALTHY_SESSION_MS)
+      if (healthy) {
+        confirmedIdx = idx
+        failures = 0
+      } else {
+        failures += 1
+        if (confirmedIdx >= 0 && failures >= 3) {
+          // 已确认路径连续多次瞬断（可能 Host 升级切换了路径）：重新轮询候选列表
+          confirmedIdx = -1
+        }
+        if (confirmedIdx < 0) {
+          candidateIdx = (candidateIdx + 1) % candidates.length
+        }
+      }
+      const baseDelay = Math.min(RECONNECT_MAX_MS, RECONNECT_MIN_MS * (2 ** Math.min(failures, 5)))
+      const jitter = Math.floor(Math.random() * Math.min(500, baseDelay * 0.2))
+      await cancellableSleep(baseDelay + jitter)
     }
   })()
 
   return {
     stop() {
       stopped = true
+      if (waitTimer) {
+        clearTimeout(waitTimer)
+        waitTimer = null
+      }
+      if (waitResolve) {
+        const wake = waitResolve
+        waitResolve = null
+        wake()
+      }
       try { activeReq?.destroy() } catch {}
       try { activeWs?.close() } catch {}
       activeReq = null

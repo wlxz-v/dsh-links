@@ -32,12 +32,34 @@ export class DeviceMutationGate {
     return pending
   }
 
-  async drain(deviceId) {
+  async drain(deviceId, { timeoutMs = 0 } = {}) {
     const key = String(deviceId ?? "")
+    const hasTimeout = Number.isFinite(timeoutMs) && timeoutMs > 0
+    const deadline = hasTimeout ? Date.now() + timeoutMs : Infinity
     for (;;) {
       const operations = this.inflight.get(key)
-      if (!operations || operations.size === 0) return
-      await Promise.allSettled([...operations])
+      if (!operations || operations.size === 0) return { drained: true, pending: 0 }
+      const settled = Promise.allSettled([...operations])
+      if (!hasTimeout) {
+        await settled
+        continue
+      }
+      const remaining = deadline - Date.now()
+      if (remaining <= 0) {
+        return { drained: false, pending: this.inflight.get(key)?.size ?? 0 }
+      }
+      let timer
+      const timedOut = await Promise.race([
+        settled.then(() => false),
+        new Promise((resolve) => {
+          timer = setTimeout(() => resolve(true), remaining)
+          timer.unref?.()
+        }),
+      ])
+      clearTimeout(timer)
+      if (timedOut) {
+        return { drained: false, pending: this.inflight.get(key)?.size ?? 0 }
+      }
     }
   }
 }

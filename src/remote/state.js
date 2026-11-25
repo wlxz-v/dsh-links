@@ -118,7 +118,14 @@ export function remoteKeys(state) {
  * @returns {boolean} 是否新发了 handle（调用方据此落盘）
  */
 export function ensureDeviceHandle(device, now = Date.now()) {
-  if (typeof device.remoteHandle === "string" && device.remoteHandle) return false
+  if (typeof device.remoteHandle === "string" && device.remoteHandle) {
+    try {
+      unb64u(device.remoteHandle, HANDLE_BYTES)
+      return false
+    } catch {
+      // 落盘 handle 格式损坏时自动修复重发，避免 deviceRemote() 永久返回 null
+    }
+  }
   device.remoteHandle = b64u(randomBytes(HANDLE_BYTES))
   device.remoteIssuedAt = now
   return true

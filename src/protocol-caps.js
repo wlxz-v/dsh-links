@@ -12,7 +12,8 @@ export const RECONNECT_GRACE_MS = 30_000
 export const CLIENT_CAPS_QUERY = `${CAP_SYNC2},${CAP_MULTI_QUESTION},${CAP_REQUEST_STATE}`
 
 export function parseClientCaps(raw) {
-  const set = new Set(String(raw ?? "").split(",").map((item) => item.trim()).filter(Boolean))
+  const bounded = String(raw ?? "").slice(0, 512)
+  const set = new Set(bounded.split(",").map((item) => item.trim()).filter(Boolean))
   return {
     sync2: set.has(CAP_SYNC2),
     multiQuestion: set.has(CAP_MULTI_QUESTION),

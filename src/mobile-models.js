@@ -152,8 +152,19 @@ async function loadDirectory(targetPort) {
     callLocalRpc(targetPort, "settings.describe", {}),
     callLocalRpc(targetPort, "llm.models", {}).catch(() => null),
   ])
-  const draft = projectProviderDirectory({ registered, directory, settings, catalog, credentials: {} })
-  const refs = [...new Set(draft.providers.filter((p) => p.keyRef).map((p) => p.keyRef))]
+  const joined = joinProviderDirectory(registered, directory)
+  const namespaces = new Map((settings?.namespaces ?? []).map((ns) => [ns.ns, ns]))
+  const refsSet = new Set()
+  for (const entry of joined) {
+    if (entry.provider === ACCOUNT_PROVIDER) continue
+    const ns = namespaces.get(entry.settingsNs)
+    if (!ns) continue
+    const profile = entry.settingsPath.length === 0 ? ns.value : getPath(ns.value, entry.settingsPath)
+    if (entry.settingsPath.length > 0 && profile === undefined) continue
+    const keyRef = typeof profile?.apiKeyEnv === "string" && profile.apiKeyEnv ? profile.apiKeyEnv : deriveKeyRef(entry.provider)
+    if (keyRef) refsSet.add(keyRef)
+  }
+  const refs = [...refsSet]
   let credentials = {}
   if (refs.length > 0) {
     try {
@@ -163,9 +174,28 @@ async function loadDirectory(targetPort) {
     }
   }
   const view = projectProviderDirectory({ registered, directory, settings, catalog, credentials })
+  const entries = new Map(joined.map((e) => [e.provider, e]))
+  return { view, entries, namespaces, credentials }
+}
+
+/** 轻量加载单个供应商的设置入口（discoverModels 不需要 llm.models 与 credentials.describe）。 */
+async function loadProviderEntry(targetPort, provider) {
+  const [registered, directory, settings] = await Promise.all([
+    callLocalRpc(targetPort, "llm.listProviders", {}),
+    callLocalRpc(targetPort, "llm.listConfigurableProviders", {}),
+    callLocalRpc(targetPort, "settings.describe", {}),
+  ])
   const entries = new Map(joinProviderDirectory(registered, directory).map((e) => [e.provider, e]))
   const namespaces = new Map((settings?.namespaces ?? []).map((ns) => [ns.ns, ns]))
-  return { view, entries, namespaces, credentials }
+  const entry = entries.get(provider)
+  if (!entry || provider === ACCOUNT_PROVIDER) {
+    throw new MobileModelsError(404, "供应商不存在或不可在手机端修改", "unknown-provider")
+  }
+  const ns = namespaces.get(entry.settingsNs)
+  if (!entry.settingsNs || !ns) {
+    throw new MobileModelsError(409, "该供应商没有可写的设置", "not-configurable")
+  }
+  return { entry, ns }
 }
 
 function hostDshVersion() {
@@ -221,6 +251,9 @@ function rpcFailure(error, fallback) {
   if (error instanceof MobileModelsError) return error
   if (error instanceof LocalRpcError) {
     if (error.code === "settings/conflict") return new MobileModelsError(409, "设置已在电脑端被修改，请刷新后重试", "conflict")
+    if (error.code === "internal" || error.code.startsWith("http/5")) {
+      return new MobileModelsError(502, fallback, error.code)
+    }
     return new MobileModelsError(400, error.message || fallback, error.code)
   }
   return new MobileModelsError(502, fallback, "unavailable")
@@ -274,6 +307,9 @@ async function writeCredential(targetPort, loaded, provider, apiKey, { materiali
   const { entry, ns } = editableEntry(loaded, provider)
   const profilePath = entry.settingsPath
   const profile = profilePath.length === 0 ? ns.value : getPath(ns.value, profilePath)
+  if (!materialize && profilePath.length > 0 && profile === undefined) {
+    throw new MobileModelsError(409, "请先在电脑端或手机端添加该供应商", "not-configured")
+  }
   const named = typeof profile?.apiKeyEnv === "string" && profile.apiKeyEnv ? profile.apiKeyEnv : null
   const keyRef = named ?? deriveKeyRef(provider)
   const cred = loaded.credentials?.[keyRef]
@@ -308,8 +344,8 @@ async function addCatalogProvider(targetPort, loaded, provider, apiKey) {
   })
 }
 
-async function discoverModels(targetPort, loaded, provider) {
-  const { entry, ns } = editableEntry(loaded, provider)
+async function discoverModels(targetPort, provider) {
+  const { entry, ns } = await loadProviderEntry(targetPort, provider)
   const profile = entry.settingsPath.length === 0 ? ns.value : getPath(ns.value, entry.settingsPath)
   const request = { provider }
   if (typeof profile?.baseURL === "string" && profile.baseURL) request.baseURL = profile.baseURL
@@ -366,8 +402,7 @@ export async function handleMobileModelsApi(req, res, targetPort, state, device,
       return true
     }
     try {
-      const loaded = await loadDirectory(targetPort)
-      const models = await discoverModels(targetPort, loaded, provider)
+      const models = await discoverModels(targetPort, provider)
       json(res, 200, { version: 1, provider, models })
     } catch (error) {
       const failure = rpcFailure(error, "获取模型列表失败")

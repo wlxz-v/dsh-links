@@ -41,16 +41,44 @@ const SUPPORTED = "supported"
 const MISSING = "missing"
 const UNKNOWN = "unknown"
 
-function withTimeout(promise, timeoutMs) {
+const TRANSPORT_ERROR_CODES = new Set([
+  "TIMEOUT",
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "ETIMEDOUT",
+  "EHOSTUNREACH",
+  "EPIPE",
+  "ABORT_ERR",
+  "aborted",
+  "gateway/unauthorized",
+  "gateway/disposed",
+  "gateway/peer-disposed",
+])
+
+function isTransientProbeError(error) {
+  const code = typeof error?.code === "string" ? error.code : ""
+  if (TRANSPORT_ERROR_CODES.has(code)) return true
+  if (code.startsWith("http/5")) return true
+  const msg = String(error?.message ?? "")
+  return /timed out|aborted|ECONNREFUSED|ECONNRESET|peer[- ]disposed/i.test(msg)
+}
+
+function withTimeout(promise, timeoutMs, activeTimers, controller) {
   let timer
   const timeout = new Promise((_, reject) => {
     timer = setTimeout(() => {
+      try { controller?.abort() } catch {}
       const error = new Error("probe timeout")
       error.code = "TIMEOUT"
       reject(error)
     }, timeoutMs)
+    timer.unref?.()
+    activeTimers.add(timer)
   })
-  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer))
+  return Promise.race([promise, timeout]).finally(() => {
+    clearTimeout(timer)
+    activeTimers.delete(timer)
+  })
 }
 
 /**
@@ -74,20 +102,31 @@ export function createHostProbe({
 
   const table = Array.isArray(probes) ? probes.filter((probe) => probe && typeof probe.id === "string") : []
   const status = new Map(table.map((probe) => [probe.id, UNKNOWN]))
+  const activeTimers = new Set()
+  const activeControllers = new Set()
   let checkedAt = 0
   let hasChecked = false
   let inflight = null
   let disposed = false
 
   async function probeOne(probe) {
+    const controller = new AbortController()
+    activeControllers.add(controller)
     try {
-      await withTimeout(Promise.resolve().then(() => call(probe.id, probe.params ?? {})), timeoutMs)
+      await withTimeout(
+        Promise.resolve().then(() => call(probe.id, probe.params ?? {}, { signal: controller.signal })),
+        timeoutMs,
+        activeTimers,
+        controller,
+      )
       return SUPPORTED
     } catch (error) {
-      // 只有「方法不存在」才算宿主不支持。业务错误（not-found / 参数校验 / 权限）都说明方法在。
+      // 只有「方法不存在」才算宿主不支持；传输/鉴权/超时算 unknown；业务错误（not-found / 参数校验）说明方法在。
       if (isMissingRemoteError(error)) return MISSING
-      if (error?.code === "TIMEOUT") return UNKNOWN
+      if (isTransientProbeError(error)) return UNKNOWN
       return SUPPORTED
+    } finally {
+      activeControllers.delete(controller)
     }
   }
 
@@ -95,13 +134,16 @@ export function createHostProbe({
     const queue = [...table]
     const workers = Array.from({ length: Math.max(1, Math.min(concurrency, queue.length || 1)) }, async () => {
       for (;;) {
+        if (disposed) return
         const probe = queue.shift()
         if (!probe) return
         const result = await probeOne(probe)
+        if (disposed) return
         status.set(probe.id, result)
       }
     })
     await Promise.all(workers)
+    if (disposed) return snapshot()
     checkedAt = now()
     hasChecked = true
     return snapshot()
@@ -157,6 +199,12 @@ export function createHostProbe({
   function stop() {
     disposed = true
     inflight = null
+    for (const timer of activeTimers) clearTimeout(timer)
+    activeTimers.clear()
+    for (const controller of activeControllers) {
+      try { controller.abort() } catch {}
+    }
+    activeControllers.clear()
   }
 
   return { refresh, ensure, snapshot, capabilities, stop }

@@ -47,8 +47,9 @@ export function acceptTranscript(ch, hostPub, sid, version = 1) {
   return Buffer.concat([ACCEPT_PREFIX, Buffer.from([version]), ch, hostPub, sid])
 }
 
-export function signHost(seed, transcript) {
-  return sign(null, transcript, privateKeyFromSeed(seed))
+export function signHost(seedOrKey, transcript) {
+  const key = Buffer.isBuffer(seedOrKey) ? privateKeyFromSeed(seedOrKey) : seedOrKey
+  return sign(null, transcript, key)
 }
 
 export function clientTranscript({ route, kind, key, ts, nonce, version = 1 }) {

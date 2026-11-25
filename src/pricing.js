@@ -42,8 +42,12 @@ export function isPeakHour(at) {
 }
 
 function finiteNumber(value) {
-  const n = typeof value === "number" ? value : Number(value)
-  return Number.isFinite(n) && n >= 0 ? n : null
+  if (typeof value === "number") return Number.isFinite(value) && value >= 0 ? value : null
+  if (typeof value === "string" && value.trim()) {
+    const n = Number(value.trim())
+    return Number.isFinite(n) && n >= 0 ? n : null
+  }
+  return null
 }
 
 /** Host 模型对象上的价格。认 `pricing` / `price` 里的每百万 token 单价。没有完整三档就返回 null。 */
@@ -74,10 +78,17 @@ export function lookupBuiltinPrice(modelId, at = new Date()) {
   return { ...rates, currency: row.currency, priceDate: row.priceDate, source: "builtin" }
 }
 
+function modelIdFromSelectionEntry(entry) {
+  if (typeof entry === "string" && entry.trim()) return entry.trim()
+  if (entry && typeof entry.model === "string" && entry.model.trim()) return entry.model.trim()
+  return null
+}
+
 export function modelIdFromProjections(values) {
-  const next = values?.modelSelection?.next ?? values?.modelSelection?.active
-  if (typeof next === "string" && next.trim()) return next.trim()
-  if (next && typeof next.model === "string" && next.model.trim()) return next.model.trim()
+  const fromNext = modelIdFromSelectionEntry(values?.modelSelection?.next)
+  if (fromNext) return fromNext
+  const fromActive = modelIdFromSelectionEntry(values?.modelSelection?.active)
+  if (fromActive) return fromActive
   const usageModel = values?.tokenUsage?.model
   if (typeof usageModel === "string" && usageModel.trim()) return usageModel.trim()
   return null

@@ -11,7 +11,8 @@ function canonicalPathForContainment(p) {
     try {
       const real = realpathSync(current)
       return missing.length ? resolve(real, ...missing) : real
-    } catch {
+    } catch (err) {
+      if (err?.code !== "ENOENT" && err?.code !== "ENOTDIR") throw err
       const parent = dirname(current)
       if (parent === current) return resolved
       missing.unshift(basename(current))
@@ -20,9 +21,9 @@ function canonicalPathForContainment(p) {
   }
 }
 
-function normalizeComparisonPath(p, platform = process.platform) {
-  if (platform !== "win32") return String(p)
-  return String(p).replace(/\//g, "\\").toLowerCase()
+export function normalizeComparisonPath(p, platform = process.platform) {
+  if (platform !== "win32") return String(p).replace(/\/+$/, "") || "/"
+  return String(p).replace(/\//g, "\\").replace(/\\+$/, (m, offset) => (offset <= 2 ? m : "")).toLowerCase()
 }
 
 export function isPathWithinRoot(target, root, platform = process.platform) {
@@ -45,8 +46,20 @@ export function validateSessionCreateWorkspace({ cwd, workspaceId, workspaces })
     return { workspaceId }
   }
   if (!cwd) return { ok: true }
-  const target = canonicalPathForContainment(cwd)
-  const inside = roots.some((w) => isPathWithinRoot(target, canonicalPathForContainment(w.path)))
+  if (!isAbsolute(String(cwd))) return { error: "cwd 必须是绝对路径" }
+  let target
+  try {
+    target = canonicalPathForContainment(cwd)
+  } catch {
+    return { error: "无法解析 cwd 路径" }
+  }
+  const inside = roots.some((w) => {
+    try {
+      return isPathWithinRoot(target, canonicalPathForContainment(w.path))
+    } catch {
+      return false
+    }
+  })
   if (!inside) return { error: "cwd 不在已注册工作区内" }
   return { cwd: target }
 }

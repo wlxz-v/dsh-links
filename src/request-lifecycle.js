@@ -70,20 +70,19 @@ export function createRequestRegistry({
   const pendingQuestions = new Map()
   const terminalResults = new Map()
   const graceTimers = new Map()
-  const sessionEligible = new Map()
 
   function pruneTerminal(at = now()) {
     for (const [id, rec] of terminalResults) {
       if (at - rec.at > TERMINAL_TTL_MS) terminalResults.delete(id)
     }
     while (terminalResults.size > MAX_TERMINAL_RESULTS) {
-      const oldest = terminalResults.keys().next().value
-      terminalResults.delete(oldest)
+      const first = terminalResults.keys().next()
+      if (first.done) break
+      terminalResults.delete(first.value)
     }
   }
 
   function rememberTerminal(rec, outcome, extra = {}) {
-    pruneTerminal()
     const result = {
       id: rec.id,
       type: rec.type,
@@ -94,6 +93,7 @@ export function createRequestRegistry({
       ...extra,
     }
     terminalResults.set(rec.id, result)
+    pruneTerminal()
     return result
   }
 
@@ -114,6 +114,7 @@ export function createRequestRegistry({
     rec.settled = true
     pendingApprovals.delete(rec.id)
     clearTimers(rec)
+    if (rec.sessionId && pendingForSession(rec.sessionId).length === 0) clearGrace(rec.sessionId)
     const resolved = APPROVAL_OUTCOMES.has(outcome) ? outcome : "unavailable"
     const terminal = rememberTerminal(rec, resolved)
     rec.terminal = terminal
@@ -126,6 +127,7 @@ export function createRequestRegistry({
     rec.settled = true
     pendingQuestions.delete(rec.id)
     clearTimers(rec)
+    if (rec.sessionId && pendingForSession(rec.sessionId).length === 0) clearGrace(rec.sessionId)
     const ok = Boolean(answer && Array.isArray(answer.answers))
     const terminal = rememberTerminal(rec, ok ? "answered" : "cancelled", ok ? { answer } : {})
     rec.terminal = terminal
@@ -142,17 +144,10 @@ export function createRequestRegistry({
 
   function addEligible(sessionId, deviceId) {
     if (!sessionId || !deviceId) return
-    let set = sessionEligible.get(sessionId)
-    if (!set) {
-      set = new Set()
-      sessionEligible.set(sessionId, set)
-    }
-    set.add(deviceId)
     for (const rec of pendingForSession(sessionId)) rec.eligibleDeviceIds.add(deviceId)
   }
 
   function removeEligible(sessionId, deviceId) {
-    sessionEligible.get(sessionId)?.delete(deviceId)
     for (const rec of pendingForSession(sessionId)) rec.eligibleDeviceIds.delete(deviceId)
   }
 
@@ -162,16 +157,13 @@ export function createRequestRegistry({
     graceTimers.delete(sessionId)
   }
 
-  function settleSession(sessionId, { approvalOutcome = "cancelled", questionsToDesktop = true } = {}) {
+  function settleSession(sessionId, { approvalOutcome = "cancelled" } = {}) {
     clearGrace(sessionId)
     for (const rec of [...pendingApprovals.values()]) {
       if (rec.sessionId === sessionId) finishApproval(rec, approvalOutcome)
     }
     for (const rec of [...pendingQuestions.values()]) {
-      if (rec.sessionId === sessionId) {
-        if (questionsToDesktop) finishQuestion(rec, null)
-        else finishQuestion(rec, null)
-      }
+      if (rec.sessionId === sessionId) finishQuestion(rec, null)
     }
   }
 
@@ -258,7 +250,7 @@ export function createRequestRegistry({
     for (const rec of [...pendingQuestions.values()]) finishQuestion(rec, null)
     pendingApprovals.clear()
     pendingQuestions.clear()
-    sessionEligible.clear()
+    terminalResults.clear()
   }
 
   return {

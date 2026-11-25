@@ -13,11 +13,12 @@ export function getBounded(map, key) {
 
 export function setBounded(map, key, value, maxEntries) {
   if (!map) return
+  const limit = Number.isInteger(maxEntries) && maxEntries > 0 ? maxEntries : 1
   if (map.has(key)) map.delete(key)
   map.set(key, value)
-  while (map.size > maxEntries) {
-    const oldest = map.keys().next().value
-    if (oldest === undefined) break
-    map.delete(oldest)
+  while (map.size > limit) {
+    const first = map.keys().next()
+    if (first.done) break
+    map.delete(first.value)
   }
 }

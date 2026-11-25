@@ -10,9 +10,22 @@ import { toolResultContent } from "./produced-files.js"
 export const DETECT_MAX_SESSIONS = 8
 export const DETECT_RUNNING_INTERVAL_MS = 5_000
 export const DETECT_HISTORY_MESSAGES = 80
+const DETECT_CONCURRENCY = 4
+const DETECT_MAX_TEXT_CHARS = 512 * 1024
 
-const URL_RE = /(?<![A-Za-z0-9+.-])http:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0):([1-9]\d{0,4})(?![0-9.])/gi
+const URL_RE = /(?<![A-Za-z0-9+.-])http:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]):([1-9]\d{0,4})(?![0-9]|\.[A-Za-z0-9-])/gi
 const EXAMPLE_RE = /(?:例如|示例|样例|e\.g\.|for example|\bplaceholder\b|(^|[^\w/])example\b)/i
+
+function normalizeTimestamp(value) {
+  if (typeof value === "number") return Number.isFinite(value) ? value : 0
+  if (typeof value === "string" && value.trim()) {
+    const num = Number(value)
+    if (Number.isFinite(num)) return num
+    const parsed = Date.parse(value)
+    return Number.isFinite(parsed) ? parsed : 0
+  }
+  return 0
+}
 
 function unwrapSessionEvent(item) {
   if (!item || typeof item !== "object") return null
@@ -39,9 +52,12 @@ export function toolOutputText(item) {
  */
 export function extractDevServerPorts(text) {
   if (typeof text !== "string" || text.length === 0) return []
+  if (!/http:\/\//i.test(text)) return []
+  const sample = text.length > DETECT_MAX_TEXT_CHARS ? text.slice(-DETECT_MAX_TEXT_CHARS) : text
   const ports = []
   const seen = new Set()
-  for (const line of text.split(/\r?\n/)) {
+  for (const line of sample.split(/\r?\n/)) {
+    if (!/http:\/\//i.test(line)) continue
     URL_RE.lastIndex = 0
     let match
     while ((match = URL_RE.exec(line))) {
@@ -105,18 +121,24 @@ export function createPreviewDetector({ pluginPort, hostPort } = {}) {
       for (const row of rows.values()) {
         if (!keep.has(row.sessionId)) drop.add(row.sessionId)
       }
+      for (const id of idleStamp.keys()) {
+        if (!keep.has(id)) drop.add(id)
+      }
+      for (const id of scanMs.keys()) {
+        if (!keep.has(id)) drop.add(id)
+      }
       for (const id of drop) endSession(id)
     },
     shouldScan(item, now) {
       const id = String(item?.sessionId ?? "")
       if (!id) return false
       if (item.running) return now - (scanMs.get(id) ?? 0) >= DETECT_RUNNING_INTERVAL_MS
-      return idleStamp.get(id) !== Number(item.updatedAt ?? 0)
+      return idleStamp.get(id) !== normalizeTimestamp(item.updatedAt)
     },
     markScanned(sessionId, stamp, now) {
       const id = String(sessionId ?? "")
       if (!id) return
-      idleStamp.set(id, Number(stamp ?? 0))
+      idleStamp.set(id, normalizeTimestamp(stamp))
       scanMs.set(id, now)
     },
   }
@@ -139,18 +161,34 @@ export async function refreshPreviewDetections({ detector, listSessions, history
     live.push({ ...item, sessionId: id })
   }
   detector.retainSessions(live.map((item) => item.sessionId))
-  const ranked = [...live].sort((a, b) => Number(b.updatedAt ?? 0) - Number(a.updatedAt ?? 0)).slice(0, DETECT_MAX_SESSIONS)
-  for (const item of ranked) {
-    if (!detector.shouldScan(item, now)) continue
-    let page
-    try {
-      page = await history(item.sessionId)
-    } catch {
-      continue
+  const ranked = [...live]
+    .sort((a, b) => normalizeTimestamp(b.updatedAt) - normalizeTimestamp(a.updatedAt))
+    .slice(0, DETECT_MAX_SESSIONS)
+  const toScan = ranked.filter((item) => detector.shouldScan(item, now))
+  if (toScan.length > 0) {
+    let cursor = 0
+    const results = new Array(toScan.length).fill(null)
+    const worker = async () => {
+      while (cursor < toScan.length) {
+        const index = cursor++
+        const item = toScan[index]
+        const asOfSeq = item?.projections?.asOfSeq
+        try {
+          const page = await history(item.sessionId, Number.isInteger(asOfSeq) ? asOfSeq : undefined)
+          results[index] = { item, page }
+        } catch {
+          // 单个会话读取失败不影响其余会话
+        }
+      }
     }
-    const events = page?.events ?? page?.records ?? []
-    for (const event of events) detector.observe(item.sessionId, event)
-    detector.markScanned(item.sessionId, item.updatedAt, now)
+    await Promise.all(Array.from({ length: Math.min(DETECT_CONCURRENCY, toScan.length) }, () => worker()))
+    // 按排名顺序合并观察结果，保证列表顺序确定
+    for (const entry of results) {
+      if (!entry) continue
+      const events = entry.page?.events ?? entry.page?.records ?? []
+      for (const event of events) detector.observe(entry.item.sessionId, event)
+      detector.markScanned(entry.item.sessionId, entry.item.updatedAt, now)
+    }
   }
   return detector.list()
 }

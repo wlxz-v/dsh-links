@@ -47,12 +47,17 @@ export function tlsExpiryMs(certPem) {
  * 无法识别的字符串（路径、主机名）返回 null，调用方不得把它写进结果。
  */
 export function classifyListenHost(host) {
-  const raw = String(host ?? "").trim().toLowerCase().replace(/^\[|\]$/g, "")
+  let raw = String(host ?? "").trim().toLowerCase().replace(/^\[|\]$/g, "")
+  const scopeIdx = raw.indexOf("%")
+  if (scopeIdx >= 0) raw = raw.slice(0, scopeIdx)
+  if (raw.startsWith("::ffff:")) raw = raw.slice(7)
   if (!raw || raw.length > 64 || /[/\\]/.test(raw)) return null
   if (raw === "localhost" || raw === "::1") return "loopback"
   const v4 = ipv4ToInt(raw)
   if (v4 != null) {
     if (ipv4InNet(v4, 0x7f000000, 0xff000000)) return "loopback"
+    // 169.254.0.0/16 链路本地地址（无可用路由器/未联网时自动分配），不是公网也不应触发 LISTEN_UNTRUSTED
+    if (ipv4InNet(v4, 0xa9fe0000, 0xffff0000)) return null
     // 100.64.0.0/10
     if (ipv4InNet(v4, 0x64400000, 0xffc00000)) return "tailnet"
     if (ipv4InNet(v4, 0x0a000000, 0xff000000)) return "private"
@@ -61,6 +66,10 @@ export function classifyListenHost(host) {
     return "other"
   }
   if (raw.startsWith("fd7a:115c:a1e0:")) return "tailnet"
+  // IPv6 链路本地 fe80::/10 仅本链路有效，不计入公网 other
+  if (/^fe[89ab][0-9a-f]:/.test(raw)) return null
+  // IPv6 ULA fc00::/7 属于私网地址
+  if (/^f[cd][0-9a-f]{2}:/.test(raw)) return "private"
   if (/^[0-9a-f:]+$/.test(raw) && raw.includes(":")) return "other"
   return null
 }
@@ -79,7 +88,9 @@ export function classifyListenHost(host) {
 export function hostDiagnosticsSource(input = {}) {
   const services = input.services ?? {}
   const fingerprint = typeof input.fingerprint === "string" ? input.fingerprint : ""
-  const notAfterMs = tlsExpiryMs(input.certPem)
+  const notAfterMs = typeof input.notAfterMs === "number" && Number.isFinite(input.notAfterMs)
+    ? input.notAfterMs
+    : tlsExpiryMs(input.certPem)
   return {
     now: input.now,
     rpc: input.rpc,
@@ -144,16 +155,19 @@ async function checkHostRpc(rt) {
   const timeoutMs = finiteMs(rt.rpcTimeoutMs, DIAGNOSTIC_RPC_TIMEOUT_MS)
   const slowMs = finiteMs(rt.rpcSlowMs, DIAGNOSTIC_RPC_SLOW_MS)
   const started = Date.now()
+  const controller = new AbortController()
   let timer
   try {
     await Promise.race([
-      Promise.resolve().then(() => rt.rpc("workspace.list", {})),
+      Promise.resolve().then(() => rt.rpc("workspace.list", {}, { signal: controller.signal })),
       new Promise((_, reject) => {
         timer = setTimeout(() => {
+          try { controller.abort() } catch {}
           const error = new Error("timeout")
           error.code = "TIMEOUT"
           reject(error)
         }, timeoutMs)
+        timer.unref?.()
       }),
     ])
     const ms = Date.now() - started
@@ -161,7 +175,7 @@ async function checkHostRpc(rt) {
     return row("host.rpc", "ok", "HOST_RPC_OK", { ms })
   } catch (error) {
     const ms = Date.now() - started
-    const timedOut = error?.code === "TIMEOUT"
+    const timedOut = error?.code === "TIMEOUT" || controller.signal.aborted
     const detail = { ms }
     if (!timedOut) {
       const brief = (value) => String(value).replace(/[^A-Za-z0-9_.-]/g, "_").slice(0, 32)
@@ -322,8 +336,17 @@ function checkStreams(rt) {
     hostEvents,
     sessionCount: viewers.length,
   }
-  if (viewers.length) detail.viewers = viewers.join(",")
-  // 用 _ 分隔：诊断 detail 的字符串要过 ENUM_STRING 校验（不允许冒号），冒号会被清洗掉。
+  if (viewers.length) {
+    // 使用 . 分隔并截断在 32 字符以内，确保多会话场景也能通过 ENUM_STRING 校验而不被静默剥除。
+    let joined = ""
+    for (const entry of viewers) {
+      const candidate = joined ? `${joined}.${entry}` : entry
+      if (candidate.length > 32) break
+      joined = candidate
+    }
+    if (joined) detail.viewers = joined
+  }
+  // 用 _ 与 . 分隔：诊断 detail 的字符串要过 ENUM_STRING 校验（不允许冒号与逗号），会被清洗掉。
   // idle 也是正常状态：手机端没打开/没在后台连着。面板上靠这一行判断审批为什么只到了电脑端。
   return row("mobile.streams", "ok", hostEvents || viewers.length ? "MOBILE_STREAMS_LIVE" : "MOBILE_STREAMS_IDLE", detail)
 }
@@ -390,7 +413,7 @@ function sanitizeDetail(value, depth = 0) {
 
 function isEnumString(value) {
   if (typeof value !== "string" || !ENUM_STRING.test(value)) return false
-  if (IPV4.test(value) || LONG_HEX.test(value)) return false
+  if (IPV4.test(value) || LONG_HEX.test(value) || PRIVATE_TEXT.test(value)) return false
   return true
 }
 

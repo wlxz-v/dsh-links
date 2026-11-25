@@ -34,7 +34,9 @@ export async function loadEventsAfter(afterSeq, fetchPage, {
 } = {}) {
   const collected = []
   let beforeSeq
+  let pinnedThroughSeq
   let projections = null
+  let maxObservedSeq = null
   let reachedStart = false
   let reachedCursor = false
   let hitEventLimit = false
@@ -44,16 +46,29 @@ export async function loadEventsAfter(afterSeq, fetchPage, {
   for (; pagesUsed < maxPages && collected.length < maxEvents; pagesUsed++) {
     const payload = { maxMessages: pageSize }
     if (Number.isInteger(beforeSeq) && beforeSeq > 0) payload.beforeSeq = beforeSeq
+    if (Number.isInteger(pinnedThroughSeq) && pinnedThroughSeq >= 0) payload.throughSeq = pinnedThroughSeq
     const page = await fetchPage(payload)
     const events = page?.events ?? page?.records ?? []
     if (page?.projections?.values) projections = page.projections.values
+    if (pinnedThroughSeq === undefined && Number.isInteger(page?.projections?.asOfSeq)) {
+      pinnedThroughSeq = page.projections.asOfSeq
+    }
+    let pageMinSeq = Infinity
+    for (const item of events) {
+      const seq = item?.event?.seq
+      if (typeof seq !== "number") continue
+      if (seq < pageMinSeq) pageMinSeq = seq
+      if (maxObservedSeq === null || seq > maxObservedSeq) maxObservedSeq = seq
+    }
     const room = maxEvents - collected.length
     if (room <= 0) {
       hitEventLimit = true
       break
     }
     if (events.length > room) {
-      collected.push(...events.slice(0, room))
+      // 保留该页最新侧的 room 条（兼容升序与降序页），保证与前序已收的更新页连续衔接。
+      const newestFirst = [...events].sort((a, b) => (b?.event?.seq ?? -Infinity) - (a?.event?.seq ?? -Infinity))
+      collected.push(...newestFirst.slice(0, room))
       pageTruncated = true
       hitEventLimit = true
       break
@@ -63,13 +78,11 @@ export async function loadEventsAfter(afterSeq, fetchPage, {
       reachedStart = true
       break
     }
-    const seqs = events.map((item) => item?.event?.seq).filter((n) => typeof n === "number")
-    if (seqs.length === 0) {
+    if (pageMinSeq === Infinity) {
       reachedStart = page?.hasMore === false
       break
     }
-    const minSeq = Math.min(...seqs)
-    if (minSeq <= afterSeq) {
+    if (pageMinSeq <= afterSeq) {
       reachedCursor = true
       break
     }
@@ -77,19 +90,23 @@ export async function loadEventsAfter(afterSeq, fetchPage, {
       reachedStart = true
       break
     }
-    beforeSeq = minSeq
+    beforeSeq = pageMinSeq
   }
 
   const events = sortedUniqueAfter(collected, afterSeq)
   const oldestSeq = events.length ? events[0].seq : null
   const newestSeq = events.length ? events[events.length - 1].seq : null
+  const cursorAhead = maxObservedSeq !== null && afterSeq > maxObservedSeq
   const hitPageLimit = pagesUsed >= maxPages && !reachedCursor && !reachedStart && !hitEventLimit
-  const attached = events.length === 0
-    ? Boolean(reachedCursor || reachedStart || pagesUsed > 0)
-    : oldestSeq === afterSeq + 1
+  const attached = cursorAhead
+    ? false
+    : events.length === 0
+      ? Boolean(reachedCursor || reachedStart || pagesUsed > 0)
+      : oldestSeq === afterSeq + 1
   const contiguous = events.length === 0 || isConsecutive(events)
   let reason = null
-  if (hitEventLimit || pageTruncated) reason = "hit-limit"
+  if (cursorAhead) reason = "cursor-ahead"
+  else if (hitEventLimit || pageTruncated) reason = "hit-limit"
   else if (hitPageLimit) reason = "hit-limit"
   else if (!contiguous) reason = "discontiguous"
   else if (events.length > 0 && !attached && reachedStart) reason = "log-gap"
@@ -102,12 +119,12 @@ export async function loadEventsAfter(afterSeq, fetchPage, {
     projections,
     complete,
     truncated: Boolean(hitEventLimit || hitPageLimit || pageTruncated),
-    gap: reason === "log-gap" || reason === "gap" || reason === "discontiguous",
+    gap: reason === "log-gap" || reason === "gap" || reason === "discontiguous" || reason === "cursor-ahead",
     reachedStart,
     reachedCursor,
     oldestAvailableSeq: oldestSeq,
     newestSeq,
-    nextCursor: newestSeq ?? afterSeq,
+    nextCursor: newestSeq ?? (cursorAhead ? maxObservedSeq : afterSeq),
     reason: complete ? null : (reason ?? "incomplete"),
     afterSeq,
   }
@@ -227,6 +244,7 @@ export function writeCatchup(writers, conn, assessed, sessionId, requestPoll) {
             conn.catchupPaused = true
             conn.res.once?.("drain", () => {
               conn.catchupPaused = false
+              if (writers?.has?.(conn) === false || conn.res?.destroyed || conn.res?.writableEnded) return
               requestPoll?.(sessionId)
             })
           }

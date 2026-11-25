@@ -1,59 +1,9 @@
 import { isAbsolute, relative, resolve, sep } from "node:path"
-import { lstatSync, readdirSync, realpathSync, statSync } from "node:fs"
+import { constants as fsConstants, lstatSync, readdirSync, realpathSync, statSync } from "node:fs"
+import { lstat, open, readdir, realpath, stat } from "node:fs/promises"
 
 export const MAX_WORKSPACE_FILE_BYTES = 8 * 1024 * 1024
 export const MAX_WORKSPACE_DIR_ENTRIES = 2000
-
-export function resolveWorkspaceFile(cwd, requested) {
-  if (typeof cwd !== "string" || !cwd.trim()) {
-    const err = new Error("缺少工作区")
-    err.status = 400
-    throw err
-  }
-  if (typeof requested !== "string" || !requested.trim()) {
-    const err = new Error("缺少 path")
-    err.status = 400
-    throw err
-  }
-  const root = realpathSync(resolve(cwd.trim()))
-  const candidate = isAbsolute(requested.trim()) ? resolve(requested.trim()) : resolve(root, requested.trim())
-  if (candidate === root || !insideRoot(root, candidate)) {
-    const err = new Error("路径越出工作区")
-    err.status = 403
-    throw err
-  }
-  let real
-  try {
-    real = realpathSync(candidate)
-  } catch {
-    const err = new Error("文件不存在")
-    err.status = 404
-    throw err
-  }
-  const rel = relative(root, real)
-  if (!rel || !insideRoot(root, real)) {
-    const err = new Error("路径越出工作区")
-    err.status = 403
-    throw err
-  }
-  const st = statSync(real)
-  if (!st.isFile()) {
-    const err = new Error("不是文件")
-    err.status = 400
-    throw err
-  }
-  if (st.size > MAX_WORKSPACE_FILE_BYTES) {
-    const err = new Error("文件过大")
-    err.status = 413
-    throw err
-  }
-  return {
-    abs: real,
-    rel: rel.split("\\").join("/"),
-    size: st.size,
-    name: real.slice(real.lastIndexOf(sep) + 1),
-  }
-}
 
 function httpError(message, status) {
   const err = new Error(message)
@@ -66,6 +16,109 @@ function insideRoot(root, real) {
   return rel === "" || (!rel.startsWith(`..${sep}`) && rel !== ".." && !isAbsolute(rel))
 }
 
+function mapFsError(err, missingMessage) {
+  if (err?.code === "ENOENT" || err?.code === "ENOTDIR") return httpError(missingMessage, 404)
+  if (err?.code === "EACCES" || err?.code === "EPERM") return httpError("无权限访问", 403)
+  return err
+}
+
+export function resolveWorkspaceFile(cwd, requested) {
+  if (typeof cwd !== "string" || !cwd.trim()) throw httpError("缺少工作区", 400)
+  if (typeof requested !== "string" || !requested.trim()) throw httpError("缺少 path", 400)
+  let root
+  try {
+    root = realpathSync(resolve(cwd.trim()))
+  } catch (err) {
+    throw mapFsError(err, "工作区不存在")
+  }
+  const candidate = isAbsolute(requested.trim()) ? resolve(requested.trim()) : resolve(root, requested.trim())
+  if (candidate === root || !insideRoot(root, candidate)) {
+    throw httpError("路径越出工作区", 403)
+  }
+  let real
+  try {
+    real = realpathSync(candidate)
+  } catch (err) {
+    throw mapFsError(err, "文件不存在")
+  }
+  const rel = relative(root, real)
+  if (!rel || !insideRoot(root, real)) {
+    throw httpError("路径越出工作区", 403)
+  }
+  let st
+  try {
+    st = statSync(real)
+  } catch (err) {
+    throw mapFsError(err, "文件不存在")
+  }
+  if (!st.isFile()) throw httpError("不是文件", 400)
+  if (st.size > MAX_WORKSPACE_FILE_BYTES) throw httpError("文件过大", 413)
+  return {
+    abs: real,
+    rel: rel.split("\\").join("/"),
+    size: st.size,
+    name: real.slice(real.lastIndexOf(sep) + 1),
+  }
+}
+
+/** 异步解析并从同一打开句柄读取文件（消除 resolve→read 间的 TOCTOU 与大文件 OOM，不阻塞事件循环）。 */
+export async function readWorkspaceFileAsync(cwd, requested) {
+  if (typeof cwd !== "string" || !cwd.trim()) throw httpError("缺少工作区", 400)
+  if (typeof requested !== "string" || !requested.trim()) throw httpError("缺少 path", 400)
+  let root
+  try {
+    root = await realpath(resolve(cwd.trim()))
+  } catch (err) {
+    throw mapFsError(err, "工作区不存在")
+  }
+  const candidate = isAbsolute(requested.trim()) ? resolve(requested.trim()) : resolve(root, requested.trim())
+  if (candidate === root || !insideRoot(root, candidate)) {
+    throw httpError("路径越出工作区", 403)
+  }
+  let real
+  try {
+    real = await realpath(candidate)
+  } catch (err) {
+    throw mapFsError(err, "文件不存在")
+  }
+  const rel = relative(root, real)
+  if (!rel || !insideRoot(root, real)) {
+    throw httpError("路径越出工作区", 403)
+  }
+  const openFlags = fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0)
+  let fh
+  try {
+    fh = await open(real, openFlags)
+  } catch (err) {
+    if (err?.code === "ELOOP") throw httpError("路径越出工作区", 403)
+    throw mapFsError(err, "文件不存在")
+  }
+  try {
+    const st = await fh.stat()
+    if (!st.isFile()) throw httpError("不是文件", 400)
+    if (st.size > MAX_WORKSPACE_FILE_BYTES) throw httpError("文件过大", 413)
+    const chunks = []
+    let total = 0
+    const buf = Buffer.allocUnsafe(Math.min(Math.max(st.size, 4096), 256 * 1024))
+    for (;;) {
+      const { bytesRead } = await fh.read(buf, 0, buf.length, null)
+      if (bytesRead === 0) break
+      total += bytesRead
+      if (total > MAX_WORKSPACE_FILE_BYTES) throw httpError("文件过大", 413)
+      chunks.push(Buffer.from(buf.subarray(0, bytesRead)))
+    }
+    return {
+      abs: real,
+      rel: rel.split("\\").join("/"),
+      size: total,
+      name: real.slice(real.lastIndexOf(sep) + 1),
+      body: Buffer.concat(chunks, total),
+    }
+  } finally {
+    await fh.close().catch(() => {})
+  }
+}
+
 /**
  * 列出会话 cwd 沙箱内的一层目录（手机文件树按层懒加载）。
  * - requested 为空 / "." 即工作区根；越界（含经符号链接越界）403，不存在 404，不是目录 400。
@@ -74,55 +127,177 @@ function insideRoot(root, real) {
  */
 export function listWorkspaceDir(cwd, requested) {
   if (typeof cwd !== "string" || !cwd.trim()) throw httpError("缺少工作区", 400)
-  const root = realpathSync(resolve(cwd.trim()))
+  let root
+  try {
+    root = realpathSync(resolve(cwd.trim()))
+  } catch (err) {
+    throw mapFsError(err, "工作区不存在")
+  }
   const raw = typeof requested === "string" ? requested.trim() : ""
   const candidate = raw === "" || raw === "." ? root : (isAbsolute(raw) ? resolve(raw) : resolve(root, raw))
   if (!insideRoot(root, candidate)) throw httpError("路径越出工作区", 403)
   let real
   try {
     real = realpathSync(candidate)
-  } catch {
-    throw httpError("目录不存在", 404)
+  } catch (err) {
+    throw mapFsError(err, "目录不存在")
   }
   if (!insideRoot(root, real)) throw httpError("路径越出工作区", 403)
-  if (!statSync(real).isDirectory()) throw httpError("不是目录", 400)
+  let rootStat
+  try {
+    rootStat = statSync(real)
+  } catch (err) {
+    throw mapFsError(err, "目录不存在")
+  }
+  if (!rootStat.isDirectory()) throw httpError("不是目录", 400)
 
   const dirents = readdirSync(real, { withFileTypes: true })
-  const entries = []
+  const dirs = []
+  const nonDirs = []
   for (const d of dirents) {
     const abs = resolve(real, d.name)
-    const entry = { name: d.name }
-    try {
-      if (d.isSymbolicLink()) {
-        let target = null
-        try {
-          target = realpathSync(abs)
-        } catch {
-          target = null
-        }
-        if (!target || !insideRoot(root, target)) {
-          entries.push({ ...entry, type: "symlink", outside: true })
-          continue
-        }
-        const st = statSync(target)
-        entry.link = true
-        Object.assign(entry, describeStat(st))
-      } else {
-        Object.assign(entry, describeStat(lstatSync(abs)))
-      }
-    } catch {
-      entry.type = "other"
+    if (d.isDirectory()) {
+      dirs.push({ name: d.name, type: "dir" })
+      continue
     }
-    entries.push(entry)
+    if (d.isSymbolicLink()) {
+      let target = null
+      try { target = realpathSync(abs) } catch { target = null }
+      if (!target || !insideRoot(root, target)) {
+        nonDirs.push({ name: d.name, type: "symlink", outside: true })
+        continue
+      }
+      try {
+        const st = statSync(target)
+        const described = { name: d.name, link: true, ...describeStat(st) }
+        if (described.type === "dir") dirs.push(described)
+        else nonDirs.push(described)
+      } catch {
+        nonDirs.push({ name: d.name, type: "other" })
+      }
+      continue
+    }
+    nonDirs.push({ name: d.name, _dirent: d, _abs: abs })
   }
-  const rank = (e) => (e.type === "dir" ? 0 : 1)
-  entries.sort((a, b) => rank(a) - rank(b) || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
+  const byName = (a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0)
+  dirs.sort(byName)
+  nonDirs.sort(byName)
+  const total = dirs.length + nonDirs.length
+  const kept = []
+  for (const d of dirs) {
+    if (kept.length >= MAX_WORKSPACE_DIR_ENTRIES) break
+    kept.push(d)
+  }
+  for (const item of nonDirs) {
+    if (kept.length >= MAX_WORKSPACE_DIR_ENTRIES) break
+    if (!item._abs) {
+      kept.push(item)
+      continue
+    }
+    try {
+      kept.push({ name: item.name, ...describeStat(lstatSync(item._abs)) })
+    } catch {
+      kept.push({ name: item.name, type: "other" })
+    }
+  }
   const rel = relative(root, real).split("\\").join("/")
   return {
     path: rel,
-    total: entries.length,
-    truncated: entries.length > MAX_WORKSPACE_DIR_ENTRIES,
-    entries: entries.slice(0, MAX_WORKSPACE_DIR_ENTRIES),
+    total,
+    truncated: total > MAX_WORKSPACE_DIR_ENTRIES,
+    entries: kept,
+  }
+}
+
+/** 异步目录列表：避免大目录同步 stat 阻塞事件循环，并先按目录/名称排序截断后再对保留的文件执行 lstat。 */
+export async function listWorkspaceDirAsync(cwd, requested) {
+  if (typeof cwd !== "string" || !cwd.trim()) throw httpError("缺少工作区", 400)
+  let root
+  try {
+    root = await realpath(resolve(cwd.trim()))
+  } catch (err) {
+    throw mapFsError(err, "工作区不存在")
+  }
+  const raw = typeof requested === "string" ? requested.trim() : ""
+  const candidate = raw === "" || raw === "." ? root : (isAbsolute(raw) ? resolve(raw) : resolve(root, raw))
+  if (!insideRoot(root, candidate)) throw httpError("路径越出工作区", 403)
+  let real
+  try {
+    real = await realpath(candidate)
+  } catch (err) {
+    throw mapFsError(err, "目录不存在")
+  }
+  if (!insideRoot(root, real)) throw httpError("路径越出工作区", 403)
+  let rootStat
+  try {
+    rootStat = await stat(real)
+  } catch (err) {
+    throw mapFsError(err, "目录不存在")
+  }
+  if (!rootStat.isDirectory()) throw httpError("不是目录", 400)
+
+  const dirents = await readdir(real, { withFileTypes: true })
+  const dirs = []
+  const nonDirs = []
+  const symlinks = []
+  for (const d of dirents) {
+    if (d.isDirectory()) dirs.push({ name: d.name, type: "dir" })
+    else if (d.isSymbolicLink()) symlinks.push(d)
+    else nonDirs.push({ name: d.name, _abs: resolve(real, d.name) })
+  }
+  if (symlinks.length > 0) {
+    let cursor = 0
+    const worker = async () => {
+      while (cursor < symlinks.length) {
+        const d = symlinks[cursor++]
+        const abs = resolve(real, d.name)
+        let target = null
+        try { target = await realpath(abs) } catch { target = null }
+        if (!target || !insideRoot(root, target)) {
+          nonDirs.push({ name: d.name, type: "symlink", outside: true })
+          continue
+        }
+        try {
+          const st = await stat(target)
+          const described = { name: d.name, link: true, ...describeStat(st) }
+          if (described.type === "dir") dirs.push(described)
+          else nonDirs.push(described)
+        } catch {
+          nonDirs.push({ name: d.name, type: "other" })
+        }
+      }
+    }
+    await Promise.all(Array.from({ length: Math.min(16, symlinks.length) }, () => worker()))
+  }
+  const byName = (a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0)
+  dirs.sort(byName)
+  nonDirs.sort(byName)
+  const total = dirs.length + nonDirs.length
+  const keptDirs = dirs.slice(0, MAX_WORKSPACE_DIR_ENTRIES)
+  const remain = MAX_WORKSPACE_DIR_ENTRIES - keptDirs.length
+  const keptNonDirs = nonDirs.slice(0, Math.max(0, remain))
+  if (keptNonDirs.length > 0) {
+    let cursor = 0
+    const worker = async () => {
+      while (cursor < keptNonDirs.length) {
+        const idx = cursor++
+        const item = keptNonDirs[idx]
+        if (!item._abs) continue
+        try {
+          keptNonDirs[idx] = { name: item.name, ...describeStat(await lstat(item._abs)) }
+        } catch {
+          keptNonDirs[idx] = { name: item.name, type: "other" }
+        }
+      }
+    }
+    await Promise.all(Array.from({ length: Math.min(16, keptNonDirs.length) }, () => worker()))
+  }
+  const rel = relative(root, real).split("\\").join("/")
+  return {
+    path: rel,
+    total,
+    truncated: total > MAX_WORKSPACE_DIR_ENTRIES,
+    entries: [...keptDirs, ...keptNonDirs],
   }
 }
 

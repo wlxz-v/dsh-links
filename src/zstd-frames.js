@@ -9,25 +9,49 @@
  */
 import { createZstdDecompress } from "node:zlib"
 
-/** 解压单帧：返回该帧输出、消费的压缩字节数与（若有）错误。 */
-function decodeFirstFrame(buf) {
+/** 解压单帧：流式守住剩余字节上限（防单帧压缩炸弹 OOM），返回该帧输出与消费字节数。 */
+function decodeFirstFrame(buf, maxFrameBytes) {
   return new Promise((resolve) => {
     const chunks = []
+    let frameBytes = 0
     let settled = false
     let failure = null
-    const stream = createZstdDecompress()
+    let limitExceeded = false
+    const stream = createZstdDecompress(
+      Number.isSafeInteger(maxFrameBytes) && maxFrameBytes < Number.MAX_SAFE_INTEGER
+        ? { maxOutputLength: maxFrameBytes }
+        : undefined,
+    )
     const finish = () => {
       if (settled) return
       settled = true
       resolve({
-        data: Buffer.concat(chunks),
+        data: limitExceeded ? Buffer.alloc(0) : Buffer.concat(chunks),
         consumed: Number.isSafeInteger(stream.bytesWritten) ? stream.bytesWritten : 0,
         error: failure,
+        limitExceeded,
       })
     }
-    stream.on("data", (chunk) => { chunks.push(chunk) })
-    stream.on("error", (error) => { failure = error; finish() })
+    stream.on("data", (chunk) => {
+      if (settled || limitExceeded) return
+      frameBytes += chunk.length
+      if (frameBytes > maxFrameBytes) {
+        limitExceeded = true
+        chunks.length = 0
+        failure = new Error(`zstd output exceeds ${maxFrameBytes} bytes`)
+        try { stream.destroy() } catch {}
+        finish()
+        return
+      }
+      chunks.push(chunk)
+    })
+    stream.on("error", (error) => {
+      if (error?.code === "ERR_BUFFER_TOO_LARGE") limitExceeded = true
+      failure = error
+      finish()
+    })
     stream.on("end", finish)
+    stream.on("close", finish)
     stream.end(buf)
   })
 }
@@ -53,7 +77,11 @@ export async function decompressZstdFrames(buf, options = {}) {
   let offset = 0
   let produced = 0
   while (offset < buf.length) {
-    const frame = await decodeFirstFrame(buf.subarray(offset))
+    const remaining = maxOutputBytes - produced
+    const frame = await decodeFirstFrame(buf.subarray(offset), remaining)
+    if (frame.limitExceeded) {
+      throw new Error(`zstd output exceeds ${maxOutputBytes} bytes`)
+    }
     if (frame.data.length) {
       produced += frame.data.length
       if (produced > maxOutputBytes) {

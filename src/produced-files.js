@@ -81,7 +81,7 @@ export function toolResultMeta(event) {
     callId: typeof sourceCallId === "string" && sourceCallId.length > 0
       ? sourceCallId
       : (typeof head?.toolCallId === "string" && head.toolCallId.length > 0 ? head.toolCallId : null),
-    isError: head?.isError === true,
+    isError: message.isError === true || head?.isError === true,
   }
 }
 

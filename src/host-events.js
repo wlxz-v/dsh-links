@@ -2,9 +2,12 @@
  * 主机级会话状态 SSE。DSH 没有全局会话事件，只在有订阅者时对 session.list 做差分。
  * 事件只有会话级状态，不带消息正文和工具参数。
  */
+import { SSE_MAX_BACKLOG_BYTES } from "./stream-cursor.js"
 
 const ACTIVE = new Set(["running", "awaitingApproval", "awaitingInput"])
 const DEFAULT_BUFFER_LIMIT = 200
+const MAX_TERMINAL_CACHE = 512
+const TERMINAL_REASON_CONCURRENCY = 4
 
 export function isActiveHostState(state) {
   return ACTIVE.has(state)
@@ -124,10 +127,11 @@ export function resyncFrame(afterSeq) {
 
 function eventsAfter(buffer, seq, lastEventId) {
   const id = Number(lastEventId)
-  if (!Number.isFinite(id) || id <= 0) return { resync: false, events: [] }
-  if (id >= seq) return { resync: false, events: [] }
-  if (buffer.length === 0 || buffer[0].seq > id + 1) return { resync: true, events: [] }
-  return { resync: false, events: buffer.filter((event) => event.seq > id) }
+  if (!Number.isFinite(id) || id <= 0) return { resync: false, caughtUp: false, events: [] }
+  if (id > seq) return { resync: true, caughtUp: false, events: [] }
+  if (id === seq) return { resync: false, caughtUp: true, events: [] }
+  if (buffer.length === 0 || buffer[0].seq > id + 1) return { resync: true, caughtUp: false, events: [] }
+  return { resync: false, caughtUp: false, events: buffer.filter((event) => event.seq > id) }
 }
 
 /**
@@ -171,7 +175,7 @@ export function createHostEventHub({
   function writeOne(conn, frame) {
     try {
       const ok = conn.res.write(frame)
-      if (ok === false && (conn.res.writableLength ?? 0) > 4 * 1024 * 1024) drop(conn)
+      if (ok === false && (conn.res.writableLength ?? 0) > SSE_MAX_BACKLOG_BYTES) drop(conn)
     } catch {
       drop(conn)
     }
@@ -224,26 +228,44 @@ export function createHostEventHub({
     try {
       const rows = await listSessions()
       const next = new Map()
+      const asOfBySession = new Map()
       for (const row of rows ?? []) {
         const classified = classifyHostSession(row)
         if (!classified.sessionId) continue
         next.set(classified.sessionId, classified)
+        if (Number.isInteger(row?.asOfSeq)) asOfBySession.set(classified.sessionId, row.asOfSeq)
       }
       const initial = previous.size === 0
       const changes = diffHostSessions(previous, next, { initial })
-      for (const change of changes) {
-        const prev = previous.get(change.sessionId)
-        if (change.state === "completed" && prev && isActiveHostState(prev.state) && terminalReason) {
-          try {
-            change.state = terminalHostState(await terminalReason(change.sessionId))
-          } catch {
-            // 读不到结束原因就保持 completed
+      if (terminalReason) {
+        const needReason = changes.filter((change) => {
+          const prev = previous.get(change.sessionId)
+          return change.state === "completed" && prev && isActiveHostState(prev.state)
+        })
+        if (needReason.length > 0) {
+          let idx = 0
+          const worker = async () => {
+            while (idx < needReason.length) {
+              const change = needReason[idx++]
+              try {
+                const asOf = asOfBySession.get(change.sessionId)
+                change.state = terminalHostState(await terminalReason(change.sessionId, asOf))
+              } catch {
+                // 读不到结束原因就保持 completed
+              }
+            }
           }
+          await Promise.all(
+            Array.from({ length: Math.min(TERMINAL_REASON_CONCURRENCY, needReason.length) }, () => worker()),
+          )
         }
       }
       // F2：终态去重。会话跑完 → 自动重试又失败 → 再跑完，这种抖动会在几分钟内
       // 连推好几条通知；同一个会话在 notificationWindowMs 内重复同一种终态就标 notify:false。
       const at = now()
+      for (const [id, entry] of lastNotifiedTerminal) {
+        if (at - entry.at >= notificationWindowMs) lastNotifiedTerminal.delete(id)
+      }
       for (const change of changes) {
         // 注意：会话回到 running 时不能清掉记录——「失败→自动重试→又失败」正是要压的场景，
         // 清理只会让第二次失败再响一次。过期由 notificationWindowMs 负责。
@@ -252,7 +274,13 @@ export function createHostEventHub({
         if (last && last.state === change.state && at - last.at < notificationWindowMs) {
           change.notify = false
         } else {
+          lastNotifiedTerminal.delete(change.sessionId)
           lastNotifiedTerminal.set(change.sessionId, { state: change.state, at })
+          while (lastNotifiedTerminal.size > MAX_TERMINAL_CACHE) {
+            const first = lastNotifiedTerminal.keys().next()
+            if (first.done) break
+            lastNotifiedTerminal.delete(first.value)
+          }
         }
       }
       const stamped = []
@@ -288,7 +316,7 @@ export function createHostEventHub({
       writeSnapshot(conn)
     } else if (replay.events.length > 0) {
       for (const event of replay.events) writeOne(conn, hostEventFrame(event))
-    } else {
+    } else if (!replay.caughtUp) {
       writeSnapshot(conn)
     }
     if (first) poll().catch(() => {})
@@ -303,6 +331,9 @@ export function createHostEventHub({
       try { conn.res.end() } catch {}
     }
     subscribers.clear()
+    previous.clear()
+    buffer.length = 0
+    lastNotifiedTerminal.clear()
     stopTimersIfIdle()
   }
 
@@ -346,4 +377,5 @@ export function handleHostEvents(req, res, hub) {
   const cursor = since ?? parseHostCursor(req?.headers?.["last-event-id"])
   const unsubscribe = hub.subscribe(res, cursor != null ? String(cursor) : null)
   res.on("close", unsubscribe)
+  res.on("error", unsubscribe)
 }

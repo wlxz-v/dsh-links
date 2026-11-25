@@ -38,6 +38,6 @@ window.__ModuleLoader__.load({
 })
 `
 
-const out = header + panel + boot
+const out = `${header};(() => {\n${panel}${boot}})();\n`
 writeFileSync(join(root, "src", "client.js"), out)
 console.log(`client.js written: ${out.split("\n").length} lines`)

@@ -2,10 +2,11 @@
  * 18640 自签证书：身份是 SHA-256 指纹，不依赖主机名/IP SAN。
  * App 按指纹钉死；换 Wi-Fi 或局域网 IP 变化不影响。
  */
-import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs"
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync } from "node:fs"
 import { basename, join } from "node:path"
 import { X509Certificate } from "node:crypto"
 import selfsigned from "selfsigned"
+import { assertNotSymlinkSync, writeFileAtomicSync } from "./atomic-fs.js"
 
 export function certFingerprintSha256(pem) {
   const cert = new X509Certificate(pem)
@@ -17,6 +18,7 @@ export async function loadOrCreateTls(stateDir) {
   try { chmodSync(stateDir, 0o700) } catch {}
   const file = join(stateDir, "tls.json")
   if (existsSync(file)) {
+    assertNotSymlinkSync(file, "tls.json")
     try { chmodSync(file, 0o600) } catch {}
     let data = null
     let parsed = false
@@ -44,9 +46,6 @@ export async function loadOrCreateTls(stateDir) {
   )
   const fingerprint = certFingerprintSha256(pems.cert)
   const data = { key: pems.private, cert: pems.cert, fingerprint }
-  const tmp = `${file}.${process.pid}.tmp`
-  writeFileSync(tmp, JSON.stringify(data, null, 2), { mode: 0o600 })
-  renameSync(tmp, file)
-  try { chmodSync(file, 0o600) } catch {}
+  writeFileAtomicSync(file, JSON.stringify(data, null, 2), { mode: 0o600, dirMode: 0o700 })
   return data
 }

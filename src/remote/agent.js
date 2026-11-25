@@ -16,7 +16,7 @@ import tls from "node:tls"
 import WebSocket, { createWebSocketStream } from "ws"
 import {
   acceptTranscript, b64u, clientMac, clientTranscript, deviceRelayKey, hostPublicKey,
-  registerTranscript, routeId as deriveRouteId, safeEqual, signHost, unb64u,
+  privateKeyFromSeed, registerTranscript, routeId as deriveRouteId, safeEqual, signHost, unb64u,
 } from "./crypto.js"
 import { NonceCache } from "./bootstrap.js"
 import {
@@ -29,11 +29,31 @@ import {
 
 const SELFTEST_TTL_MS = 60_000
 const WATCHDOG_INTERVAL_MS = 5_000
+const LOCAL_FLUSH_TIMEOUT_MS = 5_000
+
+function safeCloseWs(ws, code = CLOSE.NORMAL) {
+  if (!ws) return
+  try {
+    if (ws.readyState === WebSocket.CONNECTING) ws.terminate()
+    else if (ws.readyState === WebSocket.OPEN) ws.close(code)
+  } catch {}
+}
+
+function safeSendWs(ws, payload) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return false
+  try {
+    ws.send(payload, () => {})
+    return true
+  } catch {
+    return false
+  }
+}
 
 export class RemoteAgent extends EventEmitter {
   #endpoint
   #outerPin
   #hostKeySeed
+  #hostPrivKey
   #keySeed
   #hostPub
   #routeId
@@ -52,6 +72,8 @@ export class RemoteAgent extends EventEmitter {
   #lastError = ""
   #stopped = true
   #ctrl = null
+  #ctrlHandshakeTimer = null
+  #lastPongAt = 0
   #registeredAt = 0
   #attempt = 0
   #reconnectTimer = null
@@ -62,7 +84,8 @@ export class RemoteAgent extends EventEmitter {
   #streams = new Map()
   /** 本地 socket 的 localPort → 来源标签（§6.1） */
   #origins = new Map()
-  #selftest = null
+  /** handle(b64u) → { handle, expiresAtMs }，支持并发自检不互踩 */
+  #selftests = new Map()
 
   constructor({
     endpoint,
@@ -90,16 +113,19 @@ export class RemoteAgent extends EventEmitter {
       throw new TypeError("outerPin must be empty or 64 lowercase hex characters")
     }
     if (!Buffer.isBuffer(keySeed) || keySeed.length !== 32) throw new TypeError("keySeed must be 32 bytes")
-    if (!Number.isInteger(pluginPort) || pluginPort < 1 || pluginPort > 65535) throw new TypeError("invalid pluginPort")
+    if (typeof pluginPort !== "function" && (!Number.isInteger(pluginPort) || pluginPort < 1 || pluginPort > 65535)) {
+      throw new TypeError("invalid pluginPort")
+    }
     if (typeof lookupDevice !== "function" || typeof isLocalReady !== "function") throw new TypeError("missing callbacks")
     if (!bootstrap || typeof bootstrap.lookup !== "function") throw new TypeError("missing bootstrap table")
     this.#endpoint = url.toString()
     this.#outerPin = outerPin
     this.#hostKeySeed = Buffer.from(hostKeySeed)
+    this.#hostPrivKey = privateKeyFromSeed(this.#hostKeySeed)
     this.#hostPub = hostPublicKey(this.#hostKeySeed)
     this.#routeId = deriveRouteId(this.#hostPub)
     this.#keySeed = Buffer.from(keySeed)
-    this.#pluginPort = pluginPort
+    this.#pluginPort = typeof pluginPort === "function" ? pluginPort : () => pluginPort
     this.#lookupDevice = lookupDevice
     this.#bootstrap = bootstrap
     this.#isLocalReady = isLocalReady
@@ -144,7 +170,9 @@ export class RemoteAgent extends EventEmitter {
   async stop() {
     this.#stopped = true
     this.#clearTimer("reconnect")
+    this.#clearControlHandshake()
     this.#clearPing()
+    this.#selftests.clear()
     this.#settleStart(new Error("remote agent stopped"))
     const closing = []
     if (this.#ctrl) closing.push(closeAndWait(this.#ctrl, CLOSE.NORMAL))
@@ -163,7 +191,7 @@ export class RemoteAgent extends EventEmitter {
     for (const rec of [...this.#streams.values()]) {
       if (rec.tag.deviceId !== deviceId) continue
       count++
-      if (rec.ws) rec.ws.close(CLOSE.NORMAL)
+      safeCloseWs(rec.ws, CLOSE.NORMAL)
       this.#finishStream(rec)
     }
     return count
@@ -178,7 +206,8 @@ export class RemoteAgent extends EventEmitter {
     const result = { ok: false, failedStage: "outer", outerMs: null, rendezvousMs: null, innerTlsMs: null }
     if (this.#status !== "ready") return result
     const handle = randomBytes(KEY_BYTES)
-    this.#selftest = { handle, expiresAtMs: this.#now() + SELFTEST_TTL_MS }
+    const handleKey = b64u(handle)
+    this.#selftests.set(handleKey, { handle, expiresAtMs: this.#now() + SELFTEST_TTL_MS })
     const started = Date.now()
     let ws
     let innerSocket
@@ -191,7 +220,9 @@ export class RemoteAgent extends EventEmitter {
       const nonce = randomBytes(NONCE_BYTES)
       const transcript = clientTranscript({ route: this.#routeId, kind: "device", key: handle, ts, nonce })
       const mac = clientMac(deviceRelayKey(this.#keySeed, handle), transcript)
-      ws.send(encodeControl({ t: "client_open", v: DLP_VERSION, route: b64u(this.#routeId), kind: "device", key: b64u(handle), ts, nonce: b64u(nonce), mac: b64u(mac) }))
+      if (!safeSendWs(ws, encodeControl({ t: "client_open", v: DLP_VERSION, route: b64u(this.#routeId), kind: "device", key: handleKey, ts, nonce: b64u(nonce), mac: b64u(mac) }))) {
+        throw new Error("failed to send client_open")
+      }
       await waitForControl(ws, "ready", ACCEPT_READY_TIMEOUT_MS)
       result.rendezvousMs = Date.now() - started - result.outerMs
       result.failedStage = "inner"
@@ -206,7 +237,9 @@ export class RemoteAgent extends EventEmitter {
         timer.unref?.()
         inner.once("secureConnect", () => {
           clearTimeout(timer)
-          const fp = createHash("sha256").update(inner.getPeerCertificate().raw).digest("hex")
+          const raw = inner.getPeerCertificate()?.raw
+          if (!raw) return reject(new Error("missing inner peer certificate"))
+          const fp = createHash("sha256").update(raw).digest("hex")
           if (fp === pin) resolve()
           else reject(new Error("inner certificate mismatch"))
         })
@@ -219,9 +252,9 @@ export class RemoteAgent extends EventEmitter {
     } catch {
       // 失败阶段已记在 result.failedStage
     } finally {
-      this.#selftest = null
+      this.#selftests.delete(handleKey)
       innerSocket?.destroy()
-      ws?.close(CLOSE.NORMAL)
+      safeCloseWs(ws, CLOSE.NORMAL)
     }
     return result
   }
@@ -235,31 +268,43 @@ export class RemoteAgent extends EventEmitter {
     this.#ctrl = ws
     let registered = false
     let sentRegister = false
+    this.#clearControlHandshake()
+    this.#ctrlHandshakeTimer = setTimeout(() => {
+      this.#ctrlHandshakeTimer = null
+      if (this.#ctrl === ws && !registered) {
+        this.#lastError = "TIMEOUT"
+        this.#logger.warn("dlp-agent: control registration timed out")
+        try { ws.terminate() } catch {}
+      }
+    }, ACCEPT_READY_TIMEOUT_MS)
+    this.#ctrlHandshakeTimer?.unref?.()
     ws.on("message", (data, isBinary) => {
       const msg = isBinary ? null : parseControlFrame(data)
       if (!msg || typeof msg.t !== "string") {
-        ws.close(CLOSE.PROTOCOL_ERROR)
+        safeCloseWs(ws, CLOSE.PROTOCOL_ERROR)
         return
       }
       if (msg.t === "hello" && !sentRegister) {
         const ch = decodeField(msg.ch, CHALLENGE_BYTES)
         if (msg.v !== DLP_VERSION || !ch) {
-          ws.close(CLOSE.PROTOCOL_ERROR)
+          safeCloseWs(ws, CLOSE.PROTOCOL_ERROR)
           return
         }
         sentRegister = true
-        const sig = signHost(this.#hostKeySeed, registerTranscript(ch, this.#hostPub))
-        ws.send(encodeControl({ t: "host_register", v: DLP_VERSION, pub: b64u(this.#hostPub), sig: b64u(sig) }))
+        const sig = signHost(this.#hostPrivKey, registerTranscript(ch, this.#hostPub))
+        safeSendWs(ws, encodeControl({ t: "host_register", v: DLP_VERSION, pub: b64u(this.#hostPub), sig: b64u(sig) }))
       } else if (msg.t === "registered" && sentRegister && !registered) {
         const route = decodeField(msg.route, ROUTE_BYTES)
         // Relay 给出的 route 必须与本机推导一致，否则不是我们注册成功的那条
         if (!route || !route.equals(this.#routeId)) {
-          ws.close(CLOSE.PROTOCOL_ERROR)
+          safeCloseWs(ws, CLOSE.PROTOCOL_ERROR)
           return
         }
         registered = true
+        this.#clearControlHandshake()
         this.#lastError = ""
         this.#registeredAt = this.#now()
+        this.#lastPongAt = this.#registeredAt
         this.#startPing(ws, Number.isSafeInteger(msg.ping) && msg.ping > 0 ? msg.ping : 20)
         this.#logger.info("dlp-agent: registered")
         this.#setStatus("ready")
@@ -267,12 +312,12 @@ export class RemoteAgent extends EventEmitter {
       } else if (msg.t === "open" && registered) {
         this.#handleOpen(msg)
       } else if (msg.t === "pong" && registered) {
-        // 只用于保活
+        this.#lastPongAt = this.#now()
       } else if (msg.t === "error") {
         this.#lastError = safeCode(msg.code)
         this.#logger.warn(`dlp-agent: relay error code=${this.#lastError}`)
       } else {
-        ws.close(CLOSE.PROTOCOL_ERROR)
+        safeCloseWs(ws, CLOSE.PROTOCOL_ERROR)
       }
     })
     ws.on("error", (err) => {
@@ -284,10 +329,12 @@ export class RemoteAgent extends EventEmitter {
   #onControlClose(ws, code, registered) {
     if (this.#ctrl !== ws) return
     this.#ctrl = null
+    this.#clearControlHandshake()
     this.#clearPing()
     if (this.#stopped) return
     if (code === CLOSE.AUTH_FAILED || code === CLOSE.UNSUPPORTED_VERSION) {
       // 签名或版本不被接受：重连不会变好，停下等人处理（§6.7）
+      this.#lastError = code === CLOSE.AUTH_FAILED ? "AUTH_FAILED" : "UNSUPPORTED_VERSION"
       this.#logger.warn(`dlp-agent: registration refused code=${code}`)
       this.#stopped = true
       this.#setStatus("error")
@@ -314,10 +361,25 @@ export class RemoteAgent extends EventEmitter {
     this.#reconnectTimer?.unref?.()
   }
 
+  #clearControlHandshake() {
+    if (this.#ctrlHandshakeTimer) {
+      clearTimeout(this.#ctrlHandshakeTimer)
+      this.#ctrlHandshakeTimer = null
+    }
+  }
+
   #startPing(ws, seconds) {
     this.#clearPing()
+    const pongDeadlineMs = (seconds * 2 + 5) * 1000
     this.#pingTimer = this.#timers.setInterval(() => {
-      if (ws.readyState === WebSocket.OPEN) ws.send(encodeControl({ t: "ping" }))
+      if (this.#ctrl !== ws || ws.readyState !== WebSocket.OPEN) return
+      if (this.#now() - this.#lastPongAt > pongDeadlineMs) {
+        this.#lastError = "TIMEOUT"
+        this.#logger.warn("dlp-agent: control ping/pong timed out")
+        try { ws.terminate() } catch {}
+        return
+      }
+      safeSendWs(ws, encodeControl({ t: "ping" }))
     }, seconds * 1000)
     this.#pingTimer?.unref?.()
   }
@@ -354,19 +416,38 @@ export class RemoteAgent extends EventEmitter {
     const sid = decodeField(msg.sid, SID_BYTES)
     if (!sid) {
       // 连 sid 都无法解析就无法回 reject；这是 Relay 的协议违规
-      this.#ctrl?.close(CLOSE.PROTOCOL_ERROR)
+      safeCloseWs(this.#ctrl, CLOSE.PROTOCOL_ERROR)
       return
     }
     const sidText = b64u(sid)
+    if (this.#streams.has(sidText)) {
+      // 重复 sid 属于中继协议违规：绝不覆盖活跃流，否则旧流脱管且吊销失效
+      safeCloseWs(this.#ctrl, CLOSE.PROTOCOL_ERROR)
+      return
+    }
     const verdict = this.#verifyOpen(msg.req)
     if (verdict.code) {
       const reject = { t: "reject", sid: sidText, code: verdict.code }
       if (verdict.hostNow !== undefined) reject.hostNow = verdict.hostNow
-      this.#ctrl?.send(encodeControl(reject))
+      safeSendWs(this.#ctrl, encodeControl(reject))
       this.#logger.info(`dlp-agent: open rejected code=${verdict.code}`)
       return
     }
-    const rec = { sid, sidText, tag: { ...verdict.tag, sid: sidText }, limitKey: verdict.limitKey, ws: null, local: null, localPort: null, done: false, opened: false, watchdog: null }
+    const rec = {
+      sid,
+      sidText,
+      tag: { ...verdict.tag, sid: sidText },
+      limitKey: verdict.limitKey,
+      ws: null,
+      wsStream: null,
+      local: null,
+      localPort: null,
+      done: false,
+      opened: false,
+      watchdog: null,
+      readyTimer: null,
+      flushTimer: null,
+    }
     this.#streams.set(sidText, rec)
     this.#acceptStream(rec)
   }
@@ -421,9 +502,13 @@ export class RemoteAgent extends EventEmitter {
   }
 
   #findDevice(handle) {
-    const selftest = this.#selftest
-    if (selftest && selftest.expiresAtMs > this.#now() && selftest.handle.equals(handle)) {
-      return { deviceId: "selftest", selftest: true }
+    const key = b64u(handle)
+    const selftest = this.#selftests.get(key)
+    if (selftest) {
+      if (selftest.expiresAtMs > this.#now() && selftest.handle.equals(handle)) {
+        return { deviceId: "selftest", selftest: true }
+      }
+      this.#selftests.delete(key)
     }
     return this.#lookupDevice(Buffer.from(handle)) ?? null
   }
@@ -436,40 +521,48 @@ export class RemoteAgent extends EventEmitter {
     rec.ws = ws
     const readyTimer = this.#timers.setTimeout(() => {
       // ready 没来：Relay 那边手机会得到 OPEN_TIMEOUT，这里只收尾
+      rec.readyTimer = null
       this.#logger.info("dlp-agent: accept timed out")
-      ws.close(CLOSE.NORMAL)
+      safeCloseWs(ws, CLOSE.NORMAL)
       this.#finishStream(rec)
     }, ACCEPT_READY_TIMEOUT_MS)
     readyTimer?.unref?.()
+    rec.readyTimer = readyTimer
     let stage = "hello"
     const sendAccept = (ch) => {
-      const sig = signHost(this.#hostKeySeed, acceptTranscript(ch, this.#hostPub, rec.sid))
-      ws.send(encodeControl({ t: "host_accept", v: DLP_VERSION, pub: b64u(this.#hostPub), sid: rec.sidText, sig: b64u(sig) }))
+      const sig = signHost(this.#hostPrivKey, acceptTranscript(ch, this.#hostPub, rec.sid))
+      safeSendWs(ws, encodeControl({ t: "host_accept", v: DLP_VERSION, pub: b64u(this.#hostPub), sid: rec.sidText, sig: b64u(sig) }))
       stage = "ready"
     }
     const onMessage = (data, isBinary) => {
       if (stage === "data") {
         // 数据阶段只允许二进制（§5.4.4）
-        if (!isBinary) ws.close(CLOSE.PROTOCOL_ERROR)
+        if (!isBinary) safeCloseWs(ws, CLOSE.PROTOCOL_ERROR)
         return
       }
       const msg = isBinary ? null : parseControlFrame(data)
       if (msg?.t === "hello" && stage === "hello") {
         const ch = decodeField(msg.ch, CHALLENGE_BYTES)
-        if (msg.v !== DLP_VERSION || !ch) ws.close(CLOSE.PROTOCOL_ERROR)
+        if (msg.v !== DLP_VERSION || !ch) safeCloseWs(ws, CLOSE.PROTOCOL_ERROR)
         else sendAccept(ch)
       } else if (msg?.t === "ready" && stage === "ready") {
         stage = "data"
-        this.#timers.clearTimeout(readyTimer)
+        if (rec.readyTimer) {
+          this.#timers.clearTimeout(rec.readyTimer)
+          rec.readyTimer = null
+        }
         this.#bridgeLocal(rec)
       } else {
-        ws.close(CLOSE.PROTOCOL_ERROR)
+        safeCloseWs(ws, CLOSE.PROTOCOL_ERROR)
       }
     }
     ws.on("message", onMessage)
     ws.on("error", () => {})
     ws.on("close", () => {
-      this.#timers.clearTimeout(readyTimer)
+      if (rec.readyTimer) {
+        this.#timers.clearTimeout(rec.readyTimer)
+        rec.readyTimer = null
+      }
       this.#finishStream(rec)
     })
   }
@@ -480,10 +573,18 @@ export class RemoteAgent extends EventEmitter {
     const ws = rec.ws
     // 先建 duplex，ready 之后客户端可能立刻发数据；本地连上之前由 duplex 缓冲（满了会暂停 ws）
     const wsStream = createWebSocketStream(ws, { highWaterMark: DATA_CHUNK_BYTES })
+    rec.wsStream = wsStream
     wsStream.on("error", () => {})
-    const local = net.createConnection({ host: "127.0.0.1", port: this.#pluginPort })
+    const port = this.#pluginPort()
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      safeCloseWs(ws, CLOSE.INTERNAL_ERROR)
+      this.#finishStream(rec)
+      return
+    }
+    const local = net.createConnection({ host: "127.0.0.1", port })
     rec.local = local
-    local.on("error", () => {})
+    let localErrored = false
+    local.on("error", () => { localErrored = true })
     local.once("connect", () => {
       if (rec.done) {
         local.destroy()
@@ -498,36 +599,62 @@ export class RemoteAgent extends EventEmitter {
       local.pipe(wsStream)
       this.#startWatchdog(rec)
     })
-    local.once("close", () => {
+    local.once("close", (hadError) => {
       if (!rec.opened) {
         // 本地连接失败（§5.5 第 10 步）
-        ws.close(CLOSE.INTERNAL_ERROR)
-      } else {
-        ws.close(CLOSE.NORMAL)
+        safeCloseWs(ws, CLOSE.INTERNAL_ERROR)
+        this.#finishStream(rec)
+        return
       }
-      this.#finishStream(rec)
+      if (hadError || localErrored || wsStream.writableFinished || wsStream.destroyed) {
+        safeCloseWs(ws, CLOSE.NORMAL)
+        this.#finishStream(rec)
+        return
+      }
+      // 正常关闭时等待 wsStream 把最后一段响应字节冲刷到 WAN，防止尾部截断。
+      const finishAfterFlush = () => {
+        if (rec.flushTimer) {
+          this.#timers.clearTimeout(rec.flushTimer)
+          rec.flushTimer = null
+        }
+        safeCloseWs(ws, CLOSE.NORMAL)
+        this.#finishStream(rec)
+      }
+      wsStream.once("finish", finishAfterFlush)
+      wsStream.once("close", finishAfterFlush)
+      rec.flushTimer = this.#timers.setTimeout(finishAfterFlush, LOCAL_FLUSH_TIMEOUT_MS)
+      rec.flushTimer?.unref?.()
     })
   }
 
-  /** 单次写超时 30 秒（RFC §5.8）：任一方向的待写数据 30 秒没有进展就关闭这一对。 */
+  /** 单次写超时 30 秒（RFC §5.8）：任一方向的待写数据 30 秒没有字节进展就关闭这一对。 */
   #startWatchdog(rec) {
-    let lastWs = 0
-    let lastLocal = 0
+    let lastWsPending = 0
+    let lastLocalPending = 0
+    let lastWsBytes = rec.ws?._socket?.bytesWritten ?? 0
+    let lastLocalBytes = rec.local?.bytesWritten ?? 0
     let stalledSince = null
     rec.watchdog = this.#timers.setInterval(() => {
       const wsPending = rec.ws?.bufferedAmount ?? 0
       const localPending = rec.local?.writableLength ?? 0
-      const progressing = (wsPending === 0 || wsPending < lastWs) && (localPending === 0 || localPending < lastLocal)
-      lastWs = wsPending
-      lastLocal = localPending
-      if (progressing) {
+      const wsBytes = rec.ws?._socket?.bytesWritten ?? lastWsBytes
+      const localBytes = rec.local?.bytesWritten ?? lastLocalBytes
+      // 有积压时只要累计写出字节增加或积压下降，就说明管道仍在正常流动，不误杀大文件传输。
+      const wsStalled = wsPending > 0 && wsBytes === lastWsBytes && wsPending >= lastWsPending
+      const localStalled = localPending > 0 && localBytes === lastLocalBytes && localPending >= lastLocalPending
+      lastWsPending = wsPending
+      lastLocalPending = localPending
+      lastWsBytes = wsBytes
+      lastLocalBytes = localBytes
+      if (!wsStalled && !localStalled) {
         stalledSince = null
         return
       }
-      stalledSince ??= Date.now()
-      if (Date.now() - stalledSince >= WRITE_TIMEOUT_MS) {
+      const nowMs = this.#now()
+      stalledSince ??= nowMs
+      if (nowMs - stalledSince >= WRITE_TIMEOUT_MS) {
         this.#logger.info("dlp-agent: stream write timed out")
-        rec.ws?.terminate()
+        try { rec.ws?.terminate() } catch {}
         this.#finishStream(rec)
       }
     }, WATCHDOG_INTERVAL_MS)
@@ -537,11 +664,27 @@ export class RemoteAgent extends EventEmitter {
   #finishStream(rec) {
     if (rec.done) return
     rec.done = true
-    if (rec.watchdog) this.#timers.clearInterval(rec.watchdog)
-    if (rec.localPort !== null) this.#origins.delete(rec.localPort)
-    this.#streams.delete(rec.sidText)
+    if (rec.watchdog) {
+      this.#timers.clearInterval(rec.watchdog)
+      rec.watchdog = null
+    }
+    if (rec.readyTimer) {
+      this.#timers.clearTimeout(rec.readyTimer)
+      rec.readyTimer = null
+    }
+    if (rec.flushTimer) {
+      this.#timers.clearTimeout(rec.flushTimer)
+      rec.flushTimer = null
+    }
+    if (rec.localPort !== null && this.#origins.get(rec.localPort)?.sid === rec.sidText) {
+      this.#origins.delete(rec.localPort)
+    }
+    if (this.#streams.get(rec.sidText) === rec) {
+      this.#streams.delete(rec.sidText)
+    }
+    try { rec.wsStream?.destroy() } catch {}
     rec.local?.destroy()
-    if (rec.ws && rec.ws.readyState !== WebSocket.CLOSED && rec.ws.readyState !== WebSocket.CLOSING) rec.ws.close(CLOSE.NORMAL)
+    safeCloseWs(rec.ws, CLOSE.NORMAL)
     if (rec.opened) this.emit("stream-close", publicTag(rec.tag))
   }
 

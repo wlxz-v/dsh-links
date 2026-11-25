@@ -1,5 +1,4 @@
-import { readFileSync, statSync } from "node:fs"
-import { readFile as readFileAsync } from "node:fs/promises"
+import { readFile as readFileAsync, stat as statAsync } from "node:fs/promises"
 import { isAbsolute } from "node:path"
 import { createHash, randomBytes } from "node:crypto"
 import { hostname } from "node:os"
@@ -7,25 +6,31 @@ import { callLocalRpc, LocalRpcError } from "./local-rpc.js"
 import { mobileSessionSummary } from "./mobile-session-summary.js"
 import { deriveActivity, deriveAwaitingInput, deriveLastResult, deriveStoppedReason } from "./mobile-session-activity.js"
 import { handleMobileModelsApi } from "./mobile-models.js"
-import { handleMobileSessionControlApi, queueItemsFromInbox } from "./mobile-session-control.js"
+import { controlErrorStatus, handleMobileSessionControlApi, queueItemsFromInbox } from "./mobile-session-control.js"
 import { pluginCapabilities, PLUGIN_PROTOCOL } from "./protocol-caps.js"
 import { runDiagnostics } from "./diagnostics.js"
 import { workspaceChangesService, parseChangesCoordinates, projectChangesSummary, projectFileDiff } from "./workspace-changes.js"
 import { clampHistoryMaxMessages, projectHistoryPage } from "./history.js"
 import { buildEstimatedCost, modelIdFromProjections } from "./pricing.js"
-import { listWorkspaceDir, mimeFromName, resolveWorkspaceFile } from "./workspace-file.js"
+import { listWorkspaceDirAsync, mimeFromName, readWorkspaceFileAsync } from "./workspace-file.js"
 import { optionalString, omitNullFields } from "./optional-string.js"
-import { MobileWorkspaceCreateError, planMobileWorkspaceCreate, ensureMobileWorkspaceDirectory, resolveAbsoluteWorkspaceDirectory } from "./workspace-create.js"
+import { MobileWorkspaceCreateError, planMobileWorkspaceCreate, ensureMobileWorkspaceDirectory, resolveAbsoluteWorkspaceDirectoryAsync } from "./workspace-create.js"
+import { normalizeComparisonPath } from "./workspace-path.js"
 import { normalizeQuestions, validateAnswers } from "./question-answers.js"
 import { canDeviceHandle, requestBelongsToSession, mapApprovalUiStatus } from "./request-lifecycle.js"
-import { resolveSessionLogPath, sessionDirFor } from "./session-log-path.js"
+import { resolveSessionLogPathAsync, sessionDirFor } from "./session-log-path.js"
 import { reasoningBlocksFromSessionLog } from "./session-log-reasoning.js"
 import { decompressZstdFrames } from "./zstd-frames.js"
 import { getBounded, setBounded } from "./bounded-map.js"
+import { safeDecodeUriComponent } from "./http-utils.js"
+import { DEVICE_MUTATION_REVOKED } from "./device-mutation-gate.js"
 
 const MAX_REASONING_CACHE = 32
 const MAX_ACTIVITY_CACHE = 256
 const MAX_PRICED_MODEL_CACHE = 128
+const MAX_SESSION_CWD_CACHE = 256
+const SESSION_CWD_CACHE_TTL_MS = 60_000
+const MODEL_CATALOG_PRICE_TTL_MS = 60_000
 
 const MAX_ZSTD_OUTPUT_BYTES = 32 * 1024 * 1024
 const PROMPT_BODY_LIMIT = 16 * 1024 * 1024
@@ -55,24 +60,58 @@ function pageNeedsReasoningFile(events) {
   })
 }
 
+function rememberSessionCwds(rt, items) {
+  if (!rt || !Array.isArray(items)) return
+  const cache = rt.sessionCwdCache ?? (rt.sessionCwdCache = new Map())
+  const at = Date.now()
+  for (const item of items) {
+    if (!item?.sessionId) continue
+    setBounded(cache, item.sessionId, { cwd: optionalString(item.cwd), at }, MAX_SESSION_CWD_CACHE)
+  }
+}
+
+async function resolveSessionCwd(targetPort, sessionId, rt) {
+  const cache = rt?.sessionCwdCache
+  if (cache) {
+    const hit = getBounded(cache, sessionId)
+    if (hit && Date.now() - hit.at < SESSION_CWD_CACHE_TTL_MS) {
+      return { found: true, cwd: hit.cwd }
+    }
+  }
+  const list = await callLocalRpc(targetPort, "session.list", {})
+  const items = list?.items ?? []
+  rememberSessionCwds(rt, items)
+  const item = items.find((s) => s.sessionId === sessionId)
+  if (!item) return { found: false, cwd: null }
+  return { found: true, cwd: optionalString(item.cwd) }
+}
+
 async function readSessionReasoning(targetPort, sessionId, rt) {
   try {
-    const list = await callLocalRpc(targetPort, "session.list", {})
-    const row = (list.items ?? []).find((s) => s.sessionId === sessionId)
-    const cwd = row?.cwd
-    if (!cwd) return new Map()
-    const p = resolveSessionLogPath(sessionDirFor(cwd, sessionId))
+    const looked = await resolveSessionCwd(targetPort, sessionId, rt)
+    if (!looked.found) return new Map()
+    const p = await resolveSessionLogPathAsync(sessionDirFor(looked.cwd, sessionId))
     if (!p) return new Map()
     let st
-    try { st = statSync(p) } catch { return new Map() }
+    try { st = await statAsync(p) } catch { return new Map() }
     if (st.size > 32 * 1024 * 1024) return new Map()
     const hit = getBounded(rt?.reasoningCache, p)
     if (hit && hit.mtime === st.mtimeMs && hit.size === st.size) return hit.map
-    const text = await readSessionLogText(p)
-    const reasoning = reasoningBlocksFromSessionLog(text)
-    setBounded(rt?.reasoningCache, p, { mtime: st.mtimeMs, size: st.size, map: reasoning }, MAX_REASONING_CACHE)
-    return reasoning
-  } catch (err) {
+    const inflight = rt ? (rt.reasoningInflight ?? (rt.reasoningInflight = new Map())) : null
+    const inflightKey = `${p}:${st.mtimeMs}:${st.size}`
+    if (inflight?.has(inflightKey)) return await inflight.get(inflightKey)
+    const loadPromise = (async () => {
+      const text = await readSessionLogText(p)
+      const reasoning = reasoningBlocksFromSessionLog(text)
+      setBounded(rt?.reasoningCache, p, { mtime: st.mtimeMs, size: st.size, map: reasoning }, MAX_REASONING_CACHE)
+      return reasoning
+    })()
+    if (inflight) {
+      inflight.set(inflightKey, loadPromise)
+      loadPromise.finally(() => inflight.delete(inflightKey))
+    }
+    return await loadPromise
+  } catch {
     return new Map()
   }
 }
@@ -108,12 +147,14 @@ const ACTIVITY_HISTORY_MAX_MESSAGES = 8
 const ACTIVITY_CONCURRENCY = 4
 
 /** 取一个会话的事件流；失败返回 null（调用方跳过该字段，不影响列表）。 */
-async function readSessionEvents(targetPort, sessionId) {
+async function readSessionEvents(targetPort, sessionId, throughSeq) {
   try {
-    const history = await callLocalRpc(targetPort, "session.history", {
+    const payload = {
       sessionId,
       maxMessages: ACTIVITY_HISTORY_MAX_MESSAGES,
-    })
+    }
+    if (Number.isInteger(throughSeq) && throughSeq >= 0) payload.throughSeq = throughSeq
+    const history = await callLocalRpc(targetPort, "session.history", payload)
     return Array.isArray(history?.events) ? history.events : null
   } catch {
     return null
@@ -130,13 +171,20 @@ async function readSessionEvents(targetPort, sessionId) {
  * [deps] 只为单测注入（`readEvents` / `changesService`）；生产路径用默认实现。
  */
 export async function attachSessionActivity(rt, targetPort, sessions, deps = {}) {
-  const readEvents = deps.readEvents ?? ((sessionId) => readSessionEvents(targetPort, sessionId))
+  const throughSeqBySessionId = deps.throughSeqBySessionId
+  const readEvents = deps.readEvents ?? ((sessionId) => readSessionEvents(targetPort, sessionId, throughSeqBySessionId?.get(sessionId)))
   const changesService = deps.changesService !== undefined
     ? deps.changesService
     : workspaceChangesService(rt?.workspaceChanges)
-  const targets = sessions
-    .filter((s) => s && typeof s.sessionId === "string" && s.sessionId)
-    .slice(0, ACTIVITY_SESSION_LIMIT)
+  const valid = sessions.filter((s) => s && typeof s.sessionId === "string" && s.sessionId)
+  // 优先保障 running 会话（即使排在 20 条以后也要拿到当前步骤与审批状态），其余按原顺序补齐到 20 条。
+  const runningRows = []
+  const idleRows = []
+  for (const row of valid) {
+    if (row.running) runningRows.push(row)
+    else idleRows.push(row)
+  }
+  const targets = [...runningRows, ...idleRows].slice(0, ACTIVITY_SESSION_LIMIT)
   if (targets.length === 0) return
   const cache = rt?.sessionActivityCache
   let cursor = 0
@@ -177,15 +225,14 @@ export async function attachSessionActivity(rt, targetPort, sessions, deps = {})
           events,
           changesService ? (seq) => changesService.summary(row.sessionId, seq) : null,
         )
-        if (lastResult) {
-          row.lastResult = lastResult
-          if (cache) {
-            const prefix = `${row.sessionId}:`
-            for (const existingKey of cache.keys()) {
-              if (existingKey !== key && existingKey.startsWith(prefix)) cache.delete(existingKey)
-            }
-            setBounded(cache, key, { lastResult, stoppedReason: row.stoppedReason, awaitingInput }, MAX_ACTIVITY_CACHE)
+        if (lastResult) row.lastResult = lastResult
+        // 已成功拉取历史的非 running 会话：即使 lastResult 为 null 也负缓存，避免每次列表轮询重复打 RPC。
+        if (cache) {
+          const prefix = `${row.sessionId}:`
+          for (const existingKey of cache.keys()) {
+            if (existingKey !== key && existingKey.startsWith(prefix)) cache.delete(existingKey)
           }
+          setBounded(cache, key, { lastResult: lastResult ?? null, stoppedReason: row.stoppedReason, awaitingInput }, MAX_ACTIVITY_CACHE)
         }
       }
     }
@@ -195,10 +242,18 @@ export async function attachSessionActivity(rt, targetPort, sessions, deps = {})
   )
 }
 
-/** 列表接口的统一装配：摘要 → 补活动字段。 */
+/** 列表接口的统一装配：摘要 → 补活动字段（透传 asOfSeq 避免 20× 重复 session.list）。 */
 async function summarizeSessionList(rt, targetPort, items) {
+  rememberSessionCwds(rt, items)
+  const throughSeqBySessionId = new Map()
+  for (const item of items ?? []) {
+    const asOfSeq = item?.projections?.asOfSeq
+    if (item?.sessionId && Number.isInteger(asOfSeq) && asOfSeq >= 0) {
+      throughSeqBySessionId.set(item.sessionId, asOfSeq)
+    }
+  }
   const sessions = items.map((item) => summarizeSession(rt, item))
-  await attachSessionActivity(rt, targetPort, sessions)
+  await attachSessionActivity(rt, targetPort, sessions, { throughSeqBySessionId })
   return sessions
 }
 
@@ -224,11 +279,11 @@ async function selectSessionModel(targetPort, sessionId, provider, model, reason
   let groups = []
   try {
     const catalog = await callLocalRpc(targetPort, "session.models", { sessionId })
-    if (!stillAuthorized()) throw new Error("设备已被吊销")
     groups = catalog?.groups ?? []
   } catch {
     groups = []
   }
+  if (!stillAuthorized()) return DEVICE_MUTATION_REVOKED
   const group =
     groups.find((g) => g.id === provider) ||
     groups.find((g) => g.name === provider) ||
@@ -255,7 +310,7 @@ async function selectSessionModel(targetPort, sessionId, provider, model, reason
   ])
   let lastErr
   for (const payload of attempts) {
-    if (!stillAuthorized()) throw new Error("设备已被吊销")
+    if (!stillAuthorized()) return DEVICE_MUTATION_REVOKED
     try {
       return await callLocalRpc(targetPort, "session.selectModel", payload)
     } catch (err) {
@@ -360,31 +415,41 @@ export async function handleMobileApi(req, res, targetPort, state, stateFile, de
     if (req.method === "GET" && pathname === "/dsh-link/mobile/sessions/search") {
       const query = String(new URL(req.url ?? "/", "http://x").searchParams.get("q") ?? "").trim()
       if (!query) return json(res, 400, { error: "缺少搜索关键词" })
+      const workspacePromise = callLocalRpc(targetPort, "workspace.list", {})
+      let searchValue = null
       try {
-        const value = await callLocalRpc(targetPort, "session.search", { query })
-        const workspace = await callLocalRpc(targetPort, "workspace.list", {})
-        const items = filterArchivedMobileSearchItems(value.items, workspace.archivedSessionIds)
-        return json(res, 200, { version: 1, items, hasMore: Boolean(value.hasMore), degraded: false })
-      } catch (err) {
-        // 内容搜索不可用（索引禁用）时降级为名称匹配（DSH search.unavailable 行为）
-        const { items: listItems, archivedSessionIds } = await mobileSessionList(targetPort)
-        const withTitle = listItems.map((s) => ({ ...s, title: mobileSessionSummary(s).title }))
-        const items = withTitle
-          .filter((s) => String(s.title ?? "").toLowerCase().includes(query.toLowerCase()))
-          .slice(0, 20)
-          .map((s) => ({ sessionId: s.sessionId, snippet: s.title ?? "" }))
-        return json(res, 200, {
-          version: 1,
-          items: filterArchivedMobileSearchItems(items, archivedSessionIds),
-          hasMore: false,
-          degraded: true,
-        })
+        searchValue = await callLocalRpc(targetPort, "session.search", { query })
+      } catch {
+        searchValue = null
       }
+      if (searchValue) {
+        const workspace = await workspacePromise
+        const items = filterArchivedMobileSearchItems(searchValue.items, workspace.archivedSessionIds)
+        return json(res, 200, { version: 1, items, hasMore: Boolean(searchValue.hasMore), degraded: false })
+      }
+      // 内容搜索不可用（索引禁用）时降级为名称匹配（DSH search.unavailable 行为），先过滤归档再截断 20 条。
+      const [sessions, workspace] = await Promise.all([
+        callLocalRpc(targetPort, "session.list", {}),
+        workspacePromise,
+      ])
+      const archivedSessionIds = normalizeArchivedSessionIds(workspace.archivedSessionIds)
+      const activeItems = filterArchivedMobileSearchItems(sessions.items ?? [], archivedSessionIds)
+      const qLower = query.toLowerCase()
+      const matched = activeItems
+        .map((s) => ({ sessionId: s.sessionId, title: mobileSessionSummary(s).title }))
+        .filter((s) => String(s.title ?? "").toLowerCase().includes(qLower))
+      const items = matched.slice(0, 20).map((s) => ({ sessionId: s.sessionId, snippet: s.title ?? "" }))
+      return json(res, 200, {
+        version: 1,
+        items,
+        hasMore: matched.length > 20,
+        degraded: true,
+      })
     }
 
     if (req.method === "POST" && pathname === "/dsh-link/mobile/sessions") {
       const body = await readAuthorizedJson(req, res, state, device)
-  if (!body) return
+      if (!body) return
       const requestedWorkspaceId = typeof body.workspaceId === "string" && body.workspaceId.trim()
         ? body.workspaceId.trim()
         : ""
@@ -446,15 +511,17 @@ export async function handleMobileApi(req, res, targetPort, state, stateFile, de
 
     const modelMatch = pathname.match(/^\/dsh-link\/mobile\/sessions\/([^/]+)\/model$/)
     if (req.method === "POST" && modelMatch) {
-      const sessionId = decodeURIComponent(modelMatch[1])
+      const sessionId = safeDecodeUriComponent(modelMatch[1])
+      if (!sessionId) return json(res, 400, { error: "sessionId 无效" })
       const body = await readAuthorizedJson(req, res, state, device)
-  if (!body) return
+      if (!body) return
       const provider = String(body.provider ?? "").trim()
       const model = String(body.model ?? "").trim()
       if (!provider || !model) return json(res, 400, { error: "缺少 provider 或 model" })
       const value = await runMobileDeviceMutation(rt, state, device, () =>
         selectSessionModel(targetPort, sessionId, provider, model, body.reasoningEffort, () => isDeviceAuthorized(state, device)))
       if (mobileMutationWasRevoked(value)) return respondDeviceRevoked(res)
+      rt.pricedModelCache?.delete(sessionId)
       return json(res, 200, { ok: true, selected: value.selected ?? null })
     }
 
@@ -465,16 +532,19 @@ export async function handleMobileApi(req, res, targetPort, state, stateFile, de
 
     if (req.method === "POST" && pathname === "/dsh-link/mobile/workspaces") {
       const body = await readAuthorizedJson(req, res, state, device)
-  if (!body) return
+      if (!body) return
       try {
         const rawInput = body.input ?? body.path
         if (isAbsolute(String(rawInput ?? "").trim())) {
-          const real = resolveAbsoluteWorkspaceDirectory(rawInput)
-          const pending = rt.workspaceApprovals.submit({
-            deviceId: device.deviceId,
-            deviceName: device.name,
-            path: real,
+          const pending = await runMobileDeviceMutation(rt, state, device, async () => {
+            const real = await resolveAbsoluteWorkspaceDirectoryAsync(rawInput)
+            return rt.workspaceApprovals.submit({
+              deviceId: device.deviceId,
+              deviceName: device.name,
+              path: real,
+            })
           })
+          if (mobileMutationWasRevoked(pending)) return respondDeviceRevoked(res)
           return json(res, 202, {
             ok: true,
             pending: true,
@@ -527,12 +597,13 @@ export async function handleMobileApi(req, res, targetPort, state, stateFile, de
     // 删除工作区（取消注册；会话日志不删除，DSH workspace.delete 语义）
     if (req.method === "POST" && pathname === "/dsh-link/mobile/workspaces/delete") {
       const body = await readAuthorizedJson(req, res, state, device)
-  if (!body) return
+      if (!body) return
       const path = String(body.path ?? "").trim()
       if (!path) return json(res, 400, { error: "缺少工作区路径" })
+      const wantNorm = normalizeComparisonPath(path)
       const result = await runMobileDeviceMutation(rt, state, device, async () => {
         const list = await callLocalRpc(targetPort, "workspace.list", {})
-        const item = (list.items ?? []).find((w) => w.path === path)
+        const item = (list.items ?? []).find((w) => w.path === path || normalizeComparisonPath(w.path ?? "") === wantNorm)
         if (!item) return { missing: true }
         const value = await callLocalRpc(targetPort, "workspace.delete", { workspaceId: item.workspaceId })
         return { item, value }
@@ -563,7 +634,7 @@ export async function handleMobileApi(req, res, targetPort, state, stateFile, de
 
     if (req.method === "POST" && pathname === "/dsh-link/mobile/settings/update") {
       const body = await readAuthorizedJson(req, res, state, device)
-  if (!body) return
+      if (!body) return
       const ns = String(body.ns ?? "").trim()
       if (!ns) return json(res, 400, { error: "缺少命名空间" })
       const patch = body.patch
@@ -574,8 +645,20 @@ export async function handleMobileApi(req, res, targetPort, state, stateFile, de
       if (filtered.error) return json(res, 403, { error: filtered.error })
       const payload = { ns, patch }
       if (Number.isInteger(body.expectedRevision)) payload.expectedRevision = body.expectedRevision
-      const value = await runMobileDeviceMutation(rt, state, device, () =>
-        callLocalRpc(targetPort, "settings.update", payload))
+      let value
+      try {
+        value = await runMobileDeviceMutation(rt, state, device, () =>
+          callLocalRpc(targetPort, "settings.update", payload))
+      } catch (err) {
+        if (err instanceof LocalRpcError) {
+          const status = controlErrorStatus(err)
+          return json(res, status, {
+            error: status === 409 ? "设置已在电脑端被修改，请刷新后重试" : (status === 502 ? "保存设置失败" : err.message),
+            code: err.code,
+          })
+        }
+        throw err
+      }
       if (mobileMutationWasRevoked(value)) return respondDeviceRevoked(res)
       const nsView = value
       return json(res, 200, {
@@ -632,9 +715,10 @@ export async function handleMobileApi(req, res, targetPort, state, stateFile, de
 
     const renameMatch = pathname.match(/^\/dsh-link\/mobile\/sessions\/([^/]+)\/rename$/)
     if (req.method === "POST" && renameMatch) {
-      const sessionId = decodeURIComponent(renameMatch[1])
+      const sessionId = safeDecodeUriComponent(renameMatch[1])
+      if (!sessionId) return json(res, 400, { error: "sessionId 无效" })
       const body = await readAuthorizedJson(req, res, state, device)
-  if (!body) return
+      if (!body) return
       const title = String(body.title ?? "").trim()
       if (!title) return json(res, 400, { error: "缺少会话名称" })
       const value = await runMobileDeviceMutation(rt, state, device, () =>
@@ -645,7 +729,8 @@ export async function handleMobileApi(req, res, targetPort, state, stateFile, de
 
     const forkMatch = pathname.match(/^\/dsh-link\/mobile\/sessions\/([^/]+)\/fork$/)
     if (req.method === "POST" && forkMatch) {
-      const sessionId = decodeURIComponent(forkMatch[1])
+      const sessionId = safeDecodeUriComponent(forkMatch[1])
+      if (!sessionId) return json(res, 400, { error: "sessionId 无效" })
       const value = await runMobileDeviceMutation(rt, state, device, () =>
         callLocalRpc(targetPort, "session.fork", { sessionId }))
       if (mobileMutationWasRevoked(value)) return respondDeviceRevoked(res)
@@ -655,19 +740,22 @@ export async function handleMobileApi(req, res, targetPort, state, stateFile, de
     // 删除会话（服务端归档，workspace.archiveSession 语义；对标 web 删除）
     const archiveMatch = pathname.match(/^\/dsh-link\/mobile\/sessions\/([^/]+)\/archive$/)
     if (req.method === "POST" && archiveMatch) {
-      const sessionId = decodeURIComponent(archiveMatch[1])
+      const sessionId = safeDecodeUriComponent(archiveMatch[1])
+      if (!sessionId) return json(res, 400, { error: "sessionId 无效" })
       const value = await runMobileDeviceMutation(rt, state, device, () =>
         callLocalRpc(targetPort, "workspace.archiveSession", { sessionId }))
       if (mobileMutationWasRevoked(value)) return respondDeviceRevoked(res)
       rt.previewDetect?.endSession(sessionId)
+      rt.sessionCwdCache?.delete(sessionId)
       return json(res, 200, { ok: true, archived: Boolean(value?.ok), sessionId })
     }
 
     const approvalMatch = pathname.match(/^\/dsh-link\/mobile\/sessions\/([^/]+)\/approval$/)
     if (req.method === "POST" && approvalMatch) {
-      const sessionId = decodeURIComponent(approvalMatch[1])
+      const sessionId = safeDecodeUriComponent(approvalMatch[1])
+      if (!sessionId) return json(res, 400, { error: "sessionId 无效" })
       const body = await readAuthorizedJson(req, res, state, device)
-  if (!body) return
+      if (!body) return
       const approvalId = String(body.approvalId ?? "").trim()
       const outcome = String(body.outcome ?? "").trim()
       if (!approvalId || !["allowed-once", "rejected"].includes(outcome)) {
@@ -698,25 +786,29 @@ export async function handleMobileApi(req, res, targetPort, state, stateFile, de
         deviceId: device.deviceId,
         authorized: true,
         subscribed: isDeviceSubscribedToSession(rt, pending.sessionId, device.deviceId),
-        inGrace: rt.requests.inGrace(pending.sessionId),
       })) {
         return json(res, 403, { ok: false, accepted: false, error: "仅该会话的当前连接设备可处理审批" })
       }
-      const result = await runMobileDeviceMutation(rt, state, device, () =>
-        rt.requests.finishApproval(pending, outcome))
+      const result = await runMobileDeviceMutation(rt, state, device, () => {
+        const alreadySettled = Boolean(pending.settled)
+        const settled = rt.requests.finishApproval(pending, outcome)
+        return { settled, alreadySettled }
+      })
       if (mobileMutationWasRevoked(result)) return respondDeviceRevoked(res)
       return json(res, 200, {
         ok: true,
         accepted: true,
-        outcome: result?.outcome ?? outcome,
-        status: result?.status ?? mapApprovalUiStatus(outcome),
+        ...(result.alreadySettled ? { alreadySettled: true } : {}),
+        outcome: result.settled?.outcome ?? outcome,
+        status: result.settled?.status ?? mapApprovalUiStatus(outcome),
         handledBy: "plugin",
       })
     }
 
     const questionMatch = pathname.match(/^\/dsh-link\/mobile\/sessions\/([^/]+)\/question$/)
     if (req.method === "POST" && questionMatch) {
-      const sessionId = decodeURIComponent(questionMatch[1])
+      const sessionId = safeDecodeUriComponent(questionMatch[1])
+      if (!sessionId) return json(res, 400, { error: "sessionId 无效" })
       const body = await readAuthorizedJson(req, res, state, device)
       if (!body) return
       const rpcId = String(body.rpcId ?? "").trim()
@@ -748,7 +840,6 @@ export async function handleMobileApi(req, res, targetPort, state, stateFile, de
         deviceId: device.deviceId,
         authorized: true,
         subscribed: isDeviceSubscribedToSession(rt, pending.sessionId, device.deviceId),
-        inGrace: rt.requests.inGrace(pending.sessionId),
       })) {
         return json(res, 403, { ok: false, accepted: false, error: "仅该会话的当前连接设备可回答澄清" })
       }
@@ -760,15 +851,24 @@ export async function handleMobileApi(req, res, targetPort, state, stateFile, de
       if (!checked.ok) {
         return json(res, 400, { ok: false, accepted: false, error: checked.error, code: checked.code })
       }
-      const result = await runMobileDeviceMutation(rt, state, device, () =>
-        rt.requests.finishQuestion(pending, checked.answer))
+      const result = await runMobileDeviceMutation(rt, state, device, () => {
+        const alreadySettled = Boolean(pending.settled)
+        const settled = rt.requests.finishQuestion(pending, checked.answer)
+        return { settled, alreadySettled }
+      })
       if (mobileMutationWasRevoked(result)) return respondDeviceRevoked(res)
-      return json(res, 200, { ok: true, accepted: true, handledBy: "plugin" })
+      return json(res, 200, {
+        ok: true,
+        accepted: true,
+        ...(result.alreadySettled ? { alreadySettled: true, status: result.settled?.status } : {}),
+        handledBy: "plugin",
+      })
     }
 
     const requestsMatch = pathname.match(/^\/dsh-link\/mobile\/sessions\/([^/]+)\/requests$/)
     if (req.method === "GET" && requestsMatch) {
-      const sessionId = decodeURIComponent(requestsMatch[1])
+      const sessionId = safeDecodeUriComponent(requestsMatch[1])
+      if (!sessionId) return json(res, 400, { error: "sessionId 无效" })
       const subscribed = isDeviceSubscribedToSession(rt, sessionId, device.deviceId)
       const eligible = rt.requests.pendingForSession(sessionId).some((rec) => rec.eligibleDeviceIds.has(device.deviceId))
       // 双端审批：从后台通知点进来的设备没有 SSE 订阅，也没有重连宽限，
@@ -781,23 +881,22 @@ export async function handleMobileApi(req, res, targetPort, state, stateFile, de
 
     const fileMatch = pathname.match(/^\/dsh-link\/mobile\/sessions\/([^/]+)\/file$/)
     if (req.method === "GET" && fileMatch) {
-      const sessionId = decodeURIComponent(fileMatch[1])
+      const sessionId = safeDecodeUriComponent(fileMatch[1])
+      if (!sessionId) return json(res, 400, { error: "sessionId 无效" })
       // 只有正在查看该会话（持有活跃 SSE 订阅）的设备才能下载其文件。
       if (!isDeviceSubscribedToSession(rt, sessionId, device.deviceId)) {
         return json(res, 403, { error: "仅正在查看该会话的设备可下载文件" })
       }
       const requested = String(new URL(req.url ?? "/", "http://x").searchParams.get("path") ?? "").trim()
       try {
-        const list = await callLocalRpc(targetPort, "session.list", {})
-        const item = (list.items ?? []).find((s) => s.sessionId === sessionId)
-        if (!item) {
+        const looked = await resolveSessionCwd(targetPort, sessionId, rt)
+        if (!looked.found) {
           const err = new Error("会话不存在")
           err.status = 404
           throw err
         }
-        const cwd = optionalString(item?.cwd)
-        const resolved = resolveWorkspaceFile(cwd, requested)
-        const body = readFileSync(resolved.abs)
+        const resolved = await readWorkspaceFileAsync(looked.cwd, requested)
+        const body = resolved.body
         const mime = mimeFromName(resolved.name)
         const headers = {
           "content-type": mime,
@@ -826,20 +925,20 @@ export async function handleMobileApi(req, res, targetPort, state, stateFile, de
     // 工作区文件树：按层列目录，与 /file 同一沙箱与订阅门槛（只有正在查看该会话的设备可列）。
     const treeMatch = pathname.match(/^\/dsh-link\/mobile\/sessions\/([^/]+)\/tree$/)
     if (req.method === "GET" && treeMatch) {
-      const sessionId = decodeURIComponent(treeMatch[1])
+      const sessionId = safeDecodeUriComponent(treeMatch[1])
+      if (!sessionId) return json(res, 400, { error: "sessionId 无效" })
       if (!isDeviceSubscribedToSession(rt, sessionId, device.deviceId)) {
         return json(res, 403, { error: "仅正在查看该会话的设备可浏览文件" })
       }
       const requested = String(new URL(req.url ?? "/", "http://x").searchParams.get("path") ?? "").trim()
       try {
-        const list = await callLocalRpc(targetPort, "session.list", {})
-        const item = (list.items ?? []).find((s) => s.sessionId === sessionId)
-        if (!item) {
+        const looked = await resolveSessionCwd(targetPort, sessionId, rt)
+        if (!looked.found) {
           const err = new Error("会话不存在")
           err.status = 404
           throw err
         }
-        return json(res, 200, { ok: true, ...listWorkspaceDir(optionalString(item?.cwd), requested) })
+        return json(res, 200, { ok: true, ...(await listWorkspaceDirAsync(looked.cwd, requested)) })
       } catch (err) {
         const status = Number.isInteger(err?.status) ? err.status : 500
         const message = status >= 500 ? "读取目录失败" : (err?.message || "读取目录失败")
@@ -850,7 +949,8 @@ export async function handleMobileApi(req, res, targetPort, state, stateFile, de
     // 本轮改动文件：转发 Host workspaceChanges（摘要 = 路径 + 行数；对比 = 按需取的 hunk）。
     const changesMatch = pathname.match(/^\/dsh-link\/mobile\/sessions\/([^/]+)\/changes(\/diff)?$/)
     if (req.method === "GET" && changesMatch) {
-      const sessionId = decodeURIComponent(changesMatch[1])
+      const sessionId = safeDecodeUriComponent(changesMatch[1])
+      if (!sessionId) return json(res, 400, { error: "sessionId 无效" })
       const isDiff = Boolean(changesMatch[2])
       const service = workspaceChangesService(rt.workspaceChanges)
       if (!service) return json(res, 404, { error: "主机不支持改动文件", code: "changes_unsupported" })
@@ -883,7 +983,8 @@ export async function handleMobileApi(req, res, targetPort, state, stateFile, de
 
     const historyMatch = pathname.match(/^\/dsh-link\/mobile\/sessions\/([^/]+)\/history$/)
     if (req.method === "GET" && historyMatch) {
-      const sessionId = decodeURIComponent(historyMatch[1])
+      const sessionId = safeDecodeUriComponent(historyMatch[1])
+      if (!sessionId) return json(res, 400, { error: "sessionId 无效" })
       // 分页（session.history RPC：beforeSeq 从窗口尾部向前翻页，maxMessages 按消息边界计数）
       const search = new URL(req.url ?? "/", "http://x").searchParams
       const rpcPayload = { sessionId }
@@ -905,8 +1006,15 @@ export async function handleMobileApi(req, res, targetPort, state, stateFile, de
         contextBreakdown: projValues.contextBreakdown ?? null,
         todos: projValues.todos ?? null,
       }
-      if (usageHasTokens(statsPayload.tokenUsage)) {
-        const priced = await resolveSessionPriceModel(rt, targetPort, sessionId, projValues)
+      const [priced, reasoningBySeq] = await Promise.all([
+        usageHasTokens(statsPayload.tokenUsage)
+          ? resolveSessionPriceModel(rt, targetPort, sessionId, projValues)
+          : Promise.resolve(null),
+        pageNeedsReasoningFile(rawEvents)
+          ? readSessionReasoning(targetPort, sessionId, rt)
+          : Promise.resolve(new Map()),
+      ])
+      if (priced) {
         const estimatedCost = buildEstimatedCost({
           modelId: priced.modelId,
           usage: statsPayload.tokenUsage,
@@ -920,9 +1028,6 @@ export async function handleMobileApi(req, res, targetPort, state, stateFile, de
       const goal = projValues.goal && typeof projValues.goal === "object" ? projValues.goal : null
       // 投影为稳定消息列表（WI-001）：reasoning 只合并到覆盖其 seq 窗口的页面，
       // 消息 id 以事件 seq 为键（跨页稳定），assistant/message 与同页 block-end 共享 id。
-      const reasoningBySeq = pageNeedsReasoningFile(rawEvents)
-        ? await readSessionReasoning(targetPort, sessionId, rt)
-        : new Map()
       const changesService = workspaceChangesService(rt.workspaceChanges)
       const projected = projectHistoryPage({
         events: rawEvents,
@@ -950,7 +1055,8 @@ export async function handleMobileApi(req, res, targetPort, state, stateFile, de
 
     const promptMatch = pathname.match(/^\/dsh-link\/mobile\/sessions\/([^/]+)\/prompt$/)
     if (req.method === "POST" && promptMatch) {
-      const sessionId = decodeURIComponent(promptMatch[1])
+      const sessionId = safeDecodeUriComponent(promptMatch[1])
+      if (!sessionId) return json(res, 400, { error: "sessionId 无效" })
       const body = await readAuthorizedJson(req, res, state, device, PROMPT_BODY_LIMIT)
       if (!body) return
       const text = String(body.text ?? "").trim()
@@ -958,6 +1064,9 @@ export async function handleMobileApi(req, res, targetPort, state, stateFile, de
       const images = Array.isArray(body.images) ? body.images : []
       const content = []
       for (const img of images.slice(0, 4)) {
+        if (!img || typeof img !== "object") {
+          return json(res, 400, { error: "图片参数无效" })
+        }
         const mediaType = String(img.mediaType ?? "").trim().toLowerCase()
         const data = String(img.data ?? "").trim()
         if (!mediaType || !data) continue
@@ -983,7 +1092,8 @@ export async function handleMobileApi(req, res, targetPort, state, stateFile, de
 
     const cancel = pathname.match(/^\/dsh-link\/mobile\/sessions\/([^/]+)\/cancel$/)
     if (req.method === "POST" && cancel) {
-      const sessionId = decodeURIComponent(cancel[1])
+      const sessionId = safeDecodeUriComponent(cancel[1])
+      if (!sessionId) return json(res, 400, { error: "sessionId 无效" })
       const result = await runMobileDeviceMutation(rt, state, device, () =>
         callLocalRpc(targetPort, "session.cancel", { sessionId }))
       if (mobileMutationWasRevoked(result)) return respondDeviceRevoked(res)
@@ -992,7 +1102,8 @@ export async function handleMobileApi(req, res, targetPort, state, stateFile, de
 
     const feedbackMatch = pathname.match(/^\/dsh-link\/mobile\/sessions\/([^/]+)\/feedback$/)
     if (feedbackMatch) {
-      const sessionId = decodeURIComponent(feedbackMatch[1])
+      const sessionId = safeDecodeUriComponent(feedbackMatch[1])
+      if (!sessionId) return json(res, 400, { error: "sessionId 无效" })
       // 反馈是会话日志级数据：设备已通过外层鉴权即可读写，不要求此刻有活跃 SSE 订阅
       // （App 打开会话时会与订阅建立并发请求，强校验会命中竞态 403）。
       if (req.method === "GET") {
@@ -1004,7 +1115,13 @@ export async function handleMobileApi(req, res, targetPort, state, stateFile, de
         if (!body) return
         const messageId = String(body.messageId ?? "").trim()
         if (!messageId) return json(res, 400, { error: "缺少 messageId" })
-        const action = String(body.action ?? "put")
+        const action = body.action === undefined ? "put" : String(body.action)
+        if (action !== "put" && action !== "delete") {
+          return json(res, 400, { error: "action 只能是 put 或 delete" })
+        }
+        if (action === "put" && body.rating !== undefined && body.rating !== "positive" && body.rating !== "negative") {
+          return json(res, 400, { error: "rating 只能是 positive 或 negative" })
+        }
         const operation = action === "delete"
           ? () => callLocalRpc(targetPort, "messageFeedback.delete", {
               sessionId,
@@ -1030,7 +1147,7 @@ export async function handleMobileApi(req, res, targetPort, state, stateFile, de
 
     return json(res, 404, { error: "mobile endpoint not found" })
   } catch (error) {
-    console.error(`dsh-links: mobile API error: ${error?.message ?? error}`)
+    logger?.warn?.(`dsh-links: mobile API error: ${error?.message ?? error}`)
     // 主机运行时对被占用的会话拒绝 resume：给手机端可读的 409，而不是笼统的 502。
     if (/SessionAlreadyOwnedError|already owned by an active write handle/i.test(String(error?.message ?? error))) {
       return json(res, 409, {
@@ -1047,30 +1164,57 @@ function usageHasTokens(usage) {
   return ["uncachedInputTokens", "cacheReadTokens", "outputTokens"].some((key) => Number(usage[key]) > 0)
 }
 
-/** 投影里有模型 id 就用它。否则短缓存地问一次 session.models，失败就只显示 token。 */
+function findModelInCatalog(catalog, modelId, provider) {
+  if (!modelId || !Array.isArray(catalog?.groups)) return null
+  if (provider) {
+    const group = catalog.groups.find((g) => g?.id === provider || g?.provider === provider)
+    const exact = (group?.models ?? []).find((m) => m?.id === modelId)
+    if (exact) return exact
+  }
+  for (const group of catalog.groups) {
+    const found = (group?.models ?? []).find((model) => model?.id === modelId)
+    if (found) return found
+  }
+  return null
+}
+
+async function getCachedCatalog(rt, targetPort) {
+  const now = Date.now()
+  if (rt?.modelCatalogCache && now - rt.modelCatalogCache.at < MODEL_CATALOG_PRICE_TTL_MS) {
+    return rt.modelCatalogCache.catalog
+  }
+  try {
+    const catalog = await callLocalRpc(targetPort, "llm.models", {})
+    if (rt && catalog) rt.modelCatalogCache = { at: now, catalog }
+    return catalog
+  } catch {
+    return null
+  }
+}
+
+/** 投影里有模型 id 时仍尝试从缓存目录拿 Host 价格；否则短缓存地问一次 session.models，RPC 失败不缓存。 */
 async function resolveSessionPriceModel(rt, targetPort, sessionId, projValues) {
   const fromProj = modelIdFromProjections(projValues)
-  if (fromProj) return { modelId: fromProj, hostModel: null }
+  if (fromProj) {
+    const provider = projValues?.modelSelection?.next?.provider ?? projValues?.modelSelection?.active?.provider ?? null
+    const catalog = await getCachedCatalog(rt, targetPort)
+    return { modelId: fromProj, hostModel: findModelInCatalog(catalog, fromProj, provider) }
+  }
   if (!rt) return { modelId: null, hostModel: null }
   const cache = rt.pricedModelCache ?? (rt.pricedModelCache = new Map())
   const hit = getBounded(cache, sessionId)
   const now = Date.now()
   if (hit && now - hit.at < 30_000) return hit.value
-  let value = { modelId: null, hostModel: null }
   try {
     const catalog = await callLocalRpc(targetPort, "session.models", { sessionId })
+    if (catalog) rt.modelCatalogCache = { at: now, catalog }
     const modelId = typeof catalog?.current?.model === "string" ? catalog.current.model : null
-    let hostModel = null
-    if (modelId) {
-      for (const group of catalog?.groups ?? []) {
-        const found = (group?.models ?? []).find((model) => model?.id === modelId)
-        if (found) hostModel = found
-      }
-    }
-    value = { modelId, hostModel }
+    const provider = typeof catalog?.current?.provider === "string" ? catalog.current.provider : null
+    const hostModel = findModelInCatalog(catalog, modelId, provider)
+    const value = { modelId, hostModel }
+    setBounded(cache, sessionId, { at: now, value }, MAX_PRICED_MODEL_CACHE)
+    return value
   } catch {
-    value = { modelId: null, hostModel: null }
+    return { modelId: null, hostModel: null }
   }
-  setBounded(cache, sessionId, { at: now, value }, MAX_PRICED_MODEL_CACHE)
-  return value
 }

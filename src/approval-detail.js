@@ -34,9 +34,20 @@ export function parseToolArguments(args) {
 }
 
 function clip(text, max) {
+  if (!Number.isFinite(max) || max <= 0) return ""
   const value = String(text ?? "")
   if (value.length <= max) return value
+  if (max === 1) return "…"
   return `${value.slice(0, max - 1)}…`
+}
+
+function safeFormatValue(value) {
+  if (typeof value === "string") return value
+  try {
+    return JSON.stringify(value)
+  } catch {
+    return String(value)
+  }
 }
 
 /** 多行折叠成一行，用于通知标题/正文与事件帧。 */
@@ -67,10 +78,15 @@ export function toolCallDetail(toolName, args) {
   // 没有常用键就把参数平铺（去掉 null/空串），至少让人看出调了什么。
   const entries = Object.entries(parsed).filter(([, value]) => value != null && !(typeof value === "string" && !value.trim()))
   if (entries.length === 0) return null
-  const body = entries
-    .map(([key, value]) => `${key}: ${typeof value === "string" ? value : JSON.stringify(value)}`)
-    .join("\n")
-  return clip(body, APPROVAL_DETAIL_LIMIT)
+  const out = []
+  let total = 0
+  for (const [key, value] of entries) {
+    const line = `${key}: ${safeFormatValue(value)}`
+    out.push(line)
+    total += line.length + 1
+    if (total > APPROVAL_DETAIL_LIMIT + 16) break
+  }
+  return clip(out.join("\n"), APPROVAL_DETAIL_LIMIT)
 }
 
 /** 审批卡标题：工具名 + 第一行工作内容。 */

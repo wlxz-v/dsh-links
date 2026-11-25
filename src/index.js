@@ -9,13 +9,15 @@
  */
 import { createAwaitingInput } from "./awaiting-input.js"
 import { createServer as createHttpsServer } from "node:https"
-import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs"
-import { dirname, join } from "node:path"
+import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
+import { stat as statAsync } from "node:fs/promises"
+import { join } from "node:path"
 import { homedir, hostname, networkInterfaces } from "node:os"
 import { randomBytes } from "node:crypto"
 import z from "@deepseek-ai/schemastery"
 import QRCode from "qrcode"
 
+import { assertNotSymlinkSync, writeFileAtomicSync } from "./atomic-fs.js"
 import { setBounded } from "./bounded-map.js"
 import {
   classifyUrl,
@@ -34,6 +36,7 @@ import {
   negotiateJsonEncoding,
   requireJsonWrite,
   requireLoopbackSameOrigin,
+  safeDecodeUriComponent,
 } from "./http-utils.js"
 
 export {
@@ -52,7 +55,7 @@ export {
 import { createPreviewService, rejectUpgrade, matchPreviewPath } from "./preview-proxy.js"
 import { createPreviewDetector, publicDetections, refreshPreviewDetections, DETECT_HISTORY_MESSAGES } from "./preview-detect.js"
 import { workspaceChangesService } from "./workspace-changes.js"
-import { resolveSessionLogPath, sessionDirFor } from "./session-log-path.js"
+import { resolveSessionLogPathAsync, sessionDirFor } from "./session-log-path.js"
 
 import {
   consumePairingCode, ensurePairingCode, ensureTokenKey, findDeviceByToken, hmacDeviceToken, hydratePairing,
@@ -91,7 +94,7 @@ import { createHostProbe } from "./host-probe.js"
 import { oneLine, toolCallDetail } from "./approval-detail.js"
 
 import { applyMobileSessionSafety, handleMobileApi } from "./mobile-api.js"
-import { hostDiagnosticsSource, runDiagnostics } from "./diagnostics.js"
+import { hostDiagnosticsSource, runDiagnostics, tlsExpiryMs } from "./diagnostics.js"
 import { deriveStoppedReason } from "./mobile-session-activity.js"
 import { createHostEventHub, handleHostEvents } from "./host-events.js"
 
@@ -155,7 +158,13 @@ function ensureStateDir(config) {
         if (!existsSync(legacyState)) continue
         mkdirSync(dir, { recursive: true, mode: 0o700 })
         try {
-          cpSync(legacyDir, dir, { recursive: true })
+          cpSync(legacyDir, dir, { recursive: true, verbatimSymlinks: true })
+          for (const secretFile of ["state.json", "tls.json"]) {
+            const p = join(dir, secretFile)
+            if (existsSync(p)) {
+              try { chmodSync(p, 0o600) } catch {}
+            }
+          }
         } catch {
           writeFileSync(newState, readFileSync(legacyState), { mode: 0o600 })
         }
@@ -174,6 +183,7 @@ function statePathOf(config) {
 
 function loadState(file) {
   if (!existsSync(file)) return {}
+  assertNotSymlinkSync(file, "state.json")
   let raw
   try {
     raw = readFileSync(file, "utf8")
@@ -188,9 +198,6 @@ function loadState(file) {
 }
 
 function saveState(file, state) {
-  const dir = dirname(file)
-  mkdirSync(dir, { recursive: true, mode: 0o700 })
-  try { chmodSync(dir, 0o700) } catch {}
   const persist = {
     ...state,
     pairing: persistablePairing(state.pairing),
@@ -200,10 +207,7 @@ function saveState(file, state) {
   delete persist.pairingGlobal
   delete persist.pairingChallenge
   const data = JSON.stringify(persist, null, 2)
-  const tmp = `${file}.${process.pid}.tmp`
-  writeFileSync(tmp, data, { mode: 0o600 })
-  renameSync(tmp, file)
-  try { chmodSync(file, 0o600) } catch {}
+  writeFileAtomicSync(file, data, { mode: 0o600, dirMode: 0o700 })
 }
 
 function now() {
@@ -327,10 +331,6 @@ class HttpBodyError extends Error {
     this.status = status
   }
 }
-
-const PROMPT_BODY_LIMIT = 16 * 1024 * 1024
-const PROMPT_IMAGE_DATA_LIMIT = 4 * 1024 * 1024
-const PROMPT_IMAGE_MEDIA_TYPES = new Set(["image/png", "image/jpeg", "image/jpg", "image/webp", "image/gif"])
 
 function readBody(req, limit = 64 * 1024) {
   return new Promise((resolve, reject) => {
@@ -604,20 +604,6 @@ async function handlePair(req, res, config, state, stateFile, rt, logger, origin
   json(res, 200, result)
 }
 
-/** 会话日志正文：`.zstd` 是逐帧追加的容器，必须逐帧解完；未压缩的 jsonl 直接读文本。 */
-
-/**
- * 从会话存储文件（jsonl.zstd）读取 reasoning 块，按块首事件 seq 索引
- * （RPC 投影会剥掉父会话的思考内容，文件是补全源）。
- * 返回 Map<seq, { seq, time, text }>；连续 reasoning block-end 合并为一个
- * 块（与投影的事件侧分组规则一致），id 以首个 block-end 的 seq 为键。
- */
-
-/**
- * 向本机 dsh /api 发 RPC 统一走 ./local-rpc.js 的 callLocalRpc：
- * 方法闭集在该模块的 RPC_METHOD_ALLOWLIST 锁定并有单测覆盖。
- */
-
 // ---------- SSE 实时推送（/dsh-link/mobile/sessions/:id/stream） ----------
 // 数据流：DSH 产生事件 → 写入 JSONL → 插件轮询 session.history RPC（增量 seq）→
 // SSE emit → App 订阅 → Compose state 更新。轮询间隔可配，空闲会话用文件大小跳过 RPC。
@@ -785,15 +771,6 @@ function afterWritersChanged(rt, sessionId, { immediate = false } = {}) {
   })
 }
 
-function settleOrphanApprovals(rt) {
-  for (const sessionId of new Set([
-    ...[...rt.pendingApprovals.values()].map((rec) => rec.sessionId),
-    ...[...rt.pendingQuestions.values()].map((rec) => rec.sessionId),
-  ].filter(Boolean))) {
-    afterWritersChanged(rt, sessionId)
-  }
-}
-
 async function sessionFilePath(targetPort, sessionId, rt) {
   const MAX_SESSION_FILES_CACHE = 256
   const cached = rt.sessionFiles.get(sessionId)
@@ -802,12 +779,11 @@ async function sessionFilePath(targetPort, sessionId, rt) {
   try {
     const list = await callLocalRpc(targetPort, "session.list", {})
     const row = (list.items ?? []).find((s) => s.sessionId === sessionId)
-    const cwd = row?.cwd
-    if (!cwd) {
+    if (!row) {
       setBounded(rt.sessionFiles, sessionId, { missingUntil: Date.now() + 10_000 }, MAX_SESSION_FILES_CACHE)
       return null
     }
-    const p = resolveSessionLogPath(sessionDirFor(cwd, sessionId))
+    const p = await resolveSessionLogPathAsync(sessionDirFor(row.cwd, sessionId))
     if (!p) {
       setBounded(rt.sessionFiles, sessionId, { missingUntil: Date.now() + 10_000 }, MAX_SESSION_FILES_CACHE)
       return null
@@ -892,7 +868,7 @@ async function pollSession(sessionId, targetPort, rt, force = false) {
     let st = null
     if (filePath) {
       try {
-        st = statSync(filePath)
+        st = await statAsync(filePath)
       } catch {
         if (!force) return
       }
@@ -946,8 +922,9 @@ async function handleStreamRoute(sessionId, res, targetPort, config, req, rt, de
     writers = new Set()
     rt.sessionStreams.set(sessionId, writers)
   }
-  const afterRaw = Number(new URL(req?.url ?? "/", "http://x").searchParams.get("afterSeq") ?? 0)
-  const caps = parseClientCaps(new URL(req?.url ?? "/", "http://x").searchParams.get("caps"))
+  const searchParams = new URL(req?.url ?? "/", "http://x").searchParams
+  const afterRaw = Number(searchParams.get("afterSeq") ?? 0)
+  const caps = parseClientCaps(searchParams.get("caps"))
   const conn = {
     res,
     lastSeq: Number.isFinite(afterRaw) && afterRaw > 0 ? afterRaw : 0,
@@ -981,12 +958,17 @@ async function handleStreamRoute(sessionId, res, targetPort, config, req, rt, de
           maxMessages: payload.maxMessages ?? config.reconnectHistoryLimit,
         }),
       )
+      if (!writers.has(conn) || conn.res.destroyed || conn.res.writableEnded) return
       writeCatchup(writers, conn, assessForCursor(conn.lastSeq, batch), sessionId, (id) => requestGapPoll(id, targetPort, rt))
     } catch {} finally {
       conn.seeded = true
-      flushSeedQueue(conn, sessionId, (id) => requestGapPoll(id, targetPort, rt))
+      if (!writers.has(conn) || conn.res.destroyed || conn.res.writableEnded) {
+        conn.seedQueue = []
+        return
+      }
+      flushSeedQueue(conn, sessionId, (id) => requestGapPoll(id, targetPort, rt), writers)
       // 补历史期间 mux 到的事件没人接，立刻补一次洞
-      if (conn.missedWhileSeeding) pollSession(sessionId, targetPort, rt, true)
+      if (conn.missedWhileSeeding && !conn.catchupPaused) pollSession(sessionId, targetPort, rt, true)
     }
   })()
   res.on("close", () => {
@@ -997,11 +979,22 @@ async function handleStreamRoute(sessionId, res, targetPort, config, req, rt, de
   })
 }
 
+const REVOKE_DRAIN_TIMEOUT_MS = 10_000
+
+function evictPairingReplayForDevice(rt, deviceId) {
+  if (!rt?.pairingRequests || !deviceId) return
+  for (const [reqId, entry] of rt.pairingRequests) {
+    if (entry?.body?.deviceId === deviceId) rt.pairingRequests.delete(reqId)
+  }
+}
+
 function dropDevice(state, rt, device, exceptReq) {
   revokeDevice(null, device.deviceId)
   closeSseForDevice(rt, device.deviceId)
   closeRequestsForDevice(rt, device.deviceId, exceptReq)
   rt.workspaceApprovals.dropDevice(device.deviceId)
+  rt.previews?.disconnectDevice(device.deviceId)
+  evictPairingReplayForDevice(rt, device.deviceId)
   // 远程流一并关掉（RFC §6.5）：设备记录已删，新 client_open 会得到 UNKNOWN_KEY
   rt.remote?.agent?.dropDevice(device.deviceId)
 }
@@ -1015,11 +1008,12 @@ export async function revokeDeviceEntry(state, stateFile, rt, { name, deviceId }
   if (target[DEVICE_REVOKING]) return { status: 409, body: { error: "设备正在吊销" } }
   target[DEVICE_REVOKING] = true
   state.devices = (state.devices ?? []).filter((d) => d.deviceId !== target.deviceId)
+  // 先落盘再排空在途操作：即使 drain 期间进程崩溃，已吊销设备也不会在重启后复活。
+  saveState(stateFile, state)
   dropDevice(state, rt, target, exceptReq)
   // Linearization boundary: operations already registered finish before this
   // revocation is acknowledged; removal above prevents any new operation.
-  await rt.deviceMutations.drain(target.deviceId)
-  saveState(stateFile, state)
+  await rt.deviceMutations.drain(target.deviceId, { timeoutMs: REVOKE_DRAIN_TIMEOUT_MS })
   return { status: 200, body: { ok: true, removed: 1, deviceId: target.deviceId } }
 }
 
@@ -1027,11 +1021,11 @@ async function revokeAllDevices(state, stateFile, rt) {
   const devices = [...(state.devices ?? [])]
   for (const device of devices) device[DEVICE_REVOKING] = true
   state.devices = []
+  saveState(stateFile, state)
   for (const device of devices) dropDevice(state, rt, device)
   // As with single-device revocation, success means all earlier registered
   // mutations are settled and no later mutation can be admitted.
-  await Promise.all(devices.map((device) => rt.deviceMutations.drain(device.deviceId)))
-  saveState(stateFile, state)
+  await Promise.all(devices.map((device) => rt.deviceMutations.drain(device.deviceId, { timeoutMs: REVOKE_DRAIN_TIMEOUT_MS })))
   return { status: 200, body: { ok: true, removed: devices.length } }
 }
 
@@ -1087,12 +1081,6 @@ async function activatePendingDevice(state, stateFile, rt, deviceId) {
     },
   }
 }
-
-/**
- * Return the session list together with the Web workspace archive set.
- * DSH keeps archived logs in session.list so they can be restored; the mobile
- * client needs the set in the same bootstrap response to filter before select.
- */
 
 const PANEL_ONLY_PATHS = new Set([
   "/dsh-link/pair-info",
@@ -1246,7 +1234,7 @@ export function apply(ctx, config) {
   if (!state.devices) state.devices = []
   if (!state.pairing) state.pairing = {}
   ensureTokenKey(state)
-  const tlsHolder = { fingerprint: "", cert: "" }
+  const tlsHolder = { fingerprint: "", cert: "", notAfterMs: null }
   // 旧版设备（无 deviceId）一次性迁移：自动补发，手机无需重新配对（token 不变）
   let migrated = false
   for (const d of state.devices) {
@@ -1298,6 +1286,7 @@ export function apply(ctx, config) {
     hostPort: targetPort,
     logger: ctx.logger,
   })
+  rt.previews = previews
   rt.previewDetect = createPreviewDetector({
     pluginPort: boundPort,
     hostPort: targetPort,
@@ -1305,28 +1294,34 @@ export function apply(ctx, config) {
   // 宿主能力实测（B1）：DSH 升级会改名/合并 Remote（0.2.x 的 schedule/update + delete → edit），
   // 插件这边没有可读的注册表，只能启动后实际调一遍，把结论交给 App 隐藏点不通的入口。
   const hostProbe = createHostProbe({
-    call: (method, params) => callLocalRpc(targetPort, method, params ?? {}),
+    call: (method, params, opts) => callLocalRpc(targetPort, method, params ?? {}, opts),
   })
   rt.hostProbe = hostProbe
+  let inflightDetections = null
   async function currentDetections() {
-    const rows = await refreshPreviewDetections({
-      detector: rt.previewDetect,
-      listSessions: async () => {
-        const [sessions, workspace] = await Promise.all([
-          callLocalRpc(targetPort, "session.list", {}),
-          callLocalRpc(targetPort, "workspace.list", {}),
-        ])
-        return {
-          items: sessions?.items ?? [],
-          archivedSessionIds: workspace?.archivedSessionIds ?? [],
-        }
-      },
-      history: (sessionId) => callLocalRpc(targetPort, "session.history", {
-        sessionId,
-        maxMessages: DETECT_HISTORY_MESSAGES,
-      }),
-    })
-    return publicDetections(rows, previews.listPublic().map((item) => item.port))
+    if (inflightDetections) return inflightDetections
+    inflightDetections = (async () => {
+      const rows = await refreshPreviewDetections({
+        detector: rt.previewDetect,
+        listSessions: async () => {
+          const [sessions, workspace] = await Promise.all([
+            callLocalRpc(targetPort, "session.list", {}),
+            callLocalRpc(targetPort, "workspace.list", {}),
+          ])
+          return {
+            items: sessions?.items ?? [],
+            archivedSessionIds: workspace?.archivedSessionIds ?? [],
+          }
+        },
+        history: (sessionId, throughSeq) => callLocalRpc(targetPort, "session.history", {
+          sessionId,
+          maxMessages: DETECT_HISTORY_MESSAGES,
+          ...(Number.isInteger(throughSeq) && throughSeq >= 0 ? { throughSeq } : {}),
+        }),
+      })
+      return publicDetections(rows, previews.listPublic().map((item) => item.port))
+    })().finally(() => { inflightDetections = null })
+    return inflightDetections
   }
 
   // 诊断只读：workspace.list 已在白名单里。证书 PEM 留在 tlsHolder，不进入返回值。
@@ -1360,7 +1355,7 @@ export function apply(ctx, config) {
     }
     const view = remote.status()
     return hostDiagnosticsSource({
-      rpc: (method, params) => callLocalRpc(targetPort, method, params ?? {}),
+      rpc: (method, params, opts) => callLocalRpc(targetPort, method, params ?? {}, opts),
       services: {
         workspaceChanges: Boolean(workspaceChangesService(rt.workspaceChanges)),
         typertGateway: Boolean(gateway && typeof gateway.invoke === "function"),
@@ -1368,6 +1363,7 @@ export function apply(ctx, config) {
         peerDebug: { ...gatewayPeerState },
       },
       certPem: tlsHolder.cert,
+      notAfterMs: tlsHolder.notAfterMs,
       fingerprint: tlsHolder.fingerprint,
       devices: state.devices,
       device,
@@ -1423,7 +1419,12 @@ export function apply(ctx, config) {
         sweepExpiredPending(state, stateFile, rt)
         // 面板只需要远程的状态与地址（决定码下方的文案）；bootstrap 种子只随二维码图片出去
         const view = remote.status()
-        json(res, 200, { ...pairInfo(config, state, fp(), boundPort()), remoteStatus: { state: view.state, host: view.host } })
+        json(
+          res,
+          200,
+          { ...pairInfo(config, state, fp(), boundPort()), remoteStatus: { state: view.state, host: view.host } },
+          { "cache-control": "no-store" },
+        )
       },
     }),
     web.register({
@@ -1439,10 +1440,8 @@ export function apply(ctx, config) {
       kind: "exact",
       path: "/dsh-link/revoke",
       handler: async (req, res) => {
-        if (!requireLoopbackSameOrigin(req, res)) return
-        if (!requireJsonWrite(req, res)) return
-        const body = await readJson(req, res)
-  if (!body) return
+        const body = await readLoopbackPost(req, res)
+        if (!body) return
         const targetName = String(body.name ?? "").trim()
         const targetId = String(body.deviceId ?? "").trim()
         if (!targetName && !targetId) return json(res, 400, { error: "缺少设备名或 deviceId" })
@@ -1457,9 +1456,7 @@ export function apply(ctx, config) {
       kind: "exact",
       path: "/dsh-link/revoke-all",
       handler: async (req, res) => {
-        if (!requireLoopbackSameOrigin(req, res)) return
-        if (!requireJsonWrite(req, res)) return
-        const body = await readJson(req, res)
+        const body = await readLoopbackPost(req, res)
         if (!body) return
         const result = await revokeAllDevices(state, stateFile, rt)
         if (result.status === 200) {
@@ -1472,9 +1469,7 @@ export function apply(ctx, config) {
       kind: "exact",
       path: "/dsh-link/pair-approve",
       handler: async (req, res) => {
-        if (!requireLoopbackSameOrigin(req, res)) return
-        if (!requireJsonWrite(req, res)) return
-        const body = await readJson(req, res)
+        const body = await readLoopbackPost(req, res)
         if (!body) return
         sweepExpiredPending(state, stateFile, rt)
         const result = await activatePendingDevice(state, stateFile, rt, body.deviceId)
@@ -1528,9 +1523,7 @@ export function apply(ctx, config) {
       kind: "exact",
       path: "/dsh-link/pair-settings",
       handler: async (req, res) => {
-        if (!requireLoopbackSameOrigin(req, res)) return
-        if (!requireJsonWrite(req, res)) return
-        const body = await readJson(req, res)
+        const body = await readLoopbackPost(req, res)
         if (!body) return
         if (typeof body.requireConfirm !== "boolean") {
           return json(res, 400, { error: "缺少 requireConfirm" })
@@ -1548,9 +1541,14 @@ export function apply(ctx, config) {
         if (!requireLoopbackSameOrigin(req, res)) return
         if (req.method !== "GET") return json(res, 405, { error: "method not allowed" })
         if (readiness.phase !== "ready") return proxyPending(res)
-        const report = await runDiagnostics(diagnosticsSource(null), { scope: "panel" })
-        ctx.logger.info(`dsh-links: diagnostics scope=panel ${report.checks.map((item) => `${item.id}=${item.status}`).join(" ")}`)
-        json(res, 200, report)
+        try {
+          const report = await runDiagnostics(diagnosticsSource(null), { scope: "panel" })
+          ctx.logger.info(`dsh-links: diagnostics scope=panel ${report.checks.map((item) => `${item.id}=${item.status}`).join(" ")}`)
+          json(res, 200, report)
+        } catch (err) {
+          ctx.logger.warn(`dsh-links: diagnostics failed: ${err?.message ?? err}`)
+          json(res, 500, { error: "diagnostics failed" })
+        }
       },
     }),
     web.register({
@@ -1685,9 +1683,9 @@ export function apply(ctx, config) {
     ctx.logger.info(`dsh-links: approval/request 双端接管 session=${String(sessionId).slice(0, 8)} id=${String(id).slice(0, 24)} callId=${req?.callId ?? "无"} tool=${req?.toolName ?? req?.name ?? "?"} 手机订阅=${writers?.size ?? 0} 后台流=${hostSubscribers} 手机在线=${liveMobile ? "是" : "否"}`)
     return new Promise((resolve) => {
       const eligible = subscribedDeviceIds(writers)
-      // 没在看这个会话的手机也要能作答：后台通知点开会话后按 deviceId 认人。
+      // 没在看这个会话的已批准手机也要能作答：后台通知点开会话后按 deviceId 认人。
       for (const device of state.devices ?? []) {
-        if (device?.deviceId) eligible.add(device.deviceId)
+        if (device?.deviceId && !isDevicePending(device)) eligible.add(device.deviceId)
       }
       const rec = {
         id,
@@ -1771,9 +1769,9 @@ export function apply(ctx, config) {
     ctx.logger.info(`dsh-links: user-questions/request 双端接管 session=${String(sessionId).slice(0, 8)} rpc=${rpcId.slice(0, 8)} 题数=${questions.length} 手机订阅=${writers?.size ?? 0} 后台流=${hostSubscribers} 手机在线=${liveMobile ? "是" : "否"}`)
     return new Promise((resolve, reject) => {
       const eligible = subscribedDeviceIds(targets)
-      // 没在看这个会话的手机也要能作答：后台通知点开会话后按 deviceId 认人。
+      // 没在看这个会话的已批准手机也要能作答：后台通知点开会话后按 deviceId 认人。
       for (const device of state.devices ?? []) {
-        if (device?.deviceId) eligible.add(device.deviceId)
+        if (device?.deviceId && !isDevicePending(device)) eligible.add(device.deviceId)
       }
       let desktopPromise = null
       const answerOnDesktop = () => {
@@ -1858,6 +1856,7 @@ export function apply(ctx, config) {
         const approval = approvals.get(item?.sessionId)
         return {
           sessionId: item?.sessionId,
+          asOfSeq: Number.isInteger(item?.projections?.asOfSeq) ? item.projections.asOfSeq : undefined,
           title: item?.projections?.values?.title,
           origin: item?.origin,
           running: Boolean(item?.running),
@@ -1875,8 +1874,12 @@ export function apply(ctx, config) {
         }
       })
     },
-    terminalReason: async (sessionId) => {
-      const history = await callLocalRpc(targetPort, "session.history", { sessionId, maxMessages: 8 })
+    terminalReason: async (sessionId, throughSeq) => {
+      const history = await callLocalRpc(targetPort, "session.history", {
+        sessionId,
+        maxMessages: 8,
+        ...(Number.isInteger(throughSeq) && throughSeq >= 0 ? { throughSeq } : {}),
+      })
       return deriveStoppedReason(history?.events)
     },
   })
@@ -1928,7 +1931,8 @@ export function apply(ctx, config) {
         const permissionMatch = pathname.match(/^\/dsh-link\/mobile\/sessions\/([^/]+)\/permission$/)
         if (req.method === "POST" && permissionMatch) {
           if (!requireJsonWrite(req, res)) return
-          const sessionId = decodeURIComponent(permissionMatch[1])
+          const sessionId = safeDecodeUriComponent(permissionMatch[1])
+          if (!sessionId) return json(res, 400, { error: "sessionId 无效" })
           const body = await readAuthorizedJson(req, res, state, device)
           if (!body) return
           // 与审批请求同规则：只有正在查看该会话（活跃 SSE 订阅）的设备才能改权限。
@@ -1977,10 +1981,12 @@ export function apply(ctx, config) {
           try { detections = await currentDetections() } catch { detections = [] }
           return json(res, 200, { detections })
         }
-        if (previews.handleHttp(req, res)) return
+        if (previews.handleHttp(req, res, device.deviceId)) return
         const streamMatch = pathname.match(/^\/dsh-link\/mobile\/sessions\/([^/]+)\/stream$/)
         if (req.method === "GET" && streamMatch) {
-          return handleStreamRoute(decodeURIComponent(streamMatch[1]), res, targetPort, config, req, rt, device)
+          const sessionId = safeDecodeUriComponent(streamMatch[1])
+          if (!sessionId) return json(res, 400, { error: "sessionId 无效" })
+          return handleStreamRoute(sessionId, res, targetPort, config, req, rt, device)
         }
         return handleMobileApi(req, res, targetPort, state, stateFile, device, pathname, rt, config, ctx.logger, mobileApiDeps)
       }
@@ -1992,18 +1998,12 @@ export function apply(ctx, config) {
     }
   }
 
-  let proxy
-  let pollTimer
-  let keepAliveTimer
-  let muxBridge = null
-  const ready = loadOrCreateTls(ensureStateDir(config)).then(async (tls) => {
-    tlsHolder.fingerprint = tls.fingerprint
-    tlsHolder.cert = tls.cert
-    proxy = createHttpsServer({ key: tls.key, cert: tls.cert, minVersion: "TLSv1.2" }, requestHandler)
-    proxy.on("error", (err) => {
+  function createProxyServer(tls) {
+    const server = createHttpsServer({ key: tls.key, cert: tls.cert, minVersion: "TLSv1.2" }, requestHandler)
+    server.on("error", (err) => {
       ctx.logger.warn(`dsh-links: proxy error: ${err?.message ?? err}`)
     })
-    proxy.on("upgrade", (req, socket, head) => {
+    server.on("upgrade", (req, socket, head) => {
       socket.on("error", () => {})
       if (!matchPreviewPath(req.url)) {
         rejectUpgrade(socket, 404, "not found")
@@ -2015,30 +2015,31 @@ export function apply(ctx, config) {
         return
       }
       const device = authorize(req, state, stateFile)
+      sweepExpiredPending(state, stateFile, rt)
       if (!device || (origin && origin.deviceId !== device.deviceId) || !isDeviceAuthorized(state, device) || isDevicePending(device)) {
         rejectUpgrade(socket, 401, "unauthorized")
         return
       }
       touchDevice(state, device, stateFile)
-      previews.handleUpgrade(req, socket, head)
+      previews.handleUpgrade(req, socket, head, device.deviceId)
     })
     // 远程每条连接都是一次 WSS + 会合 + 内层 TLS，必须让 App 的连接池复用（RFC §4.2）。
     // 服务端空闲上限要长于 App 远程连接池的 keepAlive（50 秒），由客户端先放手，避免竞态。
-    proxy.keepAliveTimeout = 65_000
-    proxy.headersTimeout = 66_000
-    pollTimer = setInterval(() => {
-      for (const sessionId of rt.sessionStreams.keys()) {
-        if ((rt.sessionStreams.get(sessionId)?.size ?? 0) > 0) {
-          pollSession(sessionId, targetPort, rt)
-        }
-      }
-    }, config.eventPollIntervalMs)
-    keepAliveTimer = setInterval(() => {
-      for (const [sessionId, writers] of rt.sessionStreams) {
-        writeSse(writers, ": keepalive\n\n")
-        if (writers.size === 0) dropSession(rt, sessionId)
-      }
-    }, 15_000)
+    server.keepAliveTimeout = 65_000
+    server.headersTimeout = 66_000
+    return server
+  }
+
+  let proxy
+  let pollTimer
+  let keepAliveTimer
+  let muxBridge = null
+  let disposed = false
+  const ready = loadOrCreateTls(ensureStateDir(config)).then(async (tls) => {
+    if (disposed) return tls
+    tlsHolder.fingerprint = tls.fingerprint
+    tlsHolder.cert = tls.cert
+    tlsHolder.notAfterMs = tlsExpiryMs(tls.cert)
     // 端口顺延：默认端口（或配置端口）被占（另一个 DSH 实例、崩溃残留、别的软件抢了 18640）时
     // 按 +1 试到 PORT_LISTEN_ATTEMPTS 个，抢到哪个就记进 portState。
     // 二维码/面板/RPC 守卫读的都是 boundPort()，所以 App 拿到的一直是真实端口；
@@ -2058,23 +2059,27 @@ export function apply(ctx, config) {
     portState.shifted = candidatePort !== config.port
     let boundPortNumber = candidatePort
     for (let p = candidatePort; p < config.port + PORT_LISTEN_ATTEMPTS; p += 1) {
+      // 每次顺延使用全新 https.Server 实例，避免同一 server 反复 listen 失败在 Windows 触发 libuv closing 断言。
+      const attemptServer = createProxyServer(tls)
       try {
         await new Promise((resolve, reject) => {
           const onError = (error) => {
-            proxy.removeListener("listening", onListening)
+            attemptServer.removeListener("listening", onListening)
             reject(error)
           }
           const onListening = () => {
-            proxy.removeListener("error", onError)
+            attemptServer.removeListener("error", onError)
             resolve()
           }
-          proxy.once("error", onError)
-          proxy.once("listening", onListening)
-          proxy.listen({ port: p, host: "0.0.0.0", exclusive: true })
+          attemptServer.once("error", onError)
+          attemptServer.once("listening", onListening)
+          attemptServer.listen({ port: p, host: "0.0.0.0", exclusive: true })
         })
+        proxy = attemptServer
         boundPortNumber = p
         break
       } catch (error) {
+        try { attemptServer.close() } catch {}
         if (error?.code === "EADDRINUSE" && p + 1 < config.port + PORT_LISTEN_ATTEMPTS) {
           ctx.logger.warn(`dsh-links: 端口 ${p} 绑定冲突，继续顺延至 ${p + 1}`)
           continue
@@ -2082,6 +2087,27 @@ export function apply(ctx, config) {
         throw error
       }
     }
+    if (disposed) {
+      try { proxy?.closeAllConnections?.() } catch {}
+      try { proxy?.close() } catch {}
+      return tls
+    }
+    // 确认监听成功后再启动后台定时器，防止启动失败时泄漏定时器句柄。
+    pollTimer = setInterval(() => {
+      for (const sessionId of rt.sessionStreams.keys()) {
+        if ((rt.sessionStreams.get(sessionId)?.size ?? 0) > 0) {
+          pollSession(sessionId, targetPort, rt)
+        }
+      }
+    }, config.eventPollIntervalMs)
+    pollTimer.unref?.()
+    keepAliveTimer = setInterval(() => {
+      for (const [sessionId, writers] of rt.sessionStreams) {
+        writeSse(writers, ": keepalive\n\n")
+        if (writers.size === 0) dropSession(rt, sessionId)
+      }
+    }, 15_000)
+    keepAliveTimer.unref?.()
     {
       const bound = proxy.address()?.port ?? boundPortNumber
       portState.value = bound
@@ -2101,6 +2127,7 @@ export function apply(ctx, config) {
     }
     return tls
   }).then((tls) => {
+    if (disposed) return tls
     // 只有 listen 成功才算就绪；仅证书生成完成还不够。
     readiness.phase = "ready"
     // 就绪后再探宿主能力（不 await：探测慢不该拖慢启动，失败也只是让 App 多显示入口）。
@@ -2117,6 +2144,7 @@ export function apply(ctx, config) {
 
   ctx.effect(
     () => () => {
+      disposed = true
       readiness.phase = "stopped"
       for (const dispose of disposers) dispose()
       if (pollTimer) clearInterval(pollTimer)
@@ -2141,11 +2169,15 @@ export function apply(ctx, config) {
       }
       rt.gapPolls.clear()
       rt.reasoningCache.clear()
+      rt.reasoningInflight?.clear()
       rt.sessionActivityCache.clear()
+      rt.sessionCwdCache?.clear()
       rt.pricedModelCache?.clear()
+      rt.pairingRequests.clear()
+      rt.awaiting.clear()
       rt.requests.disposeAll("cancelled")
       unbindLocalRpcRuntime()
-      if (gatewayPeer) { try { Promise.resolve(gatewayPeer.dispose()).catch(() => {}) } catch {} }
+      dropGatewayPeer()
       try { proxy?.closeAllConnections?.() } catch {}
       try { proxy?.close() } catch {}
     },

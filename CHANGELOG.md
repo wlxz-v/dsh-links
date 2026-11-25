@@ -9,6 +9,14 @@
   - **DeepSeek Harness 0.2.x 宿主扩展规范**：网关 Peer 懒加载、多轮澄清多题依次下发、双端协同审批、PDF 原生预览与系统 Intent 唤起。
   - **社区生态参考**：局域网可用性评分参考 `lrxG/dsh-app`；重复错误通知抑制参考 `dsh-meow-smooth`。
 
+**插件全量深度梳理优化（安全加固、性能去抖、稳定性修复与回归门禁）**：
+- **核心架构与原子持久化**：新增 `src/atomic-fs.js`（`O_EXCL|O_NOFOLLOW` + `0o600` + `fsync` + Windows 重命名退避重试 + 孤儿临时文件清理），统一落地于 `src/index.js` 状态保存与 `src/tls.js` 证书/私钥写入；修复 `src/bounded-map.js` 在 `undefined` 键下的无限增长；`src/zstd-frames.js` 在单帧流式解压中强制校验 `maxOutputBytes` 防止解压炸弹 OOM；`src/http-utils.js` 严格遵循 RFC 9110 `q` 值协商、`Host` 规范化与 `Sec-Fetch-Site` 跨站收紧，新增 `safeDecodeUriComponent`；`src/device-mutation-gate.js` 的 `drain()` 支持超时上限，撤权改为「先持久化并立即断开预览/配对重放，再有界排空」。
+- **RPC、实时流与事件中心韧性**：`src/question-bridge.js` 修复启动期 `/api/remote.mux` 竞态导致的永久离线，补齐 UTF-8 跨块解码、`\r\n\r\n` 分隔、2 MiB 缓冲上限、单次帧序列化与 `catchupPaused` 暂停尊重；`src/stream-cursor.js` 修复倒序分页丢弃最新事件与游标超前（`cursor-ahead`）检测，消除大数组展开栈溢出；`src/host-events.js` 修复 `eventsAfter` 重复快照与超前游标、`lastNotifiedTerminal` 周期淘汰及有界并发（上限 4）；`src/local-rpc.js` 补全 `AbortSignal`、HTTP 响应错误与非 2xx 映射、`.unref()` 定时器及 `session.models` 并发拉取；`src/request-lifecycle.js` 移除泄漏的只写表并在末条挂起请求结算后及时清理宽限定时器；`src/question-answers.js` 修复重复/未知答案索引与 `text` 题选项校验；`src/host-probe.js` 区分传输/鉴权错误为 `unknown`。
+- **本地预览代理与检测加固**：`src/preview-proxy.js` 校验 WebSocket 101 握手状态与响应头白名单（防响应头注入/走私），补齐 HTTP 背压、客户端断开即中止上游及上传体上限，将共享 `req.socket` 追踪替换为每请求独立中止回调并支持按设备一键断链（`disconnectDevice`），阻断调试/管理高危端口及 `cookie`/`set-cookie` 透传；`src/preview-detect.js` 支持 IPv6 `[::1]`、512 KiB 文本上限、并发 4 限制与 `throughSeq` 透传。
+- **移动端 API、活跃度与异步工作区**：`src/mobile-session-activity.js` 适配 DSH V3/V4 `tool/result`（经 `toolResultMeta`）并在 `turn/end` / `user/message` 清理状态与重置 `changesSeq`；`src/mobile-api.js` 透传 `throughSeqBySessionId` 消除列表刷新 20× `session.list` RPC 风暴、为已完成会话建立 `lastResult: null` 负缓存、去重推理读取并发并将 `/file` `/tree` `/workspaces` 切换为异步有界 I/O，修复模型价格缓存失配与 `settings/conflict` 409 映射；`src/workspace-create.js` 与 `src/workspace-approval.js` 封堵同级目录创建符号链接与并发双击审批竞态；`src/history.js`、`src/session-log-reasoning.js`、`src/pricing.js`、`src/mobile-models.js` 与 `src/mobile-session-control.js` 同步修复流式块合并、空值数值判定与单遍目录扫描。
+- **远程中继 DLP/1、诊断与控制面板**：`src/remote/agent.js` 与 `src/remote/runtime.js` 修复看门狗停滞检测（按实际写入字节与注入时钟）、正常关闭先刷出 `wsStream`、重复 `sid` 拦截、控制注册/心跳超时、并发 `selfTest`、单调 `epoch` 防启停竞态及动态 `pluginPort` 读取；`src/diagnostics.js` 修复多会话 `viewers` 分隔符、隐私正则误伤正常枚举导致 500、IPv6/IPv4 链路本地分类；`src/panel.js` 修复 `host.probe` 诊断行渲染 `undefined`、`usePanelData` 串行轮询与 `AbortController`、错误状态文案及 `Escape` 关闭放大二维码；`build-client.mjs` 为编译产物 `src/client.js` 加上 IIFE 作用域隔离。
+- **回归测试门禁**：新增 `test/plugin-hardening.test.mjs`（15 项核心安全/性能/契约回归用例），`npm run prepack` 全量 414 项单测通过。
+
 **Android 首页会话列表与全局 UI 滑动流畅度优化**：
 - **消除滑动帧内 $O(N^2)$ 子智能体全表扫描**：在 `SubagentTree.kt` 新增 `runningSubagentCountsByParent` 单遍建索引 + 环安全记忆化聚合，仅在数据变更时计算一次，彻底消除 500+ 会话滑动入屏时的全表扫描与数据类拷贝。
 - **启用 `LazyColumn` 批量区间与显式 `contentType` 槽位复用**：为首页行、搜索行、对话消息行分别声明独立 `contentType`，并移除滚动行上无条件的 `animateItem()` 放置动画，大幅削减高速惯性滑动（fling）时的测量排版与 Composable 槽位重建开销。

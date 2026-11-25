@@ -9,10 +9,21 @@ import { randomBytes } from "node:crypto"
 
 export const PREVIEW_TTL_MS = 2 * 60 * 60 * 1000
 export const PREVIEW_MAX_BYTES = 50 * 1024 * 1024
+export const PREVIEW_MAX_REQUEST_BYTES = 16 * 1024 * 1024
 export const PREVIEW_IDLE_MS = 60_000
 export const PREVIEW_BLACKLIST = Object.freeze([22, 3306, 5432, 6379, 11211, 27017, 9200])
+const EXTRA_BLOCKED_PORTS = [
+  25, 135, 139, 445, 587, 2375, 2376, 2379, 3389, 5900, 5984, 6443, 9222, 9229, 10250, 15672,
+]
 
-const BLACKLIST = new Set(PREVIEW_BLACKLIST)
+const BLACKLIST = new Set([...PREVIEW_BLACKLIST, ...EXTRA_BLOCKED_PORTS])
+const WS_UPGRADE_RESPONSE_HEADERS = new Set([
+  "upgrade",
+  "connection",
+  "sec-websocket-accept",
+  "sec-websocket-protocol",
+  "sec-websocket-extensions",
+])
 const DROP_HEADERS = new Set([
   "connection",
   "keep-alive",
@@ -25,6 +36,8 @@ const DROP_HEADERS = new Set([
   "upgrade",
   "proxy-connection",
   "authorization",
+  "cookie",
+  "set-cookie",
   "x-dsh-link-token",
   "referer",
   "referrer",
@@ -71,7 +84,7 @@ export function previewLookup(hostname, options, callback) {
 
 export function matchPreviewPath(url) {
   const raw = String(url ?? "")
-  if (/^[a-z][a-z0-9+.-]*:/i.test(raw)) return null
+  if (/^[a-z][a-z0-9+.-]*:/i.test(raw) || raw.startsWith("//")) return null
   let parsed
   try {
     parsed = new URL(raw || "/", "http://127.0.0.1")
@@ -96,9 +109,18 @@ function headerList(value) {
   return Array.isArray(value) ? value : [value]
 }
 
+function headerLookup(headers, lowerName) {
+  if (!headers || typeof headers !== "object") return undefined
+  if (Object.prototype.hasOwnProperty.call(headers, lowerName)) return headers[lowerName]
+  for (const [k, v] of Object.entries(headers)) {
+    if (k.toLowerCase() === lowerName) return v
+  }
+  return undefined
+}
+
 export function stripHopByHop(headers) {
   const named = new Set()
-  for (const value of headerList(headers?.connection)) {
+  for (const value of headerList(headerLookup(headers, "connection"))) {
     for (const part of String(value).split(",")) {
       const name = part.trim().toLowerCase()
       if (name) named.add(name)
@@ -116,44 +138,68 @@ export function stripHopByHop(headers) {
 export function forwardPreviewHeaders(headers, port, { websocket = false } = {}) {
   const out = stripHopByHop(headers)
   out.host = `localhost:${port}`
-  if (headers?.origin) out.origin = `http://localhost:${port}`
+  if (headerLookup(headers, "origin")) out.origin = `http://localhost:${port}`
   if (!websocket) return out
   out.connection = "Upgrade"
   out.upgrade = "websocket"
   for (const name of ["sec-websocket-key", "sec-websocket-version", "sec-websocket-protocol", "sec-websocket-extensions"]) {
-    if (headers?.[name] != null) out[name] = headers[name]
+    const val = headerLookup(headers, name)
+    if (val != null) out[name] = val
   }
   return out
 }
 
 function createRegistry() {
-  const live = new Map()
+  const byPreview = new Map()
+  const byDevice = new Map()
   return {
-    track(previewId, socket) {
-      if (!socket) return () => {}
-      let set = live.get(previewId)
-      if (!set) {
-        set = new Set()
-        live.set(previewId, set)
+    register(previewId, abortFn, deviceId = null) {
+      let pSet = byPreview.get(previewId)
+      if (!pSet) {
+        pSet = new Set()
+        byPreview.set(previewId, pSet)
       }
-      set.add(socket)
-      const drop = () => {
-        set.delete(socket)
-        if (set.size === 0) live.delete(previewId)
+      pSet.add(abortFn)
+      let dSet = null
+      if (deviceId) {
+        dSet = byDevice.get(deviceId)
+        if (!dSet) {
+          dSet = new Set()
+          byDevice.set(deviceId, dSet)
+        }
+        dSet.add(abortFn)
       }
-      socket.once("close", drop)
-      return drop
+      let removed = false
+      return () => {
+        if (removed) return
+        removed = true
+        pSet.delete(abortFn)
+        if (pSet.size === 0) byPreview.delete(previewId)
+        if (dSet) {
+          dSet.delete(abortFn)
+          if (dSet.size === 0) byDevice.delete(deviceId)
+        }
+      }
     },
     disconnect(previewId) {
-      const set = live.get(previewId)
+      const set = byPreview.get(previewId)
       if (!set) return
-      for (const socket of [...set]) {
-        try { socket.destroy() } catch {}
+      for (const abortFn of [...set]) {
+        try { abortFn() } catch {}
       }
-      live.delete(previewId)
+      byPreview.delete(previewId)
+    },
+    disconnectDevice(deviceId) {
+      const set = byDevice.get(deviceId)
+      if (!set) return
+      for (const abortFn of [...set]) {
+        try { abortFn() } catch {}
+      }
+      byDevice.delete(deviceId)
     },
     stop() {
-      for (const id of [...live.keys()]) this.disconnect(id)
+      for (const id of [...byPreview.keys()]) this.disconnect(id)
+      byDevice.clear()
     },
   }
 }
@@ -174,12 +220,18 @@ function panelPreview(item) {
 export function rejectUpgrade(socket, code, message) {
   const body = JSON.stringify({ error: message })
   const reason = code === 401 ? "Unauthorized" : code === 403 ? "Forbidden" : code === 404 ? "Not Found" : "Error"
+  const payload = `HTTP/1.1 ${code} ${reason}\r\ncontent-type: application/json; charset=utf-8\r\ncontent-length: ${Buffer.byteLength(body)}\r\nconnection: close\r\n\r\n${body}`
   try {
-    socket.write(
-      `HTTP/1.1 ${code} ${reason}\r\ncontent-type: application/json; charset=utf-8\r\ncontent-length: ${Buffer.byteLength(body)}\r\nconnection: close\r\n\r\n${body}`,
-    )
-  } catch {}
-  socket.destroy()
+    socket.end(payload)
+  } catch {
+    try { socket.destroy() } catch {}
+    return
+  }
+  const timer = setTimeout(() => {
+    try { socket.destroy() } catch {}
+  }, 1_000)
+  timer.unref?.()
+  socket.once?.("close", () => clearTimeout(timer))
 }
 
 function writeJson(res, code, obj) {
@@ -234,17 +286,13 @@ export function createPreviewService(options) {
     return previewPortProblem(port, guards)
   }
 
-  function armExpiry(item, sockets) {
+  function armExpiry(item, onExpire) {
     const remain = Number(item.expiresAt) - now()
     const timer = setTimeout(() => {
-      for (const socket of sockets) {
-        try { socket?.destroy() } catch {}
-      }
+      try { onExpire() } catch {}
     }, Math.max(0, remain))
     timer.unref?.()
-    const clear = () => clearTimeout(timer)
-    for (const socket of sockets) socket?.once?.("close", clear)
-    return clear
+    return () => clearTimeout(timer)
   }
 
   function openUpstream(item, method, path, headers) {
@@ -309,7 +357,7 @@ export function createPreviewService(options) {
       logger?.info?.(`dsh-links: preview revoke port=${item.port}`)
       return { status: 200, body: { ok: true } }
     },
-    handleHttp(req, res) {
+    handleHttp(req, res, deviceId = null) {
       if (req.method === "CONNECT") {
         writeJson(res, 405, { error: "method not allowed" })
         return true
@@ -326,23 +374,53 @@ export function createPreviewService(options) {
         writeJson(res, 403, { error: blocked })
         return true
       }
+      const reqContentLen = Number(headerLookup(req.headers, "content-length"))
+      if (Number.isFinite(reqContentLen) && reqContentLen > PREVIEW_MAX_REQUEST_BYTES) {
+        writeJson(res, 413, { error: "请求体过大" })
+        return true
+      }
       item.hits = (item.hits ?? 0) + 1
       const headers = forwardPreviewHeaders(req.headers, item.port)
       const upstream = openUpstream(item, req.method, matched.path, headers)
-      const sockets = [req.socket, upstream]
-      registry.track(item.previewId, req.socket)
-      registry.track(item.previewId, upstream)
-      armExpiry(item, sockets)
+      let upRes = null
       let sent = 0
+      let uploaded = 0
       let finished = false
+      let unregister = () => {}
+      let clearExpiry = () => {}
+      const cleanup = () => {
+        clearExpiry()
+        unregister()
+        res.off?.("close", onResClose)
+        res.off?.("finish", onResFinish)
+      }
       const closeUpstream = () => {
         if (finished) return
         finished = true
+        cleanup()
+        try { upRes?.destroy() } catch {}
         try { upstream.destroy() } catch {}
       }
+      const abortRequest = () => {
+        closeUpstream()
+        if (!res.writableEnded) {
+          try { res.destroy() } catch {}
+        }
+      }
+      const onResFinish = () => cleanup()
+      const onResClose = () => {
+        if (!res.writableEnded) closeUpstream()
+        else cleanup()
+      }
+      unregister = registry.register(item.previewId, abortRequest, deviceId)
+      clearExpiry = armExpiry(item, abortRequest)
+      res.once?.("finish", onResFinish)
+      res.once?.("close", onResClose)
       const fail = (code, error) => {
         if (finished) return
         finished = true
+        cleanup()
+        try { upRes?.destroy() } catch {}
         try { upstream.destroy() } catch {}
         if (!res.headersSent) writeJson(res, code, { error })
         else if (!res.writableEnded) {
@@ -352,11 +430,17 @@ export function createPreviewService(options) {
       upstream.on("timeout", () => fail(504, "预览空闲超时"))
       upstream.on("error", () => fail(502, "预览端口没有响应"))
       upstream.on("response", (up) => {
-        sockets.push(up.socket)
-        registry.track(item.previewId, up.socket)
+        if (finished) {
+          try { up.destroy() } catch {}
+          return
+        }
+        upRes = up
         const out = stripHopByHop(up.headers)
-        const declared = Number(out["content-length"])
-        if (!Number.isFinite(declared) || declared > maxBytes) delete out["content-length"]
+        const rawLen = out["content-length"]
+        if (rawLen != null) {
+          const declared = Number(rawLen)
+          if (!Number.isInteger(declared) || declared < 0 || declared > maxBytes) delete out["content-length"]
+        }
         if (!res.headersSent) res.writeHead(up.statusCode ?? 502, out)
         up.on("data", (chunk) => {
           if (finished || res.writableEnded) return
@@ -368,10 +452,17 @@ export function createPreviewService(options) {
           }
           const slice = chunk.length > room ? chunk.subarray(0, room) : chunk
           sent += slice.length
-          res.write(slice)
+          const ok = res.write(slice)
           if (sent >= maxBytes) {
             closeUpstream()
             if (!res.writableEnded) res.end()
+            return
+          }
+          if (ok === false) {
+            up.pause()
+            res.once("drain", () => {
+              if (!finished && !res.writableEnded) up.resume()
+            })
           }
         })
         up.on("end", () => {
@@ -380,12 +471,20 @@ export function createPreviewService(options) {
         })
         up.on("error", () => fail(502, "预览端口没有响应"))
       })
+      req.on("data", (chunk) => {
+        if (finished) return
+        uploaded += chunk.length
+        if (uploaded > PREVIEW_MAX_REQUEST_BYTES) {
+          req.unpipe?.(upstream)
+          fail(413, "请求体过大")
+        }
+      })
       req.on("aborted", () => closeUpstream())
       req.on("error", () => closeUpstream())
       req.pipe(upstream)
       return true
     },
-    handleUpgrade(req, socket, head) {
+    handleUpgrade(req, socket, head, deviceId = null) {
       const matched = matchPreviewPath(req.url)
       if (!matched) {
         rejectUpgrade(socket, 404, "not found")
@@ -403,10 +502,25 @@ export function createPreviewService(options) {
       item.hits = (item.hits ?? 0) + 1
       const headers = forwardPreviewHeaders(req.headers, item.port, { websocket: true })
       const upstream = openUpstream(item, "GET", matched.path, headers)
-      registry.track(item.previewId, socket)
-      registry.track(item.previewId, upstream)
-      armExpiry(item, [socket, upstream])
+      let upgraded = false
+      let upSock = null
+      let unregister = () => {}
+      let clearExpiry = () => {}
+      const cleanup = () => {
+        clearExpiry()
+        unregister()
+      }
+      const teardown = () => {
+        cleanup()
+        try { socket.destroy() } catch {}
+        try { upSock?.destroy() } catch {}
+        try { upstream.destroy() } catch {}
+      }
+      unregister = registry.register(item.previewId, teardown, deviceId)
+      clearExpiry = armExpiry(item, teardown)
       const fail = () => {
+        if (upgraded) return
+        cleanup()
         if (!socket.destroyed) rejectUpgrade(socket, 502, "bad gateway")
         try { upstream.destroy() } catch {}
       }
@@ -417,35 +531,51 @@ export function createPreviewService(options) {
         fail()
       })
       upstream.on("upgrade", (upRes, upSocket, upHead) => {
-        registry.track(item.previewId, upSocket)
-        armExpiry(item, [upSocket])
-        const lines = [`HTTP/1.1 ${upRes.statusCode ?? 101} ${upRes.statusMessage || "Switching Protocols"}`]
-        for (const [key, value] of Object.entries(upRes.headers)) {
-          for (const piece of headerList(value)) lines.push(`${key}: ${piece}`)
+        if (socket.destroyed) {
+          try { upSocket.destroy() } catch {}
+          cleanup()
+          return
+        }
+        if (upRes.statusCode !== 101) {
+          try { upSocket.destroy() } catch {}
+          fail()
+          return
+        }
+        upgraded = true
+        upSock = upSocket
+        upstream.removeListener("error", fail)
+        upstream.removeListener("timeout", fail)
+        const lines = ["HTTP/1.1 101 Switching Protocols"]
+        for (const [key, value] of Object.entries(upRes.headers ?? {})) {
+          const lower = key.toLowerCase()
+          if (!WS_UPGRADE_RESPONSE_HEADERS.has(lower)) continue
+          for (const piece of headerList(value)) {
+            const text = String(piece)
+            if (/[\r\n\0]/.test(text)) continue
+            lines.push(`${lower}: ${text}`)
+          }
         }
         try {
           socket.write(`${lines.join("\r\n")}\r\n\r\n`)
           if (upHead?.length) socket.write(upHead)
           if (head?.length) upSocket.write(head)
         } catch {
-          socket.destroy()
-          upSocket.destroy()
+          teardown()
           return
         }
-        const idle = () => {
-          socket.destroy()
-          upSocket.destroy()
-        }
-        socket.setTimeout(idleMs, idle)
-        upSocket.setTimeout(idleMs, idle)
+        socket.setTimeout(idleMs, teardown)
+        upSocket.setTimeout(idleMs, teardown)
         upSocket.pipe(socket)
         socket.pipe(upSocket)
-        socket.once("close", () => upSocket.destroy())
-        upSocket.once("close", () => socket.destroy())
-        socket.on("error", idle)
-        upSocket.on("error", idle)
+        socket.once("close", teardown)
+        upSocket.once("close", teardown)
+        socket.on("error", teardown)
+        upSocket.on("error", teardown)
       })
       upstream.end()
+    },
+    disconnectDevice(deviceId) {
+      registry.disconnectDevice(deviceId)
     },
     stop() {
       registry.stop()

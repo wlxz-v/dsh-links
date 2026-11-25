@@ -4,6 +4,7 @@
  * 说明：移动布局适配已由 Android App 注入（assets/mobile-client.js），
  *       本插件不注入任何页面布局，桌面端 DSH Web UI 保持原样。
  */
+;(() => {
 /**
  * dsh-links 客户端面 · 面板模块（作为 createPanelModule 工厂被主模块组合调用）
  * 「手机连接」：一张连接码（局域网 + 远程）、远程连接（DLP/1）、已配对手机。
@@ -356,6 +357,12 @@ const createPanelModule = (require) => {
     const left = info.expiresAt ? info.expiresAt - now : null
     const expired = left !== null && left <= 0
     React.useEffect(() => { if (expired) onExpired() }, [expired, onExpired])
+    React.useEffect(() => {
+      if (!zoom) return undefined
+      const onKey = (e) => { if (e.key === 'Escape') setZoom(false) }
+      window.addEventListener('keydown', onKey)
+      return () => window.removeEventListener('keydown', onKey)
+    }, [zoom])
 
     const code = info.pairingCode || ''
     const remoteReady = remote?.state === 'ready'
@@ -385,7 +392,7 @@ const createPanelModule = (require) => {
             h('span', { className: 'dl-route' }, h(Dot, { tone: 'ok' }), '局域网'),
             h('span', { className: 'dl-route', 'data-off': remoteRoute.tone === 'idle' ? '' : undefined },
               h(Dot, { tone: remoteRoute.tone, live: remoteRoute.tone === 'warn' }),
-              remoteReady ? '远程' : remote?.state === 'off' || !remote ? '远程未开启' : '远程连接中'),
+              remoteReady ? '远程' : remote?.state === 'off' || !remote ? '远程未开启' : remote?.state === 'error' ? '远程出错' : '远程连接中'),
           ),
           h(PairAddresses, { infos: info.infos }),
           h('p', { className: 'dl-pair-hint' },
@@ -479,7 +486,7 @@ const createPanelModule = (require) => {
       setTest(null)
       if (next) return enable({ endpoint: remote.endpoint, outerPin: remote.outerPin })
       setBusy(true)
-      try { await actions.remoteDisable() } finally { setBusy(false) }
+      try { await actions.remoteDisable() } catch (err) { setError(String(err?.message ?? err)) } finally { setBusy(false) }
     }
     const runTest = async () => {
       setTesting(true)
@@ -489,7 +496,8 @@ const createPanelModule = (require) => {
     const reset = async () => {
       if (!window.confirm('重置远程身份？\n\n所有手机的远程凭据立即作废。它们回到局域网后会自动拿到新凭据；在外面的手机要重新扫码。')) return
       setBusy(true)
-      try { await actions.remoteReset() } finally { setBusy(false) }
+      setError('')
+      try { await actions.remoteReset() } catch (err) { setError(String(err?.message ?? err)) } finally { setBusy(false) }
     }
 
     let desc
@@ -585,14 +593,18 @@ const createPanelModule = (require) => {
       on: '在',
       off: '不在',
       service: { workspaceChanges: '改动', typertGateway: '网关', sessions: '会话' },
-      listen: (d) => `私网 ${d.private} · Tailscale ${d.tailnet} · 其他 ${d.other}`,
+      listen: (d) => `私网 ${d.private ?? 0} · Tailscale ${d.tailnet ?? 0} · 其他 ${d.other ?? 0}`,
+      probe: (d) => `可用 ${d.supported ?? 0}/${d.total ?? 0}${d.missing ? ` · 缺失 ${d.missing}` : ''}${d.unknown ? ` · 未知 ${d.unknown}` : ''}`,
+      streams: (d) => `后台流 ${d.hostEvents ?? 0} · 活跃会话 ${d.sessionCount ?? 0}`,
       check: {
         'host.rpc': '本机接口',
         'host.services': '本机服务',
+        'host.probe': '宿主能力',
         'plugin.version': '插件版本',
         'tls.cert': '连接证书',
         'pairing.devices': '已配对手机',
         'listen.addresses': '监听地址',
+        'mobile.streams': '手机实时流',
         'remote.relay': '远程中继',
         clock: '电脑时间',
       },
@@ -606,6 +618,11 @@ const createPanelModule = (require) => {
         HOST_SERVICES_PARTIAL: '改动服务没挂上，其余正常',
         HOST_SERVICES_MISSING: '会话或网关服务没挂上',
         HOST_SERVICES_UNAVAILABLE: '读不到本机服务',
+        HOST_PROBE_OK: '宿主接口全部支持',
+        HOST_PROBE_MISSING: '部分入口在当前宿主版本不可用，已自动隐藏',
+        HOST_PROBE_PARTIAL: '部分接口暂未完成探测',
+        HOST_PROBE_PENDING: '正在探测宿主能力',
+        HOST_PROBE_UNKNOWN: '未启用宿主能力探测',
         PLUGIN_VERSION_OK: '插件版本正常',
         PLUGIN_VERSION_UNKNOWN: '读到协议号，但没有版本字符串',
         PLUGIN_VERSION_INVALID: '插件协议号无效',
@@ -625,6 +642,8 @@ const createPanelModule = (require) => {
         LISTEN_NO_LAN: '只有本机地址，手机连不上',
         LISTEN_UNTRUSTED: '只看到公网地址，确认网段可信再用',
         LISTEN_UNAVAILABLE: '读不到监听地址',
+        MOBILE_STREAMS_LIVE: '有手机保持在线连接',
+        MOBILE_STREAMS_IDLE: '当前没有在线连接的手机',
         REMOTE_DISABLED: '远程连接已关闭',
         REMOTE_READY: '中继已连上',
         REMOTE_CONNECTING: '正在连接中继',
@@ -647,14 +666,18 @@ const createPanelModule = (require) => {
       on: 'up',
       off: 'down',
       service: { workspaceChanges: 'changes', typertGateway: 'gateway', sessions: 'sessions' },
-      listen: (d) => `private ${d.private} · Tailscale ${d.tailnet} · other ${d.other}`,
+      listen: (d) => `private ${d.private ?? 0} · Tailscale ${d.tailnet ?? 0} · other ${d.other ?? 0}`,
+      probe: (d) => `supported ${d.supported ?? 0}/${d.total ?? 0}${d.missing ? ` · missing ${d.missing}` : ''}${d.unknown ? ` · unknown ${d.unknown}` : ''}`,
+      streams: (d) => `host events ${d.hostEvents ?? 0} · sessions ${d.sessionCount ?? 0}`,
       check: {
         'host.rpc': 'Host API',
         'host.services': 'Host services',
+        'host.probe': 'Host capabilities',
         'plugin.version': 'Plugin version',
         'tls.cert': 'Certificate',
         'pairing.devices': 'Paired phones',
         'listen.addresses': 'Listen addresses',
+        'mobile.streams': 'Mobile streams',
         'remote.relay': 'Remote relay',
         clock: 'Host clock',
       },
@@ -668,6 +691,11 @@ const createPanelModule = (require) => {
         HOST_SERVICES_PARTIAL: 'Change tracking is missing; the rest is up',
         HOST_SERVICES_MISSING: 'Sessions or the gateway is not mounted',
         HOST_SERVICES_UNAVAILABLE: 'Could not read host services',
+        HOST_PROBE_OK: 'All host capabilities are supported',
+        HOST_PROBE_MISSING: 'Some host capabilities are unavailable and hidden on mobile',
+        HOST_PROBE_PARTIAL: 'Some host capability probes are still unknown',
+        HOST_PROBE_PENDING: 'Probing host capabilities',
+        HOST_PROBE_UNKNOWN: 'Host capability probe unavailable',
         PLUGIN_VERSION_OK: 'Plugin version looks fine',
         PLUGIN_VERSION_UNKNOWN: 'Protocol is present, version string is not',
         PLUGIN_VERSION_INVALID: 'Plugin protocol is invalid',
@@ -687,6 +715,8 @@ const createPanelModule = (require) => {
         LISTEN_NO_LAN: 'Only loopback is available; phones cannot connect',
         LISTEN_UNTRUSTED: 'Only public addresses were found',
         LISTEN_UNAVAILABLE: 'Could not read listen addresses',
+        MOBILE_STREAMS_LIVE: 'Mobile clients are connected',
+        MOBILE_STREAMS_IDLE: 'No active mobile stream',
         REMOTE_DISABLED: 'Remote connection is off',
         REMOTE_READY: 'Relay is connected',
         REMOTE_CONNECTING: 'Connecting to the relay',
@@ -711,14 +741,18 @@ const createPanelModule = (require) => {
     const detail = check.detail || {}
     const facts = []
     if (typeof detail.ms === 'number') facts.push(`${detail.ms} ms`)
+    if (typeof detail.errorCode === 'string') facts.push(detail.errorCode)
     if (typeof detail.daysRemaining === 'number') facts.push(copy.days(detail.daysRemaining))
     if (typeof detail.fingerprintPrefix === 'string') facts.push(detail.fingerprintPrefix)
     if (typeof detail.version === 'string') facts.push(detail.version)
     if (typeof detail.protocol === 'number') facts.push(`p${detail.protocol}`)
     if (typeof detail.count === 'number') facts.push(copy.count(detail.count))
     if (typeof detail.pending === 'number' && detail.pending > 0) facts.push(copy.pending(detail.pending))
-    if (typeof detail.total === 'number') facts.push(copy.listen(detail))
+    if (check.id === 'listen.addresses' && typeof detail.total === 'number') facts.push(copy.listen(detail))
+    if (check.id === 'host.probe' && typeof detail.total === 'number') facts.push(copy.probe(detail))
+    if (check.id === 'mobile.streams' && typeof detail.hostEvents === 'number') facts.push(copy.streams(detail))
     if (typeof detail.lastCode === 'string') facts.push(detail.lastCode)
+    if (typeof detail.peerError === 'string') facts.push(detail.peerError)
     const services = ['workspaceChanges', 'typertGateway', 'sessions'].filter((key) => typeof detail[key] === 'boolean')
     if (services.length) {
       facts.push(services.map((key) => `${copy.service[key]} ${detail[key] ? copy.on : copy.off}`).join(', '))
@@ -815,9 +849,13 @@ const createPanelModule = (require) => {
         desc: `会话 ${String(item.sessionId).slice(0, 8)} · 请在这台电脑上批准`,
         actions: h('button', {
           type: 'button', className: 'dl-btn is-primary',
+          disabled: busy,
           onClick: () => {
+            setBusy(true)
+            setError('')
             actions.approvePreview({ port: item.port, label: `开发服务器 :${item.port}` })
               .catch((err) => setError(String(err?.message ?? err)))
+              .finally(() => setBusy(false))
           },
         }, '批准'),
       })),
@@ -858,16 +896,36 @@ const createPanelModule = (require) => {
     // pair-info 503(proxy_not_ready) = HTTPS 还没 listen；有限重试后给出明确失败
     const [starting, setStarting] = React.useState(false)
     const startRetries = React.useRef(0)
+    const reqSeq = React.useRef(0)
+    const abortRef = React.useRef(null)
+    const mountedRef = React.useRef(true)
+    const cadenceRef = React.useRef(8000)
+
+    React.useEffect(() => {
+      mountedRef.current = true
+      return () => {
+        mountedRef.current = false
+        try { abortRef.current?.abort() } catch {}
+      }
+    }, [])
 
     const load = React.useCallback(async () => {
+      const seq = ++reqSeq.current
+      try { abortRef.current?.abort() } catch {}
+      const ac = new AbortController()
+      abortRef.current = ac
+      const signal = ac.signal
       try {
-        const resInfo = await fetch('/dsh-link/pair-info')
+        const resInfo = await fetch('/dsh-link/pair-info', { signal })
+        if (!mountedRef.current || seq !== reqSeq.current) return
         if (resInfo.status === 503) {
           const body = await resInfo.json().catch(() => ({}))
+          if (!mountedRef.current || seq !== reqSeq.current) return
           if (body?.error === 'proxy_not_ready') {
             if (body.phase === 'failed') throw new Error('手机连接启动失败，HTTPS 端口没能就绪。请看 DSH 日志或重启 DSH。')
             if (startRetries.current >= 20) throw new Error('手机连接启动超时。请看 DSH 日志或重启 DSH。')
             startRetries.current += 1
+            cadenceRef.current = 1500
             setStarting(true)
             setErr('')
             return
@@ -876,29 +934,59 @@ const createPanelModule = (require) => {
         if (!resInfo.ok) throw new Error(`HTTP ${resInfo.status}`)
         startRetries.current = 0
         const [resDevices, resApprovals, resRemote, resPreviews] = await Promise.all([
-          fetch('/dsh-link/devices'), fetch('/dsh-link/workspace-approvals'), fetch('/dsh-link/remote-status'), fetch('/dsh-link/previews'),
+          fetch('/dsh-link/devices', { signal }),
+          fetch('/dsh-link/workspace-approvals', { signal }),
+          fetch('/dsh-link/remote-status', { signal }).catch(() => null),
+          fetch('/dsh-link/previews', { signal }).catch(() => null),
         ])
-        if (!resDevices.ok || !resApprovals.ok || !resPreviews.ok) throw new Error(`HTTP ${resDevices.status}/${resApprovals.status}`)
+        if (!mountedRef.current || seq !== reqSeq.current) return
+        if (!resDevices.ok || !resApprovals.ok) throw new Error(`HTTP ${resDevices.status}/${resApprovals.status}`)
         const [info, devices, approvals, remote, previewBody] = await Promise.all([
-          resInfo.json(), resDevices.json(), resApprovals.json(), resRemote.ok ? resRemote.json() : null, resPreviews.json(),
+          resInfo.json(),
+          resDevices.json(),
+          resApprovals.json(),
+          resRemote?.ok ? resRemote.json().catch(() => null) : null,
+          resPreviews?.ok ? resPreviews.json().catch(() => null) : null,
         ])
-        setData({ info, devices: devices.devices ?? [], workspaceApprovals: approvals.approvals ?? [], remote, previews: previewBody.previews ?? [], detected: previewBody.detected ?? [] })
+        if (!mountedRef.current || seq !== reqSeq.current) return
+        const nextDevices = devices.devices ?? []
+        const nextApprovals = approvals.approvals ?? []
+        const hasPending = nextDevices.some((d) => d.status === 'pending') || nextApprovals.length > 0
+        const isConnecting = remote?.state === 'connecting'
+        cadenceRef.current = hasPending || isConnecting ? 2000 : 8000
+        setData((prev) => ({
+          info,
+          devices: nextDevices,
+          workspaceApprovals: nextApprovals,
+          remote,
+          previews: previewBody ? (previewBody.previews ?? []) : prev.previews,
+          detected: previewBody ? (previewBody.detected ?? []) : prev.detected,
+        }))
         setStarting(false)
         setErr('')
       } catch (e) {
+        if (e?.name === 'AbortError' || !mountedRef.current || seq !== reqSeq.current) return
         setStarting(false)
         setErr(String(e?.message ?? e))
       }
     }, [])
 
-    const pending = data.devices.filter((d) => d.status === 'pending').length + data.workspaceApprovals.length
-    const connecting = data.remote?.state === 'connecting'
     React.useEffect(() => {
       if (!active) return undefined
-      load()
-      const t = setInterval(load, starting ? 1500 : (pending || connecting ? 2000 : 8000))
-      return () => clearInterval(t)
-    }, [active, load, pending, connecting, starting])
+      let stopped = false
+      let timer = 0
+      const loop = async () => {
+        await load()
+        if (stopped) return
+        timer = setTimeout(loop, cadenceRef.current)
+      }
+      loop()
+      return () => {
+        stopped = true
+        clearTimeout(timer)
+        try { abortRef.current?.abort() } catch {}
+      }
+    }, [active, load])
 
     const after = (p) => p.finally(load)
     const actions = {
@@ -998,3 +1086,4 @@ window.__ModuleLoader__.load({
     return module.exports
   },
 })
+})();

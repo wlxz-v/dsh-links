@@ -8,6 +8,7 @@
  * 协议形状参考 Clarklevis1995/dsh-plugin-mobile-gateway（MIT）。
  */
 import { callLocalRpc, LocalRpcError } from "./local-rpc.js"
+import { safeDecodeUriComponent } from "./http-utils.js"
 
 const BODY_LIMIT = 64 * 1024
 const MAX_QUEUE_TEXT = 32 * 1024
@@ -132,16 +133,22 @@ export async function handleMobileSessionControlApi(req, res, targetPort, state,
   // ---- 排队消息 ----
   const queueList = pathname.match(/^\/dsh-link\/mobile\/sessions\/([^/]+)\/queue$/)
   if (req.method === "GET" && queueList) {
-    const sessionId = decodeURIComponent(queueList[1])
+    const sessionId = safeDecodeUriComponent(queueList[1])
+    if (!sessionId) return json(res, 400, { error: "sessionId 无效" }), true
     // 不带 maxMessages：走 follow 快照，投影最全（list 行不一定带 inbox）
-    const value = await callLocalRpc(targetPort, "session.history", { sessionId })
-    json(res, 200, { ok: true, sessionId, items: queueItemsFromInbox(value?.projections?.values?.inbox) })
+    try {
+      const value = await callLocalRpc(targetPort, "session.history", { sessionId })
+      json(res, 200, { ok: true, sessionId, items: queueItemsFromInbox(value?.projections?.values?.inbox) })
+    } catch (error) {
+      respondRpcError(json, res, error)
+    }
     return true
   }
   const queueItem = pathname.match(/^\/dsh-link\/mobile\/sessions\/([^/]+)\/queue\/([^/]+)$/)
   if (req.method === "POST" && queueItem) {
-    const sessionId = decodeURIComponent(queueItem[1])
-    const itemId = decodeURIComponent(queueItem[2])
+    const sessionId = safeDecodeUriComponent(queueItem[1])
+    const itemId = safeDecodeUriComponent(queueItem[2])
+    if (!sessionId || !itemId) return json(res, 400, { error: "路径参数无效" }), true
     const body = await readAuthorizedJson(req, res, state, device, BODY_LIMIT)
     if (!body) return true
     const kind = String(body.action ?? "")
@@ -165,7 +172,8 @@ export async function handleMobileSessionControlApi(req, res, targetPort, state,
   // ---- 目标 ----
   const goalMatch = pathname.match(/^\/dsh-link\/mobile\/sessions\/([^/]+)\/goal\/(edit|pause|resume|clear)$/)
   if (req.method === "POST" && goalMatch) {
-    const sessionId = decodeURIComponent(goalMatch[1])
+    const sessionId = safeDecodeUriComponent(goalMatch[1])
+    if (!sessionId) return json(res, 400, { error: "sessionId 无效" }), true
     const op = goalMatch[2]
     const body = await readAuthorizedJson(req, res, state, device, BODY_LIMIT)
     if (!body) return true
@@ -212,7 +220,8 @@ export async function handleMobileSessionControlApi(req, res, targetPort, state,
   }
   const schedList = pathname.match(/^\/dsh-link\/mobile\/sessions\/([^/]+)\/schedules$/)
   if (req.method === "GET" && schedList) {
-    const sessionId = decodeURIComponent(schedList[1])
+    const sessionId = safeDecodeUriComponent(schedList[1])
+    if (!sessionId) return json(res, 400, { error: "sessionId 无效" }), true
     try {
       const items = await callLocalRpc(targetPort, "schedule.list", { sessionId })
       json(res, 200, { ok: true, sessionId, items: Array.isArray(items) ? items : [] })
@@ -223,8 +232,9 @@ export async function handleMobileSessionControlApi(req, res, targetPort, state,
   }
   const schedHistory = pathname.match(/^\/dsh-link\/mobile\/sessions\/([^/]+)\/schedules\/([^/]+)\/history$/)
   if (req.method === "GET" && schedHistory) {
-    const sessionId = decodeURIComponent(schedHistory[1])
-    const id = decodeURIComponent(schedHistory[2])
+    const sessionId = safeDecodeUriComponent(schedHistory[1])
+    const id = safeDecodeUriComponent(schedHistory[2])
+    if (!sessionId || !id) return json(res, 400, { error: "路径参数无效" }), true
     const search = new URL(req.url ?? "/", "http://x").searchParams
     const limit = Math.min(100, Math.max(1, Number.parseInt(search.get("limit") ?? "20", 10) || 20))
     const before = nonEmpty(search.get("before"))
@@ -238,8 +248,9 @@ export async function handleMobileSessionControlApi(req, res, targetPort, state,
   }
   const schedItem = pathname.match(/^\/dsh-link\/mobile\/sessions\/([^/]+)\/schedules\/([^/]+)$/)
   if (schedItem && (req.method === "PUT" || req.method === "DELETE")) {
-    const sessionId = decodeURIComponent(schedItem[1])
-    const id = decodeURIComponent(schedItem[2])
+    const sessionId = safeDecodeUriComponent(schedItem[1])
+    const id = safeDecodeUriComponent(schedItem[2])
+    if (!sessionId || !id) return json(res, 400, { error: "路径参数无效" }), true
     if (req.method === "DELETE") {
       // 无请求体的写操作也要过同源 / CSRF 校验（与 readAuthorizedJson 同一道门）
       if (typeof deps.requireJsonWrite === "function" && !deps.requireJsonWrite(req, res)) return true
@@ -264,14 +275,18 @@ export async function handleMobileSessionControlApi(req, res, targetPort, state,
     }
     if (body.change !== undefined) {
       if (!isRecord(body.change)) return json(res, 400, { error: "change 不合法" }), true
+      for (const forbidden of ["title", "prompt", "id", "action"]) {
+        if (Object.hasOwn(body.change, forbidden)) {
+          return json(res, 400, { error: `change 不允许包含 ${forbidden}` }), true
+        }
+      }
       payload.change = body.change
     }
-    const patch = {}
+    // 先铺 timing 等 change 字段，再用已校验的 title/prompt 覆盖，防止绕过校验。
+    const patch = payload.change ? { ...payload.change } : {}
     for (const field of ["title", "prompt"]) {
       if (payload[field] !== undefined) patch[field] = payload[field]
     }
-    // 老接口的 change 里就是 timing 之类的改动，0.2.x 统一塞进 patch。
-    if (payload.change && typeof payload.change === "object") Object.assign(patch, payload.change)
     const result = await mutate(() => callScheduleWrite(targetPort, "update", { id, patch }, payload))
     if (result.done) return true
     json(res, 200, { ok: true, sessionId, id, value: result.value ?? null })

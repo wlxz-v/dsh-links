@@ -5,7 +5,7 @@
  * state 由调用方持有（与设备表同一份对象），这里改完调用 save() 落盘。
  */
 import { RemoteAgent } from "./agent.js"
-import { BootstrapTable } from "./bootstrap.js"
+import { BootstrapTable, NonceCache } from "./bootstrap.js"
 import {
   OFFICIAL_ENDPOINT, deviceRemote, disableRemote, enableRemote, endpointHost, ensureDeviceHandle, findDeviceByHandle,
   isOfficialEndpoint, normalizeEndpoint, normalizeOuterPin, qrRemote, remoteEnabled, remoteKeys, resetRemoteIdentity,
@@ -43,10 +43,12 @@ function settleWithin(promise, ms) {
  * @param {{ info(m: string): void, warn(m: string): void }} deps.logger
  */
 export function createRemoteRuntime({ state, save, pluginPort, isLocalReady, isRevoking, currentPairing, logger }) {
-  // 端口顺延（见 src/index.js 的 portState）：传 getter 时在 Agent 构造时取，传数字时保持原行为。
-  const readPluginPort = () => (typeof pluginPort === "function" ? pluginPort() : pluginPort)
+  // 端口顺延（见 src/index.js 的 portState）：传 getter 给 RemoteAgent，每次建流现查实际端口。
+  const readPluginPort = typeof pluginPort === "function" ? pluginPort : () => pluginPort
   const bootstrap = new BootstrapTable()
+  const nonceCache = new NonceCache()
   let agent = null
+  let epoch = 0
   let error = ""
   let lastOnlineAt = 0
   let replaced = false
@@ -55,6 +57,7 @@ export function createRemoteRuntime({ state, save, pluginPort, isLocalReady, isR
   let qr = null
 
   async function stop() {
+    epoch += 1
     const current = agent
     agent = null
     qr = null
@@ -66,6 +69,7 @@ export function createRemoteRuntime({ state, save, pluginPort, isLocalReady, isR
   /** 按 state.remote 重启 Agent；返回的 promise 在首次注册成功时 resolve。 */
   async function start() {
     await stop()
+    const myEpoch = epoch
     error = ""
     replaced = false
     if (!remoteEnabled(state)) return
@@ -81,7 +85,7 @@ export function createRemoteRuntime({ state, save, pluginPort, isLocalReady, isR
         outerPin: state.remote.outerPin ?? "",
         hostKeySeed: keys.hostKeySeed,
         keySeed: keys.keySeed,
-        pluginPort: readPluginPort(),
+        pluginPort: readPluginPort,
         // 每次 open 现查：吊销、pending 过期都即时生效（RFC §5.5 第 4 步）
         lookupDevice: (handle) => {
           const device = findDeviceByHandle(state, handle, { isRevoking })
@@ -91,19 +95,27 @@ export function createRemoteRuntime({ state, save, pluginPort, isLocalReady, isR
         isLocalReady,
         logger,
         allowInsecureWs: allowInsecureWs(),
+        nonceCache,
       })
     } catch (err) {
-      error = String(err?.message ?? err)
+      if (myEpoch === epoch) error = String(err?.message ?? err)
+      return
+    }
+    if (myEpoch !== epoch) {
+      // 在 stop() await 期间已有更新的 start/stop/disable 接管：丢弃过时实例，避免双 Agent 互相 REPLACED。
       return
     }
     next.on("status", (status) => {
+      if (agent !== next) return
       if (status !== "ready") return
       lastOnlineAt = Date.now()
       error = ""
       replaced = false
     })
     // 常见于两个 DSH profile 共用同一个 stateDir（RFC §6.7）
-    next.on("replaced", () => { replaced = true })
+    next.on("replaced", () => {
+      if (agent === next) replaced = true
+    })
     agent = next
     const started = next.start()
     started.catch((err) => {
@@ -126,7 +138,7 @@ export function createRemoteRuntime({ state, save, pluginPort, isLocalReady, isR
       official: isOfficialEndpoint(endpoint),
       outerPin: state.remote?.outerPin ?? "",
       lastOnlineAt: lastOnlineAt || null,
-      error: error || (current === "connecting" ? agent?.lastError ?? "" : ""),
+      error: error || ((current === "connecting" || current === "error") ? agent?.lastError ?? "" : ""),
       replaced,
       remoteDevices: (state.devices ?? []).filter((d) => d.remoteHandle && d.status !== "pending").length,
     }
@@ -147,6 +159,7 @@ export function createRemoteRuntime({ state, save, pluginPort, isLocalReady, isR
 
   async function disable() {
     if (disableRemote(state)) save()
+    bootstrap.clear()
     await stop()
     logger.info("dsh-links: remote disable")
     return status()
@@ -156,6 +169,8 @@ export function createRemoteRuntime({ state, save, pluginPort, isLocalReady, isR
   async function resetIdentity() {
     if (!resetRemoteIdentity(state)) return null
     save()
+    bootstrap.clear()
+    nonceCache.clear()
     logger.info("dsh-links: remote identity reset")
     if (remoteEnabled(state)) await settleWithin(start(), ENABLE_WAIT_MS)
     else await stop()

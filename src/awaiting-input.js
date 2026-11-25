@@ -29,5 +29,8 @@ export function createAwaitingInput() {
     has(sessionId) {
       return (counts.get(sessionId) ?? 0) > 0
     },
+    clear() {
+      counts.clear()
+    },
   }
 }

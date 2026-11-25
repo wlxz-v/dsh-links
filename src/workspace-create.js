@@ -1,8 +1,10 @@
 import { realpathSync, statSync } from "node:fs"
-import { mkdir, stat } from "node:fs/promises"
+import { lstat, mkdir, realpath, stat } from "node:fs/promises"
 import { dirname, isAbsolute, join } from "node:path"
 
 const MAX_WORKSPACE_NAME_BYTES = 255
+const WINDOWS_ILLEGAL_NAME = /[:*?"<>|]/
+const WINDOWS_RESERVED_NAME = /^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)/i
 
 export class MobileWorkspaceCreateError extends Error {
   constructor(code, message, status = 400, details = {}) {
@@ -23,7 +25,11 @@ function validateWorkspaceName(name) {
       { input: name },
     )
   }
-  if (/[\u0000-\u001f\u007f]/u.test(name) || Buffer.byteLength(name, "utf8") > MAX_WORKSPACE_NAME_BYTES) {
+  if (
+    /[\u0000-\u001f\u007f]/u.test(name) ||
+    Buffer.byteLength(name, "utf8") > MAX_WORKSPACE_NAME_BYTES ||
+    (process.platform === "win32" && (WINDOWS_ILLEGAL_NAME.test(name) || WINDOWS_RESERVED_NAME.test(name) || /[. ]$/.test(name)))
+  ) {
     throw new MobileWorkspaceCreateError(
       "workspace-invalid-name",
       "工作区名称包含无效字符或过长",
@@ -52,6 +58,30 @@ export function resolveAbsoluteWorkspaceDirectory(input) {
     )
   }
   if (!statSync(real).isDirectory()) {
+    throw new MobileWorkspaceCreateError("workspace-not-a-directory", "该路径不是文件夹", 400, { path: real })
+  }
+  return real
+}
+
+export async function resolveAbsoluteWorkspaceDirectoryAsync(input) {
+  const path = String(input ?? "").trim()
+  if (!isAbsolute(path)) {
+    throw new MobileWorkspaceCreateError("workspace-invalid-path", "请输入绝对路径", 400, { input: path })
+  }
+  let real
+  try {
+    real = await realpath(path)
+  } catch (error) {
+    const missing = error?.code === "ENOENT"
+    throw new MobileWorkspaceCreateError(
+      missing ? "workspace-path-not-found" : "workspace-path-unavailable",
+      missing ? "目录不存在" : "无法解析该目录",
+      missing ? 404 : 400,
+      { path },
+    )
+  }
+  const st = await stat(real)
+  if (!st.isDirectory()) {
     throw new MobileWorkspaceCreateError("workspace-not-a-directory", "该路径不是文件夹", 400, { path: real })
   }
   return real
@@ -116,9 +146,19 @@ export async function ensureMobileWorkspaceDirectory(plan) {
   } catch (error) {
     if (error?.code === "EEXIST") {
       try {
-        const existing = await stat(plan.path)
+        // 用 lstat 拒绝指向任意路径的符号链接（避免绕过本机绝对路径审批）。
+        const existing = await lstat(plan.path)
+        if (existing.isSymbolicLink()) {
+          throw new MobileWorkspaceCreateError(
+            "workspace-name-conflict",
+            "同名路径是符号链接，请改用绝对路径经本机批准后添加",
+            409,
+            { path: plan.path },
+          )
+        }
         if (existing.isDirectory()) return { directoryCreated: false }
-      } catch {
+      } catch (checkErr) {
+        if (checkErr instanceof MobileWorkspaceCreateError) throw checkErr
         throw new MobileWorkspaceCreateError(
           "workspace-directory-check-failed",
           "无法检查同名目录",

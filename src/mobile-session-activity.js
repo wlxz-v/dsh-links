@@ -1,4 +1,5 @@
 import { omitNullFields } from "./optional-string.js"
+import { toolResultMeta } from "./produced-files.js"
 import { projectChangesSummary } from "./workspace-changes.js"
 
 /**
@@ -103,13 +104,18 @@ export function deriveActivity(events) {
       callOrder.push(callId)
       streaming = null
     } else if (e.type === "tool/result") {
-      if (data.callId != null) openCalls.delete(data.callId)
+      const callId = data.callId ?? toolResultMeta(e)?.callId
+      if (callId != null) openCalls.delete(callId)
     } else if (e.type === "assistant/chunk") {
       const type = data.chunk?.type
       if (type === "reasoning-delta") streaming = { kind: "thinking", time: e.time }
       else if (type === "text-delta") streaming = { kind: "writing", time: e.time }
-    } else if (e.type === "assistant/message" || e.type === "turn/end" || e.type === "user/message") {
+    } else if (e.type === "assistant/message") {
       streaming = null
+    } else if (e.type === "turn/end" || e.type === "user/message") {
+      streaming = null
+      openCalls.clear()
+      callOrder.length = 0
     }
   }
 
@@ -180,7 +186,9 @@ export function deriveLastResult(events, changesSummary) {
     const e = eventOf(item)
     if (!e) continue
     const data = e.data ?? {}
-    if (e.type === "assistant/chunk") {
+    if (e.type === "user/message") {
+      changesSeq = null
+    } else if (e.type === "assistant/chunk") {
       const block = data.chunk?.type === "block-end" ? data.chunk.block : null
       if (block?.type === "text" && String(block.text ?? "").trim()) lastText = block.text
     } else if (e.type === "assistant/message") {

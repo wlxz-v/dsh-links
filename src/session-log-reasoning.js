@@ -10,10 +10,13 @@
 const FLUSH_TYPES = new Set([
   "user/message",
   "approval/asked",
+  "approval/decided",
   "tool/call",
   "tool/result",
   "compaction/start",
   "todo/write",
+  "workspace/changes",
+  "turn/end",
 ])
 
 /**
@@ -21,7 +24,9 @@ const FLUSH_TYPES = new Set([
  * @returns {Map<number, { seq: number, time: number, text: string }>}
  */
 export function reasoningBlocksFromSessionLog(text) {
+  const raw = String(text ?? "")
   const reasoning = new Map()
+  if (!raw || !raw.includes("reasoning")) return reasoning
   let pending = null // { seq, time, text }
   const flush = (time) => {
     if (!pending) return
@@ -31,15 +36,22 @@ export function reasoningBlocksFromSessionLog(text) {
     }
     pending = null
   }
-  for (const line of String(text ?? "").split("\n")) {
-    if (!line.trim()) continue
+  let pos = 0
+  while (pos < raw.length) {
+    let end = raw.indexOf("\n", pos)
+    if (end === -1) end = raw.length
+    const line = raw.slice(pos, end)
+    pos = end + 1
+    if (!line || !line.trim()) continue
+    // pending 为空时，只有包含 "reasoning" 的 assistant/chunk 能开启新块；跳过 90%+ 无关大行（如 tool/result）。
+    if (!pending && !line.includes("reasoning")) continue
     let e
     try { e = JSON.parse(line) } catch { continue }
     if (e?.type === "assistant/chunk") {
       const chunk = e?.data?.chunk
       if (chunk?.type === "block-end" && chunk.block?.type === "reasoning") {
         const blockText = chunk.block?.text
-        if (blockText) {
+        if (blockText && typeof e.seq === "number") {
           pending = pending
             ? { seq: pending.seq, time: pending.time, text: pending.text + "\n" + blockText }
             : { seq: e.seq, time: e.time, text: blockText }

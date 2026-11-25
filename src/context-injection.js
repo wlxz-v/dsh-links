@@ -3,39 +3,31 @@
  * 只认结构性标记，以及以 runtime context / file policy 开头的整段文本。
  * 正文里提到 CLAUDE.md、AGENTS.md 或 “Instructions from:” 不算注入。
  */
+const CONTEXT_INJECTION_RE =
+  /<(?:system-reminder|available_skills|goal_round)>|&lt;(?:system-reminder|available_skills|goal_round)&gt;|^\s*Current (?:runtime context|DSH file policy)/i
+const GOAL_ROUND_RE = /<goal_round>|&lt;goal_round&gt;/i
+const MODEL_CHANGED_RE = /^\s*\[model changed:/i
+
 export function isContextInjectionText(text) {
-  if (!text || !String(text).trim()) return false
-  const t = String(text)
-  return (
-    /<system-reminder>/i.test(t) ||
-    /&lt;system-reminder&gt;/i.test(t) ||
-    /<available_skills>/i.test(t) ||
-    /&lt;available_skills&gt;/i.test(t) ||
-    /<goal_round>/i.test(t) ||
-    /&lt;goal_round&gt;/i.test(t) ||
-    /^\s*Current runtime context/i.test(t) ||
-    /^\s*Current DSH file policy/i.test(t)
-  )
+  if (!text) return false
+  return CONTEXT_INJECTION_RE.test(String(text))
 }
 
 /** 注入来源短标签（Web：上下文注入 · skill-catalog）。 */
 export function contextInjectionLabels(text) {
+  const t = String(text ?? "")
   const labels = new Set()
-  if (
-    /available_skills/i.test(text) ||
-    /skill catalog/i.test(text) ||
-    /available-skills/i.test(text)
-  ) {
+  if (/available[_-]skills|skill catalog/i.test(t)) {
     labels.add("skill-catalog")
   }
-  if (/Current runtime context/i.test(text)) labels.add("runtime")
-  if (/Current DSH file policy/i.test(text)) labels.add("file-policy")
-  if (/Approval prompts are disabled/i.test(text)) labels.add("approval-policy")
-  for (const m of text.matchAll(/Instructions from:\s*(.+)/g)) {
+  if (/Current runtime context/i.test(t)) labels.add("runtime")
+  if (/Current DSH file policy/i.test(t)) labels.add("file-policy")
+  if (/Approval prompts are disabled/i.test(t)) labels.add("approval-policy")
+  for (const m of t.matchAll(/Instructions from:\s*(.+)/g)) {
     const name = m[1]?.trim()
     if (name) labels.add(name)
   }
-  for (const m of text.matchAll(/(?:AGENTS\.md|CLAUDE\.md|\.zcode\/[^\s,]+)/g)) {
+  for (const m of t.matchAll(/(?:AGENTS\.md|CLAUDE\.md|\.zcode\/[^\s,<>&]+)/g)) {
     labels.add(m[0])
   }
   return labels.size ? [...labels] : ["workspace"]
@@ -47,21 +39,21 @@ export function contextInjectionLabels(text) {
  * 以为用户交代过这件事。与 App SystemNotice.kt 的规则对齐。
  */
 export function isModelChangedNotice(text) {
-  if (!text || !String(text).trim()) return false
-  return /^\[model changed:/i.test(String(text).trim())
+  if (!text) return false
+  return MODEL_CHANGED_RE.test(String(text))
 }
 
 /** goal 模式每轮注入的续跑提示（`<goal_round>` 包装）。 */
 export function isGoalRoundText(text) {
   if (!text) return false
-  return /<goal_round>/i.test(String(text)) || /&lt;goal_round&gt;/i.test(String(text))
+  return GOAL_ROUND_RE.test(String(text))
 }
 
 /** 从 goal_round 提示里解析轮次和目标原文；解析不到的字段为 null。 */
 export function parseGoalRound(text) {
   const t = String(text ?? "")
   const round = t.match(/Round:\s*([0-9]+)\s*(?:\/\s*([0-9]+))?/)
-  const objective = t.match(/Objective:\s*"(.*)"/)
+  const objective = t.match(/Objective:\s*"([^"\r\n]*)"/)
   return {
     round: round ? Number(round[1]) : null,
     maxRounds: round && round[2] ? Number(round[2]) : null,

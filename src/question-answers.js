@@ -47,12 +47,13 @@ export function normalizeQuestions(raw) {
     const allowed = new Set()
     const normalizedOptions = options.map((option, index) => {
       const identity = optionIdentity(option, index)
-      allowed.add(identity)
-      if (typeof option === "string") allowed.add(option)
-      else {
-        if (option?.label != null) allowed.add(String(option.label))
-        if (option?.id != null) allowed.add(String(option.id))
-        if (option?.value != null) allowed.add(String(option.value))
+      if (identity) allowed.add(identity)
+      if (typeof option === "string") {
+        if (option) allowed.add(option)
+      } else {
+        if (option?.label != null && String(option.label) !== "") allowed.add(String(option.label))
+        if (option?.id != null && String(option.id) !== "") allowed.add(String(option.id))
+        if (option?.value != null && String(option.value) !== "") allowed.add(String(option.value))
       }
       return {
         id: identity,
@@ -75,30 +76,48 @@ export function normalizeQuestions(raw) {
 
 function selectedValues(answer) {
   const raw = answer?.selected
-  if (Array.isArray(raw)) return raw.map((item) => String(item))
+  if (Array.isArray(raw)) {
+    const out = []
+    const seen = new Set()
+    for (const item of raw) {
+      if (item == null) continue
+      const text = String(item)
+      if (!text || seen.has(text)) continue
+      seen.add(text)
+      out.push(text)
+    }
+    return out
+  }
   if (raw == null || raw === "") return []
   return [String(raw)]
 }
 
 export function validateAnswers(questions, payload) {
   if (!payload || typeof payload !== "object" || !Array.isArray(payload.answers)) {
-    return { ok: false, code: "invalid-answers", error: "缺少 rpcId 或 answer.answers" }
+    return { ok: false, code: "invalid-answers", error: "缺少 answer.answers" }
   }
   const answers = payload.answers
   if (answers.length !== questions.length) {
     return { ok: false, code: "answer-count", error: "答案数量与题目不一致" }
   }
-  const seen = new Set()
+  const questionIds = new Set(questions.map((q) => q.id))
+  const byId = new Map()
+  for (const item of answers) {
+    const id = String(item?.id ?? "")
+    if (!id || !questionIds.has(id)) {
+      return { ok: false, code: "unknown-answer", error: "包含未知题目 ID" }
+    }
+    if (byId.has(id)) {
+      return { ok: false, code: "duplicate-answer", error: "答案题目 ID 重复" }
+    }
+    byId.set(id, item)
+  }
   const normalized = []
   for (const question of questions) {
-    const answer = answers.find((item) => String(item?.id ?? "") === question.id)
+    const answer = byId.get(question.id)
     if (!answer) {
       return { ok: false, code: "missing-answer", error: `缺少题目 ${question.id} 的答案` }
     }
-    if (seen.has(question.id)) {
-      return { ok: false, code: "duplicate-answer", error: "答案题目 ID 重复" }
-    }
-    seen.add(question.id)
     if (question.kind === "unsupported") {
       return { ok: false, code: "unsupported-question", error: "存在手机端无法回答的题目，请在电脑上处理" }
     }
@@ -107,27 +126,29 @@ export function validateAnswers(questions, payload) {
     if (custom.length > MAX_CUSTOM_CHARS) {
       return { ok: false, code: "custom-too-long", error: "自由输入超出长度限制" }
     }
+    if (question.kind === "text" && selected.length > 0) {
+      return { ok: false, code: "invalid-option", error: `题目 ${question.id} 为自由输入题，不接受预设选项` }
+    }
     if (selected.length > 1 && !question.multiple) {
       return { ok: false, code: "invalid-option", error: "该题不支持多选" }
     }
-    for (const value of selected) {
-      if (question.kind === "select" && !question.allowed.has(value)) {
-        return { ok: false, code: "invalid-option", error: `选项不属于题目 ${question.id}` }
+    if (question.kind === "select") {
+      if (selected.length > question.options.length) {
+        return { ok: false, code: "invalid-option", error: `题目 ${question.id} 选项数量超出范围` }
+      }
+      for (const value of selected) {
+        if (!question.allowed.has(value)) {
+          return { ok: false, code: "invalid-option", error: `选项不属于题目 ${question.id}` }
+        }
       }
     }
     const hasValue = selected.length > 0 || custom.trim().length > 0
     if (!hasValue && !question.optional) {
       return { ok: false, code: "required", error: `题目 ${question.id} 为必填` }
     }
-    if (question.kind === "select" && selected.length === 0 && !custom.trim() && !question.optional) {
-      return { ok: false, code: "required", error: `题目 ${question.id} 为必填` }
-    }
     const out = { id: question.id, selected }
     if (custom.trim()) out.custom = custom
     normalized.push(out)
-  }
-  if (answers.length !== seen.size) {
-    return { ok: false, code: "unknown-answer", error: "包含未知题目 ID" }
   }
   return { ok: true, answer: { answers: normalized } }
 }

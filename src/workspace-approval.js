@@ -1,9 +1,19 @@
 import { randomBytes } from "node:crypto"
-import { MobileWorkspaceCreateError, resolveAbsoluteWorkspaceDirectory } from "./workspace-create.js"
+import { MobileWorkspaceCreateError, resolveAbsoluteWorkspaceDirectoryAsync } from "./workspace-create.js"
 
 const DEFAULT_TTL_MS = 10 * 60 * 1000
 const DEFAULT_MAX = 16
 const MISSING = { status: 404, body: { error: "批准请求不存在或已过期" } }
+const APPROVING_QUEUES = new WeakMap()
+
+function inFlightSetFor(queue) {
+  let set = APPROVING_QUEUES.get(queue)
+  if (!set) {
+    set = new Set()
+    APPROVING_QUEUES.set(queue, set)
+  }
+  return set
+}
 
 /** 绝对路径工作区注册的内存队列。手机提交 realpath，面板批准后才 workspace.create。 */
 export function createWorkspaceApprovalQueue({
@@ -81,36 +91,45 @@ export function rejectQueuedWorkspace(queue, rawRequestId) {
 export async function approveQueuedWorkspace(queue, rawRequestId, createWorkspace) {
   const parsed = requestIdOf(rawRequestId)
   if (parsed.error) return parsed.error
+  const inFlight = inFlightSetFor(queue)
+  if (inFlight.has(parsed.requestId)) {
+    return { status: 409, body: { error: "该请求正在处理中，请稍候" } }
+  }
   const item = queue.get(parsed.requestId)
   if (!item) return MISSING
-  let real
+  inFlight.add(parsed.requestId)
   try {
-    real = resolveAbsoluteWorkspaceDirectory(item.path)
-  } catch (error) {
-    queue.remove(parsed.requestId)
-    if (error instanceof MobileWorkspaceCreateError) {
-      return { status: error.status, body: { error: error.message, code: error.code } }
+    let real
+    try {
+      real = await resolveAbsoluteWorkspaceDirectoryAsync(item.path)
+    } catch (error) {
+      queue.remove(parsed.requestId)
+      if (error instanceof MobileWorkspaceCreateError) {
+        return { status: error.status, body: { error: error.message, code: error.code } }
+      }
+      return { status: 400, body: { error: "无法解析该目录" } }
     }
-    return { status: 400, body: { error: "无法解析该目录" } }
-  }
-  if (real !== item.path) {
-    queue.remove(parsed.requestId)
-    return { status: 409, body: { error: "目录已变化，请让手机重新提交" } }
-  }
-  try {
-    const value = await createWorkspace(real)
-    queue.remove(parsed.requestId)
-    return {
-      status: 200,
-      deviceId: item.deviceId,
-      body: {
-        ok: true,
-        path: real,
-        workspace: value?.workspace ?? null,
-        created: Boolean(value?.created),
-      },
+    if (real !== item.path) {
+      queue.remove(parsed.requestId)
+      return { status: 409, body: { error: "目录已变化，请让手机重新提交" } }
     }
-  } catch (error) {
-    return { status: 502, body: { error: "无法注册工作区" }, error }
+    try {
+      const value = await createWorkspace(real)
+      queue.remove(parsed.requestId)
+      return {
+        status: 200,
+        deviceId: item.deviceId,
+        body: {
+          ok: true,
+          path: real,
+          workspace: value?.workspace ?? null,
+          created: Boolean(value?.created),
+        },
+      }
+    } catch (error) {
+      return { status: 502, body: { error: "无法注册工作区" }, error }
+    }
+  } finally {
+    inFlight.delete(parsed.requestId)
   }
 }

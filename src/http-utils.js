@@ -48,12 +48,17 @@ export function negotiateJsonEncoding(acceptEncoding, bodyLength) {
     if (coding === "zstd" && typeof zstdCompressSync !== "function") return false
     return true
   })
+  let bestCoding = null
+  let bestQ = 0
   for (const coding of supported) {
-    const q = accepted.get(coding) ?? accepted.get("*")
-    if (q === undefined || q <= 0) continue
-    return coding
+    const q = accepted.has(coding) ? accepted.get(coding) : accepted.get("*")
+    if (!Number.isFinite(q) || q <= 0) continue
+    if (q > bestQ) {
+      bestQ = q
+      bestCoding = coding
+    }
   }
-  return null
+  return bestCoding
 }
 
 function compressJson(body, coding) {
@@ -152,6 +157,15 @@ export function isLoopbackAddress(addr) {
   return a === "127.0.0.1" || a === "::1" || a === "localhost"
 }
 
+/** 安全解码 URI 路径段，非法百分号编码返回 null 而不是抛 URIError。 */
+export function safeDecodeUriComponent(raw) {
+  try {
+    return decodeURIComponent(String(raw ?? ""))
+  } catch {
+    return null
+  }
+}
+
 export function requireLoopbackSameOrigin(req, res) {
   const remote = req.socket?.remoteAddress ?? req.connection?.remoteAddress
   if (!isLoopbackAddress(remote)) {
@@ -174,7 +188,8 @@ export function requireLoopbackSameOrigin(req, res) {
     json(res, 403, { error: "forbidden" })
     return false
   }
-  if (headerVal(req.headers, "sec-fetch-site") === "cross-site") {
+  const fetchSite = headerVal(req.headers, "sec-fetch-site")
+  if (fetchSite && fetchSite !== "same-origin" && fetchSite !== "none") {
     json(res, 403, { error: "forbidden" })
     return false
   }
@@ -195,7 +210,8 @@ export function requireLoopbackSameOrigin(req, res) {
 
 /** 状态变更请求：强制 JSON media type（触发 CORS 预检）+ 拒绝跨站 Origin。 */
 export function requireJsonWrite(req, res) {
-  if (headerVal(req.headers, "sec-fetch-site") === "cross-site") {
+  const fetchSite = headerVal(req.headers, "sec-fetch-site")
+  if (fetchSite && fetchSite !== "same-origin" && fetchSite !== "none") {
     json(res, 403, { error: "forbidden" })
     return false
   }
@@ -207,7 +223,8 @@ export function requireJsonWrite(req, res) {
       return false
     }
     try {
-      if (new URL(origin).host !== host) {
+      const expectedHost = new URL(`http://${host}`).host
+      if (new URL(origin).host !== expectedHost) {
         json(res, 403, { error: "forbidden" })
         return false
       }

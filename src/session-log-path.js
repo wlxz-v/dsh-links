@@ -4,6 +4,7 @@
  * 与 `@deepseek-ai/dsh-session-format` 的 canonical basename 规则对齐。
  */
 import { existsSync, readdirSync } from "node:fs"
+import { readdir } from "node:fs/promises"
 import { homedir } from "node:os"
 import { join } from "node:path"
 
@@ -91,6 +92,18 @@ export function resolveSessionLogPath(sessionDir) {
   let names
   try {
     names = readdirSync(sessionDir)
+  } catch {
+    return null
+  }
+  const filename = pickCurrentSessionLogFilename(names)
+  return filename ? join(sessionDir, filename) : null
+}
+
+export async function resolveSessionLogPathAsync(sessionDir) {
+  if (!sessionDir) return null
+  let names
+  try {
+    names = await readdir(sessionDir)
   } catch {
     return null
   }

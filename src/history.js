@@ -1,6 +1,7 @@
 import { classifyUserMessage } from "./context-injection.js"
 import { toolCallDetail } from "./approval-detail.js"
 import { mutationPath, toolResultContent, toolResultIsError, toolResultMeta, uniquePaths } from "./produced-files.js"
+import { mapApprovalUiStatus } from "./request-lifecycle.js"
 import { MAX_EMBEDDED_CHANGED_FILES, projectChangesSummary } from "./workspace-changes.js"
 
 /** session.history 单页消息数上限（客户端 maxMessages 不得突破）。 */
@@ -11,11 +12,7 @@ function approvalOutcomeOf(event) {
 }
 
 export function approvalUiStatus(outcome) {
-  if (!outcome) return "pending"
-  if (outcome === "allowed-once" || outcome === "rejected") return "resolved"
-  if (outcome === "cancelled") return "cancelled"
-  if (outcome === "unavailable") return "expired"
-  return "unknown"
+  return mapApprovalUiStatus(outcome)
 }
 
 export function clampHistoryMaxMessages(raw) {
@@ -125,7 +122,7 @@ export function projectHistoryPage({ events, reasoningBySeq = new Map(), hasMore
           pendingReasoning.running = true
         }
       }
-      if (chunk?.type === "block-end" && chunk.block?.text) {
+      if (chunk?.type === "block-end" && (chunk.block?.type === "reasoning" || chunk.block?.text)) {
         if (chunk.block.type === "reasoning") {
           // 连续 reasoning block-end 追加文本，保留首块 seq/time（与文件侧分组一致）
           const piece = chunk.block.text || reasoningBySeq.get(e.seq)?.text || ""
@@ -142,7 +139,7 @@ export function projectHistoryPage({ events, reasoningBySeq = new Map(), hasMore
               }
             }
             pendingReasoning.running = false
-          } else {
+          } else if (piece) {
             pendingReasoning = { seq: e.seq, time: e.time, text: piece, running: false }
           }
         } else {
@@ -160,7 +157,9 @@ export function projectHistoryPage({ events, reasoningBySeq = new Map(), hasMore
         for (const s of e.sourceEventSeqs ?? []) {
           const se = eventBySeq.get(s)
           const c = se?.data?.chunk
-          if (c?.type === "block-end" && c.block?.type === "text") textBlockEndSeqs.push(s)
+          if (c?.type === "block-end" && c.block?.type === "text" && String(c.block?.text ?? "").trim()) {
+            textBlockEndSeqs.push(s)
+          }
         }
         let ti = 0
         for (const block of message.content ?? []) {
@@ -230,10 +229,13 @@ export function projectHistoryPage({ events, reasoningBySeq = new Map(), hasMore
       })
     } else if (e.type === "tool/call") {
       flushReasoning(e.time)
-      toolCalls.set(e.data?.callId, { time: e.time })
-      toolCallArgs.set(String(e.data?.callId ?? ""), e.data?.arguments)
-      const path = mutationPath(e.data?.name, e.data?.arguments)
-      if (path) mutationCalls.set(String(e.data?.callId ?? ""), { path, turn: e.data?.turn })
+      const callKey = e.data?.callId != null && String(e.data.callId) !== "" ? String(e.data.callId) : null
+      if (callKey) {
+        toolCalls.set(callKey, { time: e.time })
+        toolCallArgs.set(callKey, e.data?.arguments)
+        const path = mutationPath(e.data?.name, e.data?.arguments)
+        if (path) mutationCalls.set(callKey, { path, turn: e.data?.turn })
+      }
       push({
         id: `tool-${e.seq}`,
         seq: e.seq,
@@ -250,8 +252,9 @@ export function projectHistoryPage({ events, reasoningBySeq = new Map(), hasMore
       flushReasoning(e.time)
       const content = toolResultContent(e).map((c) => c.text || JSON.stringify(c)).join("\n")
       const callId = toolResultMeta(e)?.callId ?? null
-      const start = toolCalls.get(callId)?.time
-      const mutation = callId != null ? mutationCalls.get(String(callId)) : null
+      const callKey = callId != null && String(callId) !== "" ? String(callId) : null
+      const start = callKey ? toolCalls.get(callKey)?.time : undefined
+      const mutation = callKey ? mutationCalls.get(callKey) : null
       if (!toolResultIsError(e) && mutation) {
         const turn = e.data?.turn ?? mutation.turn
         const list = producedByTurn.get(turn) ?? []
@@ -266,7 +269,7 @@ export function projectHistoryPage({ events, reasoningBySeq = new Map(), hasMore
         callId,
         turn: e.data?.turn,
         step: e.data?.step,
-        durationMs: Number.isFinite(start) ? e.time - start : undefined,
+        durationMs: Number.isFinite(start) && Number.isFinite(e.time) && e.time >= start ? e.time - start : undefined,
         time: e.time,
         type: "tool_result",
       })
@@ -346,6 +349,7 @@ export function projectHistoryPage({ events, reasoningBySeq = new Map(), hasMore
         id: `reason-${r.seq}`,
         seq: r.seq,
         role: "reasoning",
+        kind: "reasoning",
         text,
         time: r.time ?? 0,
         type: "reasoning",

@@ -89,11 +89,12 @@ export function projectFileDiff(diff, { maxLines = MAX_DIFF_LINES, maxChars = MA
   let chars = 0
   let full = false
   for (const hunk of Array.isArray(diff.hunks) ? diff.hunks : []) {
-    const lines = Array.isArray(hunk?.lines) ? hunk.lines.map((line) => String(line)) : []
-    totalLines += lines.length
+    const rawLines = Array.isArray(hunk?.lines) ? hunk.lines : []
+    totalLines += rawLines.length
     if (full) continue
     const kept = []
-    for (const line of lines) {
+    for (const rawLine of rawLines) {
+      const line = String(rawLine)
       if (shown >= maxLines || chars + line.length > maxChars) {
         full = true
         break

@@ -81,7 +81,11 @@ export const CLOSE = Object.freeze({
  * 失败返回 null（调用方按 PROTOCOL_ERROR 关闭当前连接）。
  */
 export function parseControlFrame(raw) {
-  const bytes = Buffer.isBuffer(raw) ? raw : Buffer.from(String(raw), "utf8")
+  let bytes
+  if (Buffer.isBuffer(raw)) bytes = raw
+  else if (ArrayBuffer.isView(raw)) bytes = Buffer.from(raw.buffer, raw.byteOffset, raw.byteLength)
+  else if (raw instanceof ArrayBuffer) bytes = Buffer.from(raw)
+  else bytes = Buffer.from(String(raw), "utf8")
   if (bytes.length === 0 || bytes.length > MAX_CONTROL_BYTES) return null
   const text = bytes.toString("utf8")
   // 非法 UTF-8 会被替换成 U+FFFD，往返不一致即拒绝
