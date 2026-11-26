@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 )
@@ -106,12 +107,16 @@ func intField(raw map[string]json.RawMessage, name string) (int64, error) {
 	if !ok {
 		return 0, errors.New("missing field")
 	}
+	trimmed := bytes.TrimSpace(value)
+	if len(trimmed) == 0 || trimmed[0] == '"' {
+		return 0, errors.New("invalid integer field")
+	}
 	var result json.Number
-	if err := json.Unmarshal(value, &result); err != nil {
+	if err := json.Unmarshal(trimmed, &result); err != nil {
 		return 0, errors.New("invalid integer field")
 	}
 	n, err := result.Int64()
-	if err != nil || n > (1<<53)-1 || n < -((1<<53)-1) || json.Number(result.String()) != result {
+	if err != nil || n > (1<<53)-1 || n < -((1<<53)-1) || strconv.FormatInt(n, 10) != result.String() {
 		return 0, errors.New("invalid integer field")
 	}
 	return n, nil

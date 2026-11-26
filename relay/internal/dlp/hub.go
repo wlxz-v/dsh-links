@@ -27,21 +27,26 @@ import (
 const MaxDataMessage = 256 * 1024
 
 type route struct {
-	ctrl        *websocket.Conn
-	active      int
-	pending     int
-	bytesToday  int64
-	bytesDay    string
-	connections int
+	ctrl       *websocket.Conn
+	active     int
+	pending    int
+	bytesToday int64
+	bytesDay   string
 }
 
 type pendingStream struct {
 	route    [16]byte
 	client   *websocket.Conn
 	created  time.Time
+	claimed  bool
 	accepted chan *websocket.Conn
 	result   chan agentRejection
 	done     chan struct{}
+	doneOnce sync.Once
+}
+
+func (p *pendingStream) finish() {
+	p.doneOnce.Do(func() { close(p.done) })
 }
 
 type agentRejection struct {
@@ -65,13 +70,13 @@ type Hub struct {
 	logKey          [32]byte
 	done            chan struct{}
 	closed          bool
-	version         string
+	version         atomic.Pointer[string]
 	statsMu         sync.Mutex
 	statsAt         time.Time
-	statHosts       int64
-	statStreams     int64
-	statOpen        int64
-	statBytes       int64
+	statHosts       atomic.Int64
+	statStreams     atomic.Int64
+	statOpen        atomic.Int64
+	statBytes       atomic.Int64
 	statReject      map[string]int64
 }
 
@@ -82,7 +87,8 @@ func NewHub(cfg Config, logger *log.Logger) *Hub {
 	if logger == nil {
 		logger = log.New(io.Discard, "", 0)
 	}
-	h := &Hub{cfg: cfg, routes: map[[16]byte]*route{}, pending: map[[16]byte]*pendingStream{}, clients: map[string]int{}, hosts: map[string]int{}, unknowns: map[string]int{}, connections: map[*websocket.Conn]struct{}{}, openLimiter: newLimiter(), registerLimiter: newLimiter(), logger: logger, done: make(chan struct{}), version: "dev", statsAt: cfg.Now(), statReject: map[string]int64{}}
+	h := &Hub{cfg: cfg, routes: map[[16]byte]*route{}, pending: map[[16]byte]*pendingStream{}, clients: map[string]int{}, hosts: map[string]int{}, unknowns: map[string]int{}, connections: map[*websocket.Conn]struct{}{}, openLimiter: newLimiter(), registerLimiter: newLimiter(), logger: logger, done: make(chan struct{}), statsAt: cfg.Now(), statReject: map[string]int64{}}
+	h.SetVersion("dev")
 	go h.statsLoop()
 	return h
 }
@@ -91,11 +97,7 @@ func (h *Hub) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		version := h.version
-		if version == "" {
-			version = "dev"
-		}
-		_, _ = io.WriteString(w, "ok "+version)
+		_, _ = io.WriteString(w, "ok "+h.versionString())
 	})
 	mux.HandleFunc("/ws", h.serveHTTP)
 	return mux
@@ -351,7 +353,6 @@ func (h *Hub) serveRegister(ctx context.Context, c *websocket.Conn, ip string, c
 	}
 	previous := old.ctrl
 	old.ctrl = c
-	old.connections++
 	h.mu.Unlock()
 	if previous != nil && previous != c {
 		go previous.Close(websocket.StatusCode(4010), "REPLACED")
@@ -364,7 +365,7 @@ func (h *Hub) serveRegister(ctx context.Context, c *websocket.Conn, ip string, c
 		h.sweepOfflineRoutesLocked(h.cfg.Now())
 		h.mu.Unlock()
 	}()
-	h.logEvent("host_register", "ok", routeID[:], 0)
+	h.logEvent("host_register", "OK", routeID[:], 0)
 	h.noteHostRegister()
 	if err := h.writeJSON(c, message("registered", map[string]any{"route": encodeB64(routeID[:]), "ping": 20})); err != nil {
 		return
@@ -404,13 +405,14 @@ func (h *Hub) serveRegister(ctx context.Context, c *websocket.Conn, ip string, c
 			sidRaw, e3 := decodeB64(sidText, 16)
 			if e1 != nil || e2 != nil || e3 != nil {
 				h.fail(c, "PROTOCOL_ERROR", 4000)
-				break
+				return
 			}
 			var sid [16]byte
 			copy(sid[:], sidRaw)
-			h.rejectPending(sid, code, rawFieldInt64(msg, "hostNow"))
+			h.rejectPending(routeID, sid, code, rawFieldInt64(msg, "hostNow"))
 		default:
 			h.fail(c, "PROTOCOL_ERROR", 4000)
+			return
 		}
 	}
 }
@@ -501,9 +503,17 @@ func (h *Hub) serveClient(ctx context.Context, c *websocket.Conn, ip string, fra
 	h.pending[sid] = p
 	ctrl := r.ctrl
 	h.mu.Unlock()
-	h.logEvent("client_open", "pending", routeID[:], 0)
+	h.logEvent("client_open", "PENDING", routeID[:], 0)
 	h.noteClientOpen()
-	defer h.removePending(sid)
+	defer func() {
+		h.removePending(sid)
+		select {
+		case orphan := <-p.accepted:
+			h.fail(orphan, "PROTOCOL_ERROR", 4000)
+		default:
+		}
+		p.finish()
+	}()
 	req := map[string]any{"v": version, "route": routeText, "kind": kind, "key": keyText, "ts": ts, "nonce": nonceText, "mac": macText}
 	if err := h.writeJSON(ctrl, message("open", map[string]any{"sid": encodeB64(sid[:]), "req": req})); err != nil {
 		h.fail(c, "OPEN_TIMEOUT", 4006)
@@ -516,6 +526,7 @@ func (h *Hub) serveClient(ctx context.Context, c *websocket.Conn, ip string, fra
 		h.mu.Lock()
 		if h.closed {
 			h.mu.Unlock()
+			_ = data.Close(websocket.StatusGoingAway, "")
 			return
 		}
 		if rr := h.routes[routeID]; rr != nil {
@@ -526,10 +537,13 @@ func (h *Hub) serveClient(ctx context.Context, c *websocket.Conn, ip string, fra
 		}
 		delete(h.pending, sid)
 		h.mu.Unlock()
-		_ = h.writeJSON(c, message("ready", map[string]any{}))
-		_ = h.writeJSON(data, message("ready", map[string]any{}))
+		if h.writeJSON(c, message("ready", map[string]any{})) != nil || h.writeJSON(data, message("ready", map[string]any{})) != nil {
+			_ = c.Close(websocket.StatusNormalClosure, "")
+			_ = data.Close(websocket.StatusNormalClosure, "")
+			h.finishActiveRoute(routeID)
+			return
+		}
 		h.bridge(ctx, sid, routeID, c, data, p.done)
-		close(p.done)
 	case rejection := <-p.result:
 		if rejection.code == "" {
 			rejection.code = "SERVER_BUSY"
@@ -634,31 +648,32 @@ func (h *Hub) serveHostData(ctx context.Context, c *websocket.Conn, ip string, c
 	routeID, _ := RouteID(pub)
 	h.mu.Lock()
 	p := h.pending[sid]
-	valid := p != nil && p.route == routeID
+	valid := p != nil && p.route == routeID && !p.claimed
+	if valid {
+		p.claimed = true
+		p.accepted <- c
+	}
 	h.mu.Unlock()
 	if !valid {
 		h.fail(c, "PROTOCOL_ERROR", 4000)
 		return
 	}
 	select {
-	case p.accepted <- c:
-	default:
-		h.fail(c, "PROTOCOL_ERROR", 4000)
-	}
-	select {
 	case <-h.done:
 	case <-ctx.Done():
-	case <-p.result:
 	case <-p.done:
 	}
 }
 
-func (h *Hub) rejectPending(sid [16]byte, code string, hostNow int64) {
+func (h *Hub) rejectPending(routeID, sid [16]byte, code string, hostNow int64) {
 	if len(code) > 32 || strings.ContainsAny(code, " \t\r\n") {
 		code = "PROTOCOL_ERROR"
 	}
 	h.mu.Lock()
 	p := h.pending[sid]
+	if p != nil && p.route != routeID {
+		p = nil
+	}
 	h.mu.Unlock()
 	if p == nil {
 		return
@@ -668,6 +683,15 @@ func (h *Hub) rejectPending(sid [16]byte, code string, hostNow int64) {
 	case p.result <- agentRejection{code: code, hostNow: hostNow}:
 	default:
 	}
+}
+
+func (h *Hub) finishActiveRoute(routeID [16]byte) {
+	h.mu.Lock()
+	if r := h.routes[routeID]; r != nil && r.active > 0 {
+		r.active--
+	}
+	h.sweepOfflineRoutesLocked(h.cfg.Now())
+	h.mu.Unlock()
 }
 
 func (h *Hub) removePending(sid [16]byte) {
@@ -688,7 +712,6 @@ func (h *Hub) bridge(ctx context.Context, sid, routeID [16]byte, client, host *w
 	client.SetReadLimit(MaxDataMessage + 1)
 	bridgeCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	deadline := h.cfg.Now().Add(h.cfg.MaxLifetime)
 	activity := make(chan struct{}, 1)
 	var bytesForwarded atomic.Int64
 	var once sync.Once
@@ -721,6 +744,7 @@ func (h *Hub) bridge(ctx context.Context, sid, routeID [16]byte, client, host *w
 	}
 	results := make(chan error, 2)
 	copyDirection := func(src, dst *websocket.Conn) {
+		buffer := make([]byte, 16*1024)
 		for {
 			typ, reader, err := src.Reader(bridgeCtx)
 			if err != nil {
@@ -735,7 +759,6 @@ func (h *Hub) bridge(ctx context.Context, sid, routeID [16]byte, client, host *w
 			writeCtx, writeCancel := context.WithTimeout(bridgeCtx, h.cfg.WriteTimeout)
 			writer, err := dst.Writer(writeCtx, websocket.MessageBinary)
 			if err == nil {
-				buffer := make([]byte, 16*1024)
 				var frameBytes int64
 				closeCode := 0
 				for {
@@ -797,12 +820,37 @@ func (h *Hub) bridge(ctx context.Context, sid, routeID [16]byte, client, host *w
 	}
 	go copyDirection(client, host)
 	go copyDirection(host, client)
+	pingFailed := make(chan struct{}, 1)
+	go func() {
+		ticker := time.NewTicker(25 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-bridgeCtx.Done():
+				return
+			case <-closing:
+				return
+			case <-ticker.C:
+				pingCtx, pingCancel := context.WithTimeout(bridgeCtx, 10*time.Second)
+				pingErr := make(chan error, 2)
+				go func() { pingErr <- client.Ping(pingCtx) }()
+				go func() { pingErr <- host.Ping(pingCtx) }()
+				errA, errB := <-pingErr, <-pingErr
+				pingCancel()
+				if errA != nil || errB != nil {
+					select {
+					case pingFailed <- struct{}{}:
+					default:
+					}
+					return
+				}
+			}
+		}
+	}()
 	idle := time.NewTimer(h.cfg.IdleTimeout)
 	defer idle.Stop()
-	life := time.NewTimer(time.Until(deadline))
+	life := time.NewTimer(h.cfg.MaxLifetime)
 	defer life.Stop()
-	ping := time.NewTicker(25 * time.Second)
-	defer ping.Stop()
 	active := true
 	for active {
 		select {
@@ -823,17 +871,9 @@ func (h *Hub) bridge(ctx context.Context, sid, routeID [16]byte, client, host *w
 		case <-life.C:
 			finish(4009, "LIFETIME_EXCEEDED")
 			active = false
-		case <-ping.C:
-			pingCtx, pingCancel := context.WithTimeout(bridgeCtx, 10*time.Second)
-			pingErr := make(chan error, 2)
-			go func() { pingErr <- client.Ping(pingCtx) }()
-			go func() { pingErr <- host.Ping(pingCtx) }()
-			errA, errB := <-pingErr, <-pingErr
-			pingCancel()
-			if errA != nil || errB != nil {
-				finish(1001, "")
-				active = false
-			}
+		case <-pingFailed:
+			finish(1001, "")
+			active = false
 		case <-bridgeCtx.Done():
 			active = false
 		}
@@ -846,12 +886,7 @@ func (h *Hub) bridge(ctx context.Context, sid, routeID [16]byte, client, host *w
 		}
 	default:
 	}
-	h.mu.Lock()
-	if r := h.routes[routeID]; r != nil && r.active > 0 {
-		r.active--
-	}
-	h.sweepOfflineRoutesLocked(h.cfg.Now())
-	h.mu.Unlock()
+	h.finishActiveRoute(routeID)
 	_ = sid
 	_ = done
 }
@@ -901,6 +936,7 @@ func (h *Hub) clientIP(r *http.Request) string {
 	if err != nil {
 		return "unknown"
 	}
+	addr = addr.Unmap()
 	trusted := false
 	for _, prefix := range h.cfg.TrustedProxies {
 		if prefix.Contains(addr) {
@@ -911,21 +947,25 @@ func (h *Hub) clientIP(r *http.Request) string {
 	if !trusted {
 		return addr.String()
 	}
-	parts := strings.Split(r.Header.Get("X-Forwarded-For"), ",")
-	for i := len(parts) - 1; i >= 0; i-- {
-		candidate, parseErr := netip.ParseAddr(strings.TrimSpace(parts[i]))
-		if parseErr != nil {
-			continue
-		}
-		isTrusted := false
-		for _, prefix := range h.cfg.TrustedProxies {
-			if prefix.Contains(candidate) {
-				isTrusted = true
-				break
+	headers := r.Header.Values("X-Forwarded-For")
+	for hi := len(headers) - 1; hi >= 0; hi-- {
+		parts := strings.Split(headers[hi], ",")
+		for i := len(parts) - 1; i >= 0; i-- {
+			candidate, parseErr := netip.ParseAddr(strings.TrimSpace(parts[i]))
+			if parseErr != nil {
+				continue
 			}
-		}
-		if !isTrusted {
-			return candidate.String()
+			candidate = candidate.Unmap()
+			isTrusted := false
+			for _, prefix := range h.cfg.TrustedProxies {
+				if prefix.Contains(candidate) {
+					isTrusted = true
+					break
+				}
+			}
+			if !isTrusted {
+				return candidate.String()
+			}
 		}
 	}
 	return addr.String()
@@ -970,6 +1010,5 @@ func safeLogCode(code string) bool {
 func (h *Hub) String() string {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	return fmt.Sprintf("routes=%d streams=%d", len(h.routes), len(h.pending))
+	return fmt.Sprintf("routes=%d streams=%d", len(h.routes), h.activeStreamsLocked())
 }
-func rawRouteString(route [16]byte) string { return strconv.Itoa(int(route[0])) }

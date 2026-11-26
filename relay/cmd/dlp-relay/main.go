@@ -24,7 +24,11 @@ func main() {
 	hub := dlp.NewHub(cfg, log.New(os.Stderr, "dlp-relay ", log.LstdFlags))
 	hub.SetVersion(version)
 	log.Printf("DLP Relay version %s", version)
-	server := &http.Server{Handler: hub.Handler(), ReadHeaderTimeout: 5 * time.Second}
+	server := &http.Server{
+		Handler:           hub.Handler(),
+		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
 	// 先 Listen 再 Serve：DLP_LISTEN 可以写端口 0，由系统分配后把实际地址打出来（本机端到端脚本靠它取端口）
 	listener, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {

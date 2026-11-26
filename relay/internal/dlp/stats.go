@@ -11,34 +11,33 @@ func (h *Hub) SetVersion(version string) {
 	if version == "" {
 		version = "dev"
 	}
-	h.version = version
+	h.version.Store(&version)
+}
+
+func (h *Hub) versionString() string {
+	if p := h.version.Load(); p != nil && *p != "" {
+		return *p
+	}
+	return "dev"
 }
 
 func (h *Hub) noteHostRegister() {
-	h.statsMu.Lock()
-	h.statHosts++
-	h.statsMu.Unlock()
+	h.statHosts.Add(1)
 }
 
 func (h *Hub) noteClientOpen() {
-	h.statsMu.Lock()
-	h.statOpen++
-	h.statsMu.Unlock()
+	h.statOpen.Add(1)
 }
 
 func (h *Hub) noteStream() {
-	h.statsMu.Lock()
-	h.statStreams++
-	h.statsMu.Unlock()
+	h.statStreams.Add(1)
 }
 
 func (h *Hub) noteBytes(n int64) {
 	if n <= 0 {
 		return
 	}
-	h.statsMu.Lock()
-	h.statBytes += n
-	h.statsMu.Unlock()
+	h.statBytes.Add(n)
 }
 
 func (h *Hub) noteReject(code string) {
@@ -66,18 +65,19 @@ func (h *Hub) statsLoop() {
 func (h *Hub) maybeFlushStats() {
 	now := h.cfg.Now()
 	h.statsMu.Lock()
-	defer h.statsMu.Unlock()
 	if now.Sub(h.statsAt) < 5*time.Minute {
+		h.statsMu.Unlock()
 		return
 	}
-	line := formatStats(h.statHosts, h.statStreams, h.statOpen, h.statReject, h.statBytes)
-	h.statHosts = 0
-	h.statStreams = 0
-	h.statOpen = 0
-	h.statBytes = 0
+	hosts := h.statHosts.Swap(0)
+	streams := h.statStreams.Swap(0)
+	open := h.statOpen.Swap(0)
+	bytes := h.statBytes.Swap(0)
+	reject := h.statReject
 	h.statReject = map[string]int64{}
 	h.statsAt = now
-	h.logger.Printf("%s", line)
+	h.statsMu.Unlock()
+	h.logger.Printf("%s", formatStats(hosts, streams, open, reject, bytes))
 }
 
 func formatStats(hosts, streams, open int64, reject map[string]int64, bytes int64) string {
