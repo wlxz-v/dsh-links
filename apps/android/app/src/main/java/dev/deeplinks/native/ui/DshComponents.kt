@@ -89,7 +89,6 @@ private fun DshChipSurface(
     count: Int? = null,
     tonal: Boolean = false,
 ) {
-    val interaction = remember { MutableInteractionSource() }
     // 选中是浅灰底上的深字。品牌蓝不进筛选。按压反馈只留水波纹（P1：去掉手动叠底）
     // tonal：未选中也带卡片底（输入区建议胶囊坐在灰色实底上，需要看得出是可点的胶囊）
     val bg = when {
@@ -635,8 +634,6 @@ fun ChatLoadingSkeleton(
                 .background(Dsh.bgCode)
         )
     }
-    // 默认内容色：默认即可（每个占位都有自己的颜色）
-    CompositionLocalProvider(LocalContentColor provides Dsh.labelPrimary) {}
 }
 
 // ============================================================

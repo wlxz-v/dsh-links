@@ -186,13 +186,24 @@ class SessionControlController(
     val schedulesLoading = mutableStateOf(false)
     val schedulesError = mutableStateOf<String?>(null)
     private var queueJob: Job? = null
+    private var actionJob: Job? = null
+    private var schedulesJob: Job? = null
+    private var sessionGeneration = 0L
 
     fun clear() {
+        sessionGeneration++
+        queueJob?.cancel()
+        queueJob = null
+        actionJob?.cancel()
+        actionJob = null
+        schedulesJob?.cancel()
+        schedulesJob = null
         queue.value = emptyList()
         goal.value = null
         busy.value = null
         error.value = null
         schedules.value = emptyList()
+        schedulesLoading.value = false
         schedulesError.value = null
     }
 
@@ -228,13 +239,15 @@ class SessionControlController(
 
     private fun queueAction(item: QueuedPrompt, action: String, onOk: () -> Unit = {}) {
         val sid = currentSessionId() ?: return
+        val gen = sessionGeneration
         run("queue:${item.id}", Area.Queue, if (action == "steer") Op.Steer else Op.Remove) {
             client().updateQueueItem(sid, item.id, action)
             withContext(Dispatchers.Main) {
+                if (gen != sessionGeneration || currentSessionId() != sid) return@withContext
                 if (action == "remove") queue.value = queue.value.filterNot { it.id == item.id }
                 onOk()
             }
-            refreshQueue()
+            if (gen == sessionGeneration && currentSessionId() == sid) refreshQueue()
         }
     }
 
@@ -251,10 +264,12 @@ class SessionControlController(
     private fun goalAction(op: String, objective: String? = null, maxGoalRounds: Int? = null, onDone: (Boolean) -> Unit = {}) {
         val sid = currentSessionId() ?: return
         val g = goal.value ?: return
+        val gen = sessionGeneration
         val diagOp = when (op) { "pause" -> Op.Pause; "resume" -> Op.Resume; "clear" -> Op.Clear; else -> Op.Edit }
         run("goal:$op", Area.Goal, diagOp, onFail = { onDone(false) }) {
             val next = client().goalAction(sid, op, g.ref, objective, maxGoalRounds)
             withContext(Dispatchers.Main) {
+                if (gen != sessionGeneration || currentSessionId() != sid) return@withContext
                 goal.value = when (op) {
                     "clear" -> null
                     "pause" -> g.copy(ref = next ?: g.ref, phase = "paused")
@@ -270,22 +285,29 @@ class SessionControlController(
     fun loadSchedules(all: Boolean) {
         val sid = currentSessionId()
         if (!all && sid == null) return
+        val gen = sessionGeneration
+        schedulesJob?.cancel()
         schedulesLoading.value = true
         schedulesError.value = null
-        scope.launch {
+        schedulesJob = scope.launch {
             try {
                 val items = withContext(Dispatchers.IO) {
                     if (all) client().getScheduleCatalog() else client().getSessionSchedules(sid!!)
                 }
+                if (!all && (gen != sessionGeneration || currentSessionId() != sid)) return@launch
                 schedules.value = items
                 PrivacySafeDiagnostics.event(Area.Schedule, Op.Load, ok = true, count = items.size)
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e
             } catch (e: Exception) {
-                PrivacySafeDiagnostics.event(Area.Schedule, Op.Load, ok = false)
-                schedulesError.value = e.message?.takeIf { it.isNotBlank() } ?: L.unknownError
+                if (all || (gen == sessionGeneration && currentSessionId() == sid)) {
+                    PrivacySafeDiagnostics.event(Area.Schedule, Op.Load, ok = false)
+                    schedulesError.value = e.message?.takeIf { it.isNotBlank() } ?: L.unknownError
+                }
             } finally {
-                schedulesLoading.value = false
+                if (all || gen == sessionGeneration) {
+                    schedulesLoading.value = false
+                }
             }
         }
     }
@@ -315,9 +337,10 @@ class SessionControlController(
 
     private fun run(key: String, area: Area, op: Op, onFail: () -> Unit = {}, block: suspend () -> Unit) {
         if (busy.value != null) return
+        val gen = sessionGeneration
         busy.value = key
         error.value = null
-        scope.launch {
+        actionJob = scope.launch {
             try {
                 withContext(Dispatchers.IO) { block() }
                 PrivacySafeDiagnostics.event(area, op, ok = true)
@@ -325,13 +348,17 @@ class SessionControlController(
                 throw e
             } catch (e: Exception) {
                 PrivacySafeDiagnostics.event(area, op, ok = false)
-                error.value = e.message?.takeIf { it.isNotBlank() } ?: L.unknownError
-                onFail()
-                // 多半是 CAS 冲突（网页端刚改过）：拉一次最新状态
-                refreshQueue()
-                refreshAll()
+                if (gen == sessionGeneration) {
+                    error.value = e.message?.takeIf { it.isNotBlank() } ?: L.unknownError
+                    onFail()
+                    // 多半是 CAS 冲突（网页端刚改过）：拉一次最新状态
+                    refreshQueue()
+                    refreshAll()
+                }
             } finally {
-                busy.value = null
+                if (gen == sessionGeneration && busy.value == key) {
+                    busy.value = null
+                }
             }
         }
     }

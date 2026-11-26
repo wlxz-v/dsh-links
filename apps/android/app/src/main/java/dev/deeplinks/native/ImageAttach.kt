@@ -7,6 +7,7 @@ import android.graphics.Matrix
 import android.media.ExifInterface
 import android.net.Uri
 import android.util.Base64
+import dev.deeplinks.core.BoundedIo
 import dev.deeplinks.native.util.IMAGE_MAX_BYTES
 import dev.deeplinks.native.util.IMAGE_MAX_EDGE
 import dev.deeplinks.native.util.IMAGE_TARGET_BYTES
@@ -14,56 +15,53 @@ import dev.deeplinks.native.util.inSampleSize
 import dev.deeplinks.native.util.redactUriForLog
 import dev.deeplinks.native.util.scaledSize
 import dev.deeplinks.native.util.viewfinderCropOnBitmap
-import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
+import java.io.File
 import java.io.IOException
 import java.io.InputStream
 
 object ImageAttach {
     private const val TAG = "dsh-image"
 
-    /** 原图读入内存的上限：超过则拒绝，避免相机 200MP / 长全景图把内存打爆。 */
-    private const val MAX_SOURCE_BYTES = 64 * 1024 * 1024
+    /** 原图落盘临时文件的上限：超过则拒绝，避免相机 200MP / 长全景图打爆存储或内存。 */
+    private const val MAX_SOURCE_BYTES = 64L * 1024 * 1024
 
     /**
-     * 把整张图读成字节再解码。
-     *
-     * 直接对 provider 的 InputStream 调 BitmapFactory.decodeStream 在 HyperOS 安全访问 /
-     * MIUI 相册 provider 上会静默返回 null（流形态不支持按需 seek），表象是
-     * 「无法读取图片：image stream unavailable」。先完整读入字节，再用
-     * decodeByteArray 解码，可绕开 provider 流差异；同时保留三级 provider 回退。
+     * 把 provider 流式落盘到临时文件再按文件解码，避免在 JVM 堆上同时持有 64~192MB 字节缓冲，
+     * 同时绕开 HyperOS 安全访问 / MIUI 相册 provider 不支持流 seek 的差异。
      */
-    private fun readAll(input: InputStream): ByteArray {
-        val out = ByteArrayOutputStream()
-        val buffer = ByteArray(64 * 1024)
-        var total = 0
-        while (true) {
-            val read = input.read(buffer)
-            if (read < 0) break
-            total += read
-            if (total > MAX_SOURCE_BYTES) throw IOException("image too large to read")
-            out.write(buffer, 0, read)
+    private fun copyToTempFile(context: Context, input: InputStream): File {
+        val tmp = File.createTempFile("img-attach-", ".tmp", context.cacheDir)
+        try {
+            val written = tmp.outputStream().use { sink -> BoundedIo.copy(input, sink, MAX_SOURCE_BYTES) }
+            if (written <= 0L) {
+                tmp.delete()
+                throw IOException("empty image stream")
+            }
+            return tmp
+        } catch (e: Exception) {
+            tmp.delete()
+            throw e
         }
-        return out.toByteArray()
     }
 
-    /** 逐个尝试 content provider 的三种打开方式，返回第一份非空字节。 */
-    private fun readBytes(context: Context, uri: Uri): ByteArray? {
-        val attempts: List<() -> ByteArray?> = listOf(
-            { context.contentResolver.openInputStream(uri)?.use { readAll(it) } },
+    /** 逐个尝试 content provider 的三种打开方式，返回第一份非空临时文件。 */
+    private fun readToTempFile(context: Context, uri: Uri): File? {
+        val attempts: List<() -> File?> = listOf(
+            { context.contentResolver.openInputStream(uri)?.use { copyToTempFile(context, it) } },
             {
                 context.contentResolver.openFileDescriptor(uri, "r")?.use { pfd ->
-                    android.os.ParcelFileDescriptor.AutoCloseInputStream(pfd).use { readAll(it) }
+                    android.os.ParcelFileDescriptor.AutoCloseInputStream(pfd).use { copyToTempFile(context, it) }
                 }
             },
             {
                 context.contentResolver.openAssetFileDescriptor(uri, "r")?.use { afd ->
-                    afd.createInputStream().use { readAll(it) }
+                    afd.createInputStream().use { copyToTempFile(context, it) }
                 }
             },
         )
         for (attempt in attempts) {
-            val bytes = try {
+            val file = try {
                 attempt()
             } catch (e: Exception) {
                 android.util.Log.w(
@@ -73,7 +71,8 @@ object ImageAttach {
                 )
                 null
             }
-            if (bytes != null && bytes.isNotEmpty()) return bytes
+            if (file != null && file.length() > 0L) return file
+            file?.delete()
         }
         return null
     }
@@ -99,27 +98,31 @@ object ImageAttach {
     }
 
     fun decode(context: Context, uri: Uri): Bitmap {
-        val bytes = readBytes(context, uri)
+        val tempFile = readToTempFile(context, uri)
             ?: throw IOException("image stream unavailable (${uri.scheme}://${uri.authority})")
+        try {
+            val size = tempFile.length()
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeFile(tempFile.path, bounds)
+            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
+                loadThumbnail(context, uri)?.let { return it }
+                throw IOException("image decode failed (${size}B ${uri.authority})")
+            }
 
-        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
-        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
-            loadThumbnail(context, uri)?.let { return it }
-            throw IOException("image decode failed (${bytes.size}B ${uri.authority})")
-        }
+            val sample = inSampleSize(bounds.outWidth, bounds.outHeight)
+            val opts = BitmapFactory.Options().apply { inSampleSize = sample }
+            val raw = BitmapFactory.decodeFile(tempFile.path, opts)
+                ?: loadThumbnail(context, uri)
+                ?: throw IOException("image decode failed (${size}B ${uri.authority})")
 
-        val sample = inSampleSize(bounds.outWidth, bounds.outHeight)
-        val opts = BitmapFactory.Options().apply { inSampleSize = sample }
-        val raw = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts)
-            ?: loadThumbnail(context, uri)
-            ?: throw IOException("image decode failed (${bytes.size}B ${uri.authority})")
-
-        val rotated = rotate(raw, exifRotation(bytes))
-        val (w, h) = scaledSize(rotated.width, rotated.height)
-        return if (w == rotated.width && h == rotated.height) rotated
-        else Bitmap.createScaledBitmap(rotated, w, h, true).also {
-            if (it !== rotated && !rotated.isRecycled) rotated.recycle()
+            val rotated = rotate(raw, exifRotation(tempFile))
+            val (w, h) = scaledSize(rotated.width, rotated.height)
+            return if (w == rotated.width && h == rotated.height) rotated
+            else Bitmap.createScaledBitmap(rotated, w, h, true).also {
+                if (it !== rotated && !rotated.isRecycled) rotated.recycle()
+            }
+        } finally {
+            runCatching { tempFile.delete() }
         }
     }
 
@@ -152,9 +155,9 @@ object ImageAttach {
         return out
     }
 
-    private fun exifRotation(bytes: ByteArray): Int {
+    private fun exifRotation(file: File): Int {
         return try {
-            val exif = ExifInterface(ByteArrayInputStream(bytes))
+            val exif = ExifInterface(file.path)
             when (exif.getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)) {
                 ExifInterface.ORIENTATION_ROTATE_90 -> 90
                 ExifInterface.ORIENTATION_ROTATE_180 -> 180

@@ -175,6 +175,17 @@ internal fun ProducedFilesRow(
     // 不能只改芯片文字：打开失败/超限要留一行说明，否则看起来还是「点了没反应」。
     var notice by remember { mutableStateOf<String?>(null) }
 
+    androidx.compose.runtime.DisposableEffect(preview) {
+        val owned = preview
+        onDispose {
+            when (owned) {
+                is ProducedPreview.Image -> if (!owned.bitmap.isRecycled) owned.bitmap.recycle()
+                is ProducedPreview.Pdf -> owned.pages.forEach { if (!it.isRecycled) it.recycle() }
+                else -> Unit
+            }
+        }
+    }
+
     LaunchedEffect(copiedPath) {
         if (copiedPath == null) return@LaunchedEffect
         delay(1_400)
@@ -201,41 +212,39 @@ internal fun ProducedFilesRow(
         notice = null
         scope.launch(Dispatchers.IO) {
             val result = runCatching { fetch(path) }
+            val resolved = result.mapCatching { (serverMime, bytes) ->
+                when {
+                    kind == ProducedFileKind.IMAGE || serverMime.startsWith("image/") -> {
+                        val bmp = decodeSampledBitmap(bytes)
+                        if (bmp != null) ProducedPreview.Image(bmp) to null else null to "decode"
+                    }
+                    kind == ProducedFileKind.TEXT || isProducedTextMime(serverMime) -> {
+                        ProducedPreview.Text(path, decodeProducedText(bytes)) to null
+                    }
+                    kind == ProducedFileKind.PDF -> {
+                        val dir = java.io.File(context.cacheDir, "opened").apply { mkdirs() }
+                        val file = java.io.File(dir, safeCacheFileName(path)).apply { writeBytes(bytes) }
+                        val rendered = runCatching { renderPdfPages(file) }.getOrNull()
+                        if (rendered != null && rendered.first.isNotEmpty()) {
+                            ProducedPreview.Pdf(producedFileName(path), rendered.first, rendered.second) to null
+                        } else {
+                            null to "pdf"
+                        }
+                    }
+                    else -> {
+                        val opened = openWithSystemApp(context, path, mimeForProducedFile(path, serverMime), bytes)
+                        null to if (opened) "external" else "no-app"
+                    }
+                }
+            }
             withContext(Dispatchers.Main) {
                 loadingPath = null
-                result.fold(
-                    onSuccess = { (serverMime, bytes) ->
+                resolved.fold(
+                    onSuccess = { (nextPreview, status) ->
                         when {
-                            kind == ProducedFileKind.IMAGE || serverMime.startsWith("image/") -> {
-                                val bmp = decodeSampledBitmap(bytes)
-                                if (bmp != null) preview = ProducedPreview.Image(bmp)
-                                else errorPath = path
-                            }
-                            kind == ProducedFileKind.TEXT || isProducedTextMime(serverMime) -> {
-                                preview = ProducedPreview.Text(path, decodeProducedText(bytes))
-                            }
-                            kind == ProducedFileKind.PDF -> {
-                                // PdfRenderer 只认真实文件：先落到缓存再渲染前几页。
-                                val rendered = withContext(Dispatchers.IO) {
-                                    runCatching {
-                                        val dir = java.io.File(context.cacheDir, "opened").apply { mkdirs() }
-                                        val file = java.io.File(dir, safeCacheFileName(path)).apply { writeBytes(bytes) }
-                                        renderPdfPages(file)
-                                    }.getOrNull()
-                                }
-                                if (rendered != null && rendered.first.isNotEmpty()) {
-                                    preview = ProducedPreview.Pdf(producedFileName(path), rendered.first, rendered.second)
-                                } else {
-                                    errorPath = path
-                                }
-                            }
-                            else -> {
-                                // 表格/文档/压缩包这类：本机查看器打开（WPS / Office / 解压 App）。
-                                val opened = withContext(Dispatchers.IO) {
-                                    openWithSystemApp(context, path, mimeForProducedFile(path, serverMime), bytes)
-                                }
-                                if (!opened) notice = L.noAppToOpen
-                            }
+                            nextPreview != null -> preview = nextPreview
+                            status == "no-app" -> notice = L.noAppToOpen
+                            status != "external" -> errorPath = path
                         }
                     },
                     onFailure = { error ->

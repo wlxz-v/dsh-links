@@ -28,6 +28,7 @@ object TokenCrypto {
     private const val GCM_TAG_BITS = 128
     private const val IV_BYTES = 12
     private const val TAG = "TokenCrypto"
+    @Volatile private var cachedKey: SecretKey? = null
 
     fun encrypt(context: Context, plaintext: String): String {
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
@@ -49,10 +50,12 @@ object TokenCrypto {
             val iv = Base64.decode(body.substring(0, sep), Base64.NO_WRAP)
             val ct = Base64.decode(body.substring(sep + 1), Base64.NO_WRAP)
             if (iv.size != IV_BYTES) return null
+            val key = getExistingKey() ?: return null
             val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-            cipher.init(Cipher.DECRYPT_MODE, getOrCreateKey(context), GCMParameterSpec(GCM_TAG_BITS, iv))
+            cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(GCM_TAG_BITS, iv))
             String(cipher.doFinal(ct), Charsets.UTF_8)
         } catch (e: Exception) {
+            cachedKey = null
             Log.w(TAG, "decrypt failed", e)
             null
         }
@@ -61,9 +64,20 @@ object TokenCrypto {
     fun isEncrypted(blob: String): Boolean = blob.startsWith(PREFIX)
 
     @Synchronized
-    private fun getOrCreateKey(context: Context): SecretKey {
+    private fun getExistingKey(): SecretKey? {
+        cachedKey?.let { return it }
         val keyStore = KeyStore.getInstance(KEYSTORE).apply { load(null) }
-        (keyStore.getKey(KEY_ALIAS, null) as? SecretKey)?.let { return it }
+        return (keyStore.getKey(KEY_ALIAS, null) as? SecretKey)?.also { cachedKey = it }
+    }
+
+    @Synchronized
+    private fun getOrCreateKey(context: Context): SecretKey {
+        cachedKey?.let { return it }
+        val keyStore = KeyStore.getInstance(KEYSTORE).apply { load(null) }
+        (keyStore.getKey(KEY_ALIAS, null) as? SecretKey)?.let {
+            cachedKey = it
+            return it
+        }
         val generator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, KEYSTORE)
         generator.init(
             KeyGenParameterSpec.Builder(KEY_ALIAS, KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT)
@@ -72,6 +86,6 @@ object TokenCrypto {
                 .setKeySize(256)
                 .build()
         )
-        return generator.generateKey()
+        return generator.generateKey().also { cachedKey = it }
     }
 }

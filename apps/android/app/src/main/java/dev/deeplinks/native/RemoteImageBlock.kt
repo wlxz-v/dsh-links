@@ -122,17 +122,23 @@ internal fun RemoteImageBlock(url: String, modifier: Modifier = Modifier) {
                 }
             }
         } else {
+            val request = remember(context, url, requested) {
+                ImageRequest.Builder(context)
+                    .data(url)
+                    // 限制解码像素上限，避免远端原图（4000×3000+）在消息列表里占用数十 MB 位图内存
+                    .size(1440, 1440)
+                    // 重试时强制重新走网络：磁盘/内存里可能留着上一轮的失败空响应。
+                    .memoryCachePolicy(if (requested > 1) CachePolicy.DISABLED else CachePolicy.ENABLED)
+                    .diskCachePolicy(if (requested > 1) CachePolicy.DISABLED else CachePolicy.ENABLED)
+                    .build()
+            }
             key(requested) {
                 SubcomposeAsyncImage(
-                    model = ImageRequest.Builder(context)
-                        .data(url)
-                        // 重试时强制重新走网络：磁盘/内存里可能留着上一轮的失败空响应。
-                        .memoryCachePolicy(if (requested > 1) CachePolicy.DISABLED else CachePolicy.ENABLED)
-                        .diskCachePolicy(if (requested > 1) CachePolicy.DISABLED else CachePolicy.ENABLED)
-                        .build(),
+                    model = request,
                     contentDescription = null,
                     modifier = Modifier
                         .fillMaxWidth()
+                        .heightIn(max = 480.dp)
                         .clip(RoundedCornerShape(DshRadius.container))
                         .background(Dsh.bgCard)
                         .combinedClickable(

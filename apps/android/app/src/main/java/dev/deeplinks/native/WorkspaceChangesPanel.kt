@@ -34,7 +34,9 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.Stable
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
@@ -118,8 +120,8 @@ internal class ChangesPanelState(initialProgress: Float = 0f) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, WorkspaceFileDiff>?) = size > 6
     }
 
-    val visible: Boolean get() = progress.value > 0f || progress.targetValue > 0f
-    val opened: Boolean get() = progress.targetValue >= 1f
+    val visible: Boolean by derivedStateOf { progress.value > 0f || progress.targetValue > 0f }
+    val opened: Boolean by derivedStateOf { progress.targetValue >= 1f }
 
     suspend fun open(seq: Long? = null, fileIndex: Int? = null) {
         this.seq = seq
@@ -282,7 +284,8 @@ internal fun WorkspaceChangesPanel(
     /** 6.1 底部「就这些改动提问」：带这一轮的上下文回到对话页输入框。 */
     onAskAboutTurn: ((WorkspaceChangesSummary) -> Unit)? = null,
 ) {
-    state.animationMs = motionDuration(DshDuration.slow)
+    val nextAnimationMs = motionDuration(DshDuration.slow)
+    SideEffect { state.animationMs = nextAnimationMs }
     val scope = rememberCoroutineScope()
     BackHandler(enabled = state.opened && state.fileIndex != null) { state.fileIndex = null }
     PredictiveBackHandler(enabled = state.opened && state.fileIndex == null) { events ->
@@ -606,7 +609,10 @@ private fun DiffNoteRow(text: String) {
 
 @Composable
 private fun DiffLines(diff: WorkspaceFileDiff.Text, wrap: Boolean) {
-    val allRows = remember(diff) { diffRows(diff.hunks) }
+    // diffRows 含词级 LCS 行内比对：放到 Default 线程计算，避免大文件在主线程卡顿掉帧
+    val allRows by produceState<List<DiffRow>>(initialValue = emptyList(), key1 = diff) {
+        value = withContext(Dispatchers.Default) { diffRows(diff.hunks) }
+    }
     // 已展开的折叠段（存「被折叠片段在 allRows 里的起始下标」）；切换文件时随 diff 重置
     var expandedFolds by remember(diff) { mutableStateOf(emptySet<Int>()) }
     val rows = remember(allRows, expandedFolds) { foldContextRows(allRows, expandedFolds) }
@@ -646,12 +652,23 @@ private fun DiffLines(diff: WorkspaceFileDiff.Text, wrap: Boolean) {
                 itemsIndexed(notes, key = { i, _ -> "note-$i" }) { _, note ->
                     DiffNoteRow(ChangesL.note(note, diff))
                 }
-                itemsIndexed(rows, key = { i, _ -> i }, contentType = { _, row -> row.kind }) { index, row ->
+                itemsIndexed(
+                    rows,
+                    key = { idx, row ->
+                        when (row.kind) {
+                            DiffRow.Kind.FOLD -> "fold-${row.foldStart}"
+                            DiffRow.Kind.HUNK -> "hunk-${row.text}-$idx"
+                            else -> "${row.kind.ordinal}-${row.oldNo ?: -1}-${row.newNo ?: -1}"
+                        }
+                    },
+                    contentType = { _, row -> row.kind },
+                ) { _, row ->
                     DiffLineRow(
                         row = row,
                         digits = digits,
                         wrap = wrap,
                         style = codeStyle,
+                        lineMeasurer = measurer,
                         textWidthPx = textWidthPx,
                         // 折叠行自带被折叠片段的起始下标（数据层给的），UI 不用反推
                         onExpandFold = { c ->
@@ -670,6 +687,7 @@ private fun DiffLineRow(
     digits: Int,
     wrap: Boolean,
     style: androidx.compose.ui.text.TextStyle,
+    lineMeasurer: androidx.compose.ui.text.TextMeasurer,
     /** 自动换行时文本列的可用像素宽；<= 0 表示走横向滚动那条路径，不做悬挂缩进。 */
     textWidthPx: Int = 0,
     onExpandFold: (Int) -> Unit = {},
@@ -716,9 +734,8 @@ private fun DiffLineRow(
         )
         Text(" $sign ", color = signColor, style = style, maxLines = 1, softWrap = false)
         val lineText = remember(row, signColor) { diffLineText(row, signColor.copy(alpha = 0.3f)) }
-        // 稿 04：折行的续行要 2ch 悬挂缩进。断点由真实排版给出（TextMeasurer + 约束宽度），
-        // 不按字符数猜；切片走 AnnotatedString，行内改动的加深底色不会丢。
-        val lineMeasurer = rememberTextMeasurer()
+        // 稿 04：折行的续行要 2ch 悬挂缩进。断点由真实排版给出（共享 TextMeasurer + 约束宽度），
+        // 不按字符数猜；续行用 buildAnnotatedString 拼接使行内改动 span 区间自动随缩进偏移。
         val lineRanges = remember(lineText, textWidthPx, wrap) {
             if (!wrap || textWidthPx <= 0) {
                 emptyList()
@@ -757,7 +774,10 @@ private fun DiffLineRow(
                         if (index == 0) {
                             slice
                         } else {
-                            AnnotatedString(" ".repeat(HANGING_INDENT_CHARS) + slice.text, slice.spanStyles, slice.paragraphStyles)
+                            buildAnnotatedString {
+                                append(" ".repeat(HANGING_INDENT_CHARS))
+                                append(slice)
+                            }
                         },
                         color = Dsh.labelPrimary,
                         style = style,

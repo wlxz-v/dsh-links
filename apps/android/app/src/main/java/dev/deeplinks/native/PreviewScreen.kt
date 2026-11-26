@@ -33,10 +33,12 @@ import dev.deeplinks.native.ui.v4.DlTopBarAction
 import dev.deeplinks.native.ui.v4.DlTopBarNav
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -55,20 +57,30 @@ import dev.deeplinks.core.previewCopied
 import dev.deeplinks.core.previewLimit
 import dev.deeplinks.core.previewRefresh
 import dev.deeplinks.core.previewTitle
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayInputStream
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 internal fun PreviewEntrySheet(client: MobileApiClient, host: Host, onDismiss: () -> Unit) {
+    val scope = rememberCoroutineScope()
     var items by remember { mutableStateOf<List<MobilePreview>>(emptyList()) }
     var error by remember { mutableStateOf<String?>(null) }
     var open by remember { mutableStateOf<OpenPreview?>(null) }
+    var starting by remember { mutableStateOf(false) }
+    DisposableEffect(open) {
+        val current = open
+        onDispose { current?.proxy?.close() }
+    }
     LaunchedEffect(Unit) {
         try {
             items = withContext(Dispatchers.IO) { client.listPreviews() }
             error = null
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             error = e.message
         }
@@ -98,12 +110,27 @@ internal fun PreviewEntrySheet(client: MobileApiClient, host: Host, onDismiss: (
                         leading = GlobeOutline16,
                         trailing = DlRowTrailing.Chevron,
                         onClick = {
-                            val proxy = PreviewLocalProxy(
-                                exchange = { hostPreviewExchange(host, it) },
-                                webSocket = { forward, socket, accept -> hostPreviewWebSocket(host, forward, socket, accept) },
-                            )
-                            proxy.start()
-                            open = OpenPreview("localhost:${item.port}", proxy, proxy.localUrl(item.previewId))
+                            if (starting) return@DlListRow
+                            starting = true
+                            scope.launch {
+                                try {
+                                    val started = withContext(Dispatchers.IO) {
+                                        val proxy = PreviewLocalProxy(
+                                            exchange = { hostPreviewExchange(host, it) },
+                                            webSocket = { forward, socket, accept -> hostPreviewWebSocket(host, forward, socket, accept) },
+                                        )
+                                        proxy.start()
+                                        OpenPreview("localhost:${item.port}", proxy, proxy.localUrl(item.previewId))
+                                    }
+                                    open = started
+                                } catch (e: CancellationException) {
+                                    throw e
+                                } catch (e: Exception) {
+                                    error = e.message
+                                } finally {
+                                    starting = false
+                                }
+                            }
                         },
                     )
                 }
@@ -157,7 +184,14 @@ private fun PreviewScreen(title: String, url: String, onClose: () -> Unit) {
                     DlTopBarAction(RefreshOutline16, L.previewRefresh, { webView?.reload() }),
                     DlTopBarAction(CopyOutline16, L.previewCopyAddress, {
                         val clipboard = context.getSystemService(android.content.ClipboardManager::class.java)
-                        clipboard?.setPrimaryClip(android.content.ClipData.newPlainText("preview", url))
+                        val clip = android.content.ClipData.newPlainText("preview", url).apply {
+                            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+                                description.extras = android.os.PersistableBundle().apply {
+                                    putBoolean(android.content.ClipDescription.EXTRA_IS_SENSITIVE, true)
+                                }
+                            }
+                        }
+                        clipboard?.setPrimaryClip(clip)
                         Toast.makeText(context, copied, Toast.LENGTH_SHORT).show()
                     }),
                 ),

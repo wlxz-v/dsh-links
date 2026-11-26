@@ -13,6 +13,7 @@ data class AppRelease(
 )
 
 private const val DAY_MS = 24L * 60L * 60L * 1000L
+private const val MAX_RELEASE_BODY_BYTES = 512 * 1024
 private const val PREFS = "dsh_settings"
 private const val KEY_ENABLED = "update_check_enabled"
 private const val KEY_CHECKED = "update_last_checked_at"
@@ -125,7 +126,6 @@ object UpdateChecker {
     fun checkBlocking(context: Context, versionName: String, url: String = GITHUB_RELEASES_URL, now: Long = System.currentTimeMillis()) {
         if (!UpdateCheckPrefs.enabled(context)) return
         if (!shouldCheck(UpdateCheckPrefs.lastCheckedAt(context), now)) return
-        UpdateCheckPrefs.setLastCheckedAt(context, now)
         try {
             val request = Request.Builder()
                 .url(url)
@@ -138,9 +138,10 @@ object UpdateChecker {
                     CrashRecorder.breadcrumb("update", "http ${response.code}")
                     return
                 }
-                val body = response.body.string()
+                val body = response.body.byteStream().use { BoundedIo.readText(it, MAX_RELEASE_BODY_BYTES) }
                 val newer = newerRelease(versionName, parseReleases(body))
                 UpdateCheckPrefs.setCachedNewer(context, newer)
+                UpdateCheckPrefs.setLastCheckedAt(context, now)
             }
         } catch (_: Exception) {
             CrashRecorder.breadcrumb("update", "check failed")

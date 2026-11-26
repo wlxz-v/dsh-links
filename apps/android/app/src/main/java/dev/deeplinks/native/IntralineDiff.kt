@@ -45,13 +45,17 @@ internal fun intralineEmphasis(
     if (old == new) return none
     val a = intralineTokens(old)
     val b = intralineTokens(new)
-    fun tokA(i: Int) = old.substring(a[i].first, a[i].last + 1)
-    fun tokB(j: Int) = new.substring(b[j].first, b[j].last + 1)
+    fun sameToken(i: Int, j: Int): Boolean {
+        val ra = a[i]
+        val rb = b[j]
+        val len = ra.last - ra.first + 1
+        return len == rb.last - rb.first + 1 && old.regionMatches(ra.first, new, rb.first, len)
+    }
 
     var head = 0
-    while (head < a.size && head < b.size && tokA(head) == tokB(head)) head++
+    while (head < a.size && head < b.size && sameToken(head, head)) head++
     var tail = 0
-    while (tail < a.size - head && tail < b.size - head && tokA(a.size - 1 - tail) == tokB(b.size - 1 - tail)) tail++
+    while (tail < a.size - head && tail < b.size - head && sameToken(a.size - 1 - tail, b.size - 1 - tail)) tail++
     val n = a.size - head - tail
     val m = b.size - head - tail
     val cells = n.toLong() * m
@@ -65,7 +69,7 @@ internal fun intralineEmphasis(
         val dp = Array(n + 1) { IntArray(m + 1) }
         for (i in n - 1 downTo 0) {
             for (j in m - 1 downTo 0) {
-                dp[i][j] = if (tokA(head + i) == tokB(head + j)) dp[i + 1][j + 1] + 1
+                dp[i][j] = if (sameToken(head + i, head + j)) dp[i + 1][j + 1] + 1
                 else maxOf(dp[i + 1][j], dp[i][j + 1])
             }
         }
@@ -73,7 +77,7 @@ internal fun intralineEmphasis(
         var j = 0
         while (i < n && j < m) {
             when {
-                tokA(head + i) == tokB(head + j) -> {
+                sameToken(head + i, head + j) -> {
                     matchedA[head + i] = true
                     matchedB[head + j] = true
                     i++

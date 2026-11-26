@@ -1,12 +1,8 @@
 # DeepLinks release 混淆规则
 # R8 仅在 release 构建生效；debug 不受影响。
 
-# Prism4j（代码语法高亮，纯 Kotlin/Android，grammar 经 Prism4jGrammarLocator 加载）
--keep class io.noties.prism4j.** { *; }
--dontwarn io.noties.**
-
-# coil（图片加载）
--dontwarn coil.**
+# coil3（图片加载）
+-dontwarn coil3.**
 -dontwarn okio.**
 
 # 保留源码行号，便于崩溃排查

@@ -222,6 +222,14 @@ class WorkspacePrefs(context: Context) {
         sessionSnapshots = next
     }
 
+    /** 批量更新会话快照，一次反序列化 + 一次写回，避免循环逐条 O(N²) 读写 SharedPreferences。 */
+    fun rememberSessionSnapshots(updates: Map<String, SessionSnapshot>) {
+        if (updates.isEmpty()) return
+        val next = sessionSnapshots.toMutableMap()
+        next.putAll(updates)
+        sessionSnapshots = next
+    }
+
     fun forgetSessionSnapshot(sessionId: String) {
         forgetSessionSnapshots(listOf(sessionId))
     }

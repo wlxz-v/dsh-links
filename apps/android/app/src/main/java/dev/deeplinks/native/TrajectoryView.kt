@@ -234,7 +234,7 @@ internal fun TrajectoryView(
     val errorCount = remember(turns) { turns.sumOf { (_, rows) -> rows.count(::traceRowIsError) } }
     val lastRowKey = turns.lastOrNull()?.second?.lastOrNull()?.key
     val visibleTurns = remember(turns, query, filter) {
-        turns.map { (turn, rows) -> turn to rows.filter { traceRowMatches(it, filter, query) } }
+        turns.map { (turn, rows) -> turn to rows.filter { traceRowMatches(it, filter, query) }.asReversed() }
             .filter { it.second.isNotEmpty() }
             .asReversed()
     }
@@ -265,7 +265,7 @@ internal fun TrajectoryView(
                 }
                 visibleTurns.forEach { (turn, rows) ->
                     item(key = "trace-turn-" + turn.index, contentType = "trace-turn-header") { TraceRoundHeader(turn) }
-                    items(items = rows.asReversed(), key = { it.key }, contentType = { "trace-row" }) { row ->
+                    items(items = rows, key = { it.key }, contentType = { "trace-row" }) { row ->
                         val open = row.key in expanded
                         TraceListRow(
                             row = row,
@@ -333,13 +333,15 @@ private fun TraceListRow(
     onToggle: () -> Unit,
 ) {
     val primary = row.primary
-    val error = traceRowIsError(row)
-    val role = traceDisplayRole(primary)
+    val error = remember(row) { traceRowIsError(row) }
+    val role = remember(primary) { traceDisplayRole(primary) }
     val visual = traceRoleVisual(role)
     val isTool = primary.role == "tool_call"
-    val title = when {
-        isTool -> traceToolTitle(primary)
-        else -> firstLine(primary.text).ifEmpty { primary.toolName ?: visual.label }
+    val title = remember(primary, isTool, visual.label) {
+        when {
+            isTool -> traceToolTitle(primary)
+            else -> firstLine(primary.text).ifEmpty { primary.toolName ?: visual.label }
+        }
     }
     val kind = when {
         error -> L.traceErrorKind

@@ -114,6 +114,11 @@ fun highlightCode(code: String, language: String?, isDark: Boolean): AnnotatedSt
 
 private fun tokenize(code: String, lang: String, isDark: Boolean): AnnotatedString = buildAnnotatedString {
     val keywords = KEYWORDS[lang].orEmpty()
+    val commentStyle = SpanStyle(color = commentColor(isDark))
+    val stringStyle = SpanStyle(color = stringColor(isDark))
+    val numberStyle = SpanStyle(color = numberColor(isDark))
+    val keywordStyle = SpanStyle(color = keywordColor(isDark))
+    val functionStyle = SpanStyle(color = functionColor(isDark))
     var i = 0
     val n = code.length
     while (i < n) {
@@ -121,8 +126,8 @@ private fun tokenize(code: String, lang: String, isDark: Boolean): AnnotatedStri
         // 行注释
         if (isLineComment(code, i, lang)) {
             val end = code.indexOf('\n', i).let { if (it < 0) n else it }
-            pushStyle(SpanStyle(color = commentColor(isDark)))
-            append(code.substring(i, end))
+            pushStyle(commentStyle)
+            append(code, i, end)
             pop()
             i = end
             continue
@@ -130,8 +135,8 @@ private fun tokenize(code: String, lang: String, isDark: Boolean): AnnotatedStri
         // 块注释 /* */
         if (code.startsWith("/*", i)) {
             val end = code.indexOf("*/", i).let { if (it < 0) n else it + 2 }
-            pushStyle(SpanStyle(color = commentColor(isDark)))
-            append(code.substring(i, end))
+            pushStyle(commentStyle)
+            append(code, i, end)
             pop()
             i = end
             continue
@@ -141,12 +146,12 @@ private fun tokenize(code: String, lang: String, isDark: Boolean): AnnotatedStri
             val quote = c
             var j = i + 1
             while (j < n) {
-                if (code[j] == '\\') { j += 2; continue }
+                if (code[j] == '\\') { j = minOf(j + 2, n); continue }
                 if (code[j] == quote) { j++; break }
                 j++
             }
-            pushStyle(SpanStyle(color = stringColor(isDark)))
-            append(code.substring(i, j))
+            pushStyle(stringStyle)
+            append(code, i, j)
             pop()
             i = j
             continue
@@ -157,8 +162,8 @@ private fun tokenize(code: String, lang: String, isDark: Boolean): AnnotatedStri
             while (j < n && (code[j].isDigit() || code[j] == '.' || code[j] == 'x' || code[j] == 'X' ||
                 code[j] in 'a'..'f' || code[j] in 'A'..'F' || code[j] == '_')
             ) j++
-            pushStyle(SpanStyle(color = numberColor(isDark)))
-            append(code.substring(i, j))
+            pushStyle(numberStyle)
+            append(code, i, j)
             pop()
             i = j
             continue
@@ -172,10 +177,10 @@ private fun tokenize(code: String, lang: String, isDark: Boolean): AnnotatedStri
             while (k < n && code[k].isWhitespace()) k++
             when {
                 keywords.contains(word) -> {
-                    pushStyle(SpanStyle(color = keywordColor(isDark))); append(word); pop()
+                    pushStyle(keywordStyle); append(word); pop()
                 }
                 k < n && code[k] == '(' -> {
-                    pushStyle(SpanStyle(color = functionColor(isDark))); append(word); pop()
+                    pushStyle(functionStyle); append(word); pop()
                 }
                 else -> append(word)
             }

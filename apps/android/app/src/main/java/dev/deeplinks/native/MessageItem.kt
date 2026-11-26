@@ -44,8 +44,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
-import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.role
@@ -772,12 +772,14 @@ private fun TodoGlyph(status: String) {
                 modifier = Modifier.size(DshIconSize.sm)
             )
             "active", "progress", "in_progress", "running" -> {
-                val angle = rememberMotionSpin(750, label = "todo-spin")
+                val spin = rememberMotionSpinState(750, label = "todo-spin")
                 Icon(
                     RefreshOutline16,
                     contentDescription = null,
                     tint = Dsh.labelSecondary,
-                    modifier = Modifier.size(DshIconSize.sm).rotate(angle ?: 0f)
+                    modifier = Modifier
+                        .size(DshIconSize.sm)
+                        .graphicsLayer { rotationZ = spin?.value ?: 0f }
                 )
             }
             else -> Box(
@@ -960,11 +962,12 @@ private fun UserBubble(text: String, longPress: Modifier = Modifier) {
 
 @Composable
 private fun AssistantMarkdown(text: String, longPress: Modifier = Modifier, streaming: Boolean = false) {
+    val decoded = remember(text) { decodeHtmlEntities(text) }
     Column(
         modifier = longPress.fillMaxWidth(),
         verticalArrangement = Arrangement.spacedBy(DshSpace.s12)
     ) {
-        MarkdownContent(decodeHtmlEntities(text), streaming = streaming)
+        MarkdownContent(decoded, streaming = streaming)
     }
 }
 

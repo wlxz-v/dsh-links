@@ -165,12 +165,12 @@ private fun MarkdownTableBlock(rows: List<List<String>>) {
     val context = androidx.compose.ui.platform.LocalContext.current
     var fullscreen by remember { mutableStateOf(false) }
     var tableError by remember { mutableStateOf<String?>(null) }
-    val csvBytes = remember(rows) { tableToCsv(rows).toByteArray(Charsets.UTF_8) }
     val saveTable = rememberLauncherForActivityResult(
         ActivityResultContracts.CreateDocument("text/csv"),
     ) { uri ->
         if (uri == null) return@rememberLauncherForActivityResult
         runCatching {
+            val csvBytes = tableToCsv(rows).toByteArray(Charsets.UTF_8)
             context.contentResolver.openOutputStream(uri)?.use { it.write(csvBytes) }
                 ?: error("open")
         }.onSuccess {
@@ -373,9 +373,13 @@ private fun InlineMarkdownText(
             }
         }
     }
-    SideEffect { MathRenderer.attach(context.applicationContext) }
-    val mathRevision = MathRenderer.revision
     val source = if (streaming && markdown) closeStreamingMarkdown(text) else text
+    // 只有包含 `$` 的文本块才订阅 MathRenderer.revision，避免任意公式渲染完成导致全屏段落/表格单元格重排
+    val hasInlineMath = markdown && source.contains('$')
+    if (hasInlineMath) {
+        SideEffect { MathRenderer.attach(context.applicationContext) }
+    }
+    val mathRevision = if (hasInlineMath) MathRenderer.revision else 0
     val built = remember(source, markdown, pressed, labelPrimaryColor, brand400Color, color, mathRevision) {
         if (markdown) {
             buildInlineMarkdown(source, pressed, labelPrimaryColor, brand400Color, color.toArgb(), openUrl)
@@ -422,33 +426,38 @@ private fun buildInlineMarkdown(
         var i = 0
         var mathIndex = 0
         while (i < text.length) {
-            // 找下一个标记位置
-            val tokens = listOf(
-                text.indexOf('`', i) to '`',
-                text.indexOf("**", i) to '*',
-                text.indexOf("~~", i) to '~',
-                text.indexOf("$", i) to '$',
-                text.indexOf("[", i) to '[',
-            ).filter { it.first != -1 }
-            if (tokens.isEmpty()) {
-                append(text.substring(i))
+            // 零分配查找下一个行内标记位置
+            var nextIdx = Int.MAX_VALUE
+            var kind = '\u0000'
+            fun consider(idx: Int, k: Char) {
+                if (idx in 0 until nextIdx) {
+                    nextIdx = idx
+                    kind = k
+                }
+            }
+            consider(text.indexOf('`', i), '`')
+            consider(text.indexOf('*', i), '*')
+            consider(text.indexOf("~~", i), '~')
+            consider(text.indexOf('$', i), '$')
+            consider(text.indexOf('[', i), '[')
+            if (nextIdx == Int.MAX_VALUE) {
+                append(text, i, text.length)
                 break
             }
-            val (nextIdx, kind) = tokens.minBy { it.first }
-            append(text.substring(i, nextIdx))
+            if (nextIdx > i) append(text, i, nextIdx)
             when (kind) {
                 '`' -> {
                     val end = text.indexOf('`', nextIdx + 1)
-                    if (end == -1) { append(text.substring(nextIdx)); break }
+                    if (end == -1) { append(text, nextIdx, text.length); break }
                     withStyle(SpanStyle(fontFamily = FontFamily.Monospace, background = pressed, color = labelPrimaryColor)) {
-                        append(text.substring(nextIdx + 1, end))
+                        append(text, nextIdx + 1, end)
                     }
                     i = end + 1
                 }
                 '$' -> {
                     // 行内公式 $...$：内容首尾不能是空白（KaTeX 约定），不跨行、不嵌套
                     val end = text.indexOf('$', nextIdx + 1)
-                    if (end == -1) { append(text.substring(nextIdx)); break }
+                    if (end == -1) { append(text, nextIdx, text.length); break }
                     val inner = text.substring(nextIdx + 1, end)
                     val valid = inner.isNotBlank() &&
                         !inner.startsWith(" ") && !inner.endsWith(" ") &&
@@ -486,29 +495,41 @@ private fun buildInlineMarkdown(
                     i = end + 1
                 }
                 '*' -> {
-                    // **bold** 或 *italic*
-                    val after = if (nextIdx + 2 < text.length) text[nextIdx + 2] else '\u0000'
-                    if (after == '*') {
+                    // **bold** 或 *italic*（修复原代码错看 nextIdx + 2 导致 **bold** 误入斜体分支的缺陷）
+                    val isBold = nextIdx + 1 < text.length && text[nextIdx + 1] == '*'
+                    if (isBold) {
                         val end = text.indexOf("**", nextIdx + 2)
-                        if (end == -1) { append(text.substring(nextIdx)); break }
+                        if (end == -1 || end == nextIdx + 2) {
+                            append("**")
+                            i = nextIdx + 2
+                            continue
+                        }
                         withStyle(SpanStyle(fontWeight = FontWeight(600))) {
-                            append(text.substring(nextIdx + 2, end))
+                            append(text, nextIdx + 2, end)
                         }
                         i = end + 2
                     } else {
                         val end = text.indexOf('*', nextIdx + 1)
-                        if (end == -1) { append(text.substring(nextIdx)); break }
+                        val validItalic = end > nextIdx + 1 &&
+                            !text[nextIdx + 1].isWhitespace() &&
+                            !text[end - 1].isWhitespace() &&
+                            text.indexOf('\n', nextIdx + 1).let { it == -1 || it > end }
+                        if (!validItalic) {
+                            append('*')
+                            i = nextIdx + 1
+                            continue
+                        }
                         withStyle(SpanStyle(fontStyle = androidx.compose.ui.text.font.FontStyle.Italic)) {
-                            append(text.substring(nextIdx + 1, end))
+                            append(text, nextIdx + 1, end)
                         }
                         i = end + 1
                     }
                 }
                 '~' -> {
                     val end = text.indexOf("~~", nextIdx + 2)
-                    if (end == -1) { append(text.substring(nextIdx)); break }
+                    if (end == -1) { append(text, nextIdx, text.length); break }
                     withStyle(SpanStyle(textDecoration = androidx.compose.ui.text.style.TextDecoration.LineThrough)) {
-                        append(text.substring(nextIdx + 2, end))
+                        append(text, nextIdx + 2, end)
                     }
                     i = end + 2
                 }

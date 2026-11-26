@@ -91,25 +91,28 @@ class SessionBackgroundMonitorService : Service() {
         val nextSessionId = intent?.getStringExtra(EXTRA_SESSION_ID)
             ?: if (isRestore) storedSessionId() else null
         val nextHost = HostStore.current(this)
+        val startedAsForeground = intent?.action == ACTION_START || intent?.action == ACTION_ANSWER
         if (nextSessionId.isNullOrBlank() || nextHost == null) {
+            if (startedAsForeground && !foregroundPosted) postMinimalForegroundForStop()
             stopSelf()
             return START_NOT_STICKY
         }
         val expectedSlot = intent?.getStringExtra(EXTRA_HOST_SLOT)
         if (expectedSlot != null && expectedSlot != nextHost.slotKey) {
+            if (startedAsForeground && !foregroundPosted) postMinimalForegroundForStop()
             stopSelf()
             return START_NOT_STICKY
         }
         if (intent?.action == ACTION_ANSWER) {
-            if (sessionId != null && sessionId != nextSessionId) {
-                DshNotifier.cancelApproval(this, nextHost, nextSessionId)
-                DshNotifier.openSession(this, nextHost, nextSessionId)
-                return START_NOT_STICKY
+            if (sessionId == null) {
+                configure(nextHost, nextSessionId, storedTitle().orEmpty(), storedSequence(), true)
+            } else {
+                startForegroundNow()
             }
-            if (sessionId == null) configure(nextHost, nextSessionId, storedTitle().orEmpty(), storedSequence(), true)
-            else startForegroundNow()
             val approvalId = intent.getStringExtra(EXTRA_APPROVAL_ID).orEmpty()
-            if (approvalId.isNotBlank()) submitApproval(nextHost, nextSessionId, approvalId, intent.getBooleanExtra(EXTRA_APPROVE, false))
+            if (approvalId.isNotBlank()) {
+                submitApproval(nextHost, nextSessionId, approvalId, intent.getBooleanExtra(EXTRA_APPROVE, false))
+            }
             return START_STICKY
         }
         configure(
@@ -131,6 +134,23 @@ class SessionBackgroundMonitorService : Service() {
         if (instance === this) instance = null
         if (activeSessionId == sessionId) activeSessionId = null
         super.onDestroy()
+    }
+
+    private fun postMinimalForegroundForStop() {
+        val placeholder = DshNotifier.stoppingMonitorNotification(this)
+        foregroundPosted = true
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            runCatching {
+                ServiceCompat.startForeground(
+                    this,
+                    DshNotifier.TASK_MONITOR_NOTIFICATION_ID,
+                    placeholder,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING,
+                )
+            }
+        } else {
+            runCatching { startForeground(DshNotifier.TASK_MONITOR_NOTIFICATION_ID, placeholder) }
+        }
     }
 
     private fun startForegroundNow() {
@@ -211,14 +231,14 @@ class SessionBackgroundMonitorService : Service() {
             }
         }
         networkJob = serviceScope.launch {
-            ConnectivitySignals.probeNow.collect {
+            ConnectivitySignals.networkActions.collect { action ->
                 if (!isActive || readerGeneration != generation || !background) return@collect
-                if (hostMonitorShouldReconnect(NetworkChangeAction.ResetPool)) {
+                if (hostMonitorShouldReconnect(action)) {
                     client.reconnect()
                 }
             }
         }
-        if (afterSeq > 0) client.noteEventId(afterSeq)
+        // 注意：afterSeq 属于单会话 SSE 编号空间，不可直接喂给主机级 /mobile/events 游标（后者按插件启动从 1 递增）。
     }
 
     private val activeSince = ActiveSinceTracker()
@@ -264,12 +284,14 @@ class SessionBackgroundMonitorService : Service() {
         when (item.state) {
             "awaitingApproval" -> {
                 onProgressEvent(TaskProgressEvent.ApprovalAsked)
-                reconcilePendingApproval(host, item.sessionId)
                 // 后台接管的是当前会话时也要推到通知栏：用户可能锁着屏，回不到 App 里的决策栏。
                 val approvalId = item.approvalId
                 val tool = item.approvalToolName
                 if (background && !approvalId.isNullOrBlank() && !tool.isNullOrBlank()) {
                     DshNotifier.notifyApproval(this, host, item.sessionId, tool, approvalId, item.title.ifBlank { sessionTitle }, item.approvalDetail)
+                } else {
+                    // 老插件未在主机事件里带 approvalId/toolName 时再回查 /requests 补齐
+                    reconcilePendingApproval(host, item.sessionId)
                 }
             }
             "awaitingInput" -> {
@@ -291,8 +313,14 @@ class SessionBackgroundMonitorService : Service() {
                     )
                 }
             }
-            "running" -> onProgressEvent(TaskProgressEvent.ApprovalDecided)
-            "completed", "failed", "stopped" -> onProgressEvent(TaskProgressEvent.TurnEnded)
+            "running" -> {
+                DshNotifier.cancelApproval(this, host, item.sessionId)
+                onProgressEvent(TaskProgressEvent.ApprovalDecided)
+            }
+            "completed", "failed", "stopped" -> {
+                DshNotifier.cancelApproval(this, host, item.sessionId)
+                onProgressEvent(TaskProgressEvent.TurnEnded)
+            }
         }
     }
 
@@ -465,12 +493,20 @@ class SessionBackgroundMonitorService : Service() {
             val client = MobileApiClient(host)
             var accepted = false
             for (attempt in 1..3) {
-                accepted = runCatching {
+                var terminalClientError = false
+                accepted = try {
                     client.answerApproval(sid, approvalId, if (approve) ApprovalActionReceiver.OUTCOME_ALLOW else ApprovalActionReceiver.OUTCOME_REJECT)
-                }.onFailure { error ->
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    throw e
+                } catch (error: Exception) {
                     Log.w(TAG, "approval failed attempt=$attempt session=${sid.take(8)}: ${error.javaClass.simpleName}")
-                }.getOrDefault(false)
-                if (accepted) break
+                    val code = (error as? MobileApiHttpException)?.httpCode
+                    if (error is MobileAuthException || (code != null && code in 400..499)) {
+                        terminalClientError = true
+                    }
+                    false
+                }
+                if (accepted || terminalClientError) break
                 if (attempt < 3) delay(700)
             }
             withContext(Dispatchers.Main) {
@@ -509,7 +545,15 @@ class SessionBackgroundMonitorService : Service() {
             withContext(Dispatchers.Main) {
                 if (sessionId != sid || !background) return@withContext
                 when {
-                    pending != null -> DshNotifier.notifyApproval(this@SessionBackgroundMonitorService, host, sid, pending.toolName ?: L.toolFallbackName, pending.id, sessionTitle)
+                    pending != null -> DshNotifier.notifyApproval(
+                        this@SessionBackgroundMonitorService,
+                        host,
+                        sid,
+                        pending.toolName ?: L.toolFallbackName,
+                        pending.id,
+                        sessionTitle,
+                        pending.detail,
+                    )
                     waiting -> DshNotifier.notifyApproval(this@SessionBackgroundMonitorService, host, sid, L.toolFallbackName, sessionTitle = sessionTitle)
                 }
             }
@@ -722,10 +766,13 @@ class SessionBackgroundMonitorService : Service() {
             if (service != null) {
                 service.finishForSession(sid)
             } else if (activeSessionId == sid) {
-                context.startService(Intent(context, SessionBackgroundMonitorService::class.java).apply {
-                    action = ACTION_STOP
-                    putExtra(EXTRA_SESSION_ID, sid)
-                })
+                activeSessionId = null
+                runCatching {
+                    context.startService(Intent(context, SessionBackgroundMonitorService::class.java).apply {
+                        action = ACTION_STOP
+                        putExtra(EXTRA_SESSION_ID, sid)
+                    })
+                }
             }
         }
     }

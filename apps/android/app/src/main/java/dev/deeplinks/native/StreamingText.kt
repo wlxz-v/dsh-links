@@ -15,8 +15,7 @@ import androidx.compose.foundation.text.appendInlineContent
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.mutableIntStateOf
-import androidx.compose.runtime.mutableLongStateOf
-import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -69,9 +68,9 @@ internal fun streamFadeAlpha(ageMs: Long, durationMs: Long = STREAM_FADE_MS): Fl
  */
 @Composable
 internal fun rememberStreamFade(length: Int, enabled: Boolean): List<StreamFadeSpan> {
-    val chunks = remember { mutableStateListOf<StreamFadeChunk>() }
+    val chunks = remember { ArrayList<StreamFadeChunk>() }
     var settled by remember { mutableIntStateOf(length) }
-    var now by remember { mutableLongStateOf(SystemClock.uptimeMillis()) }
+    var activeSpans by remember { mutableStateOf<List<StreamFadeSpan>>(emptyList()) }
     if (!enabled) return emptyList()
     LaunchedEffect(length) {
         val born = SystemClock.uptimeMillis()
@@ -81,21 +80,26 @@ internal fun rememberStreamFade(length: Int, enabled: Boolean): List<StreamFadeS
         }
         settled = length
         while (chunks.isNotEmpty()) {
-            now = SystemClock.uptimeMillis()
-            chunks.removeAll { now - it.bornAt >= STREAM_FADE_MS }
+            val tickNow = SystemClock.uptimeMillis()
+            chunks.removeAll { tickNow - it.bornAt >= STREAM_FADE_MS }
+            val next = ArrayList<StreamFadeSpan>(chunks.size)
+            for (c in chunks) {
+                val end = min(c.end, length)
+                val alpha = streamFadeAlpha(tickNow - c.bornAt)
+                if (c.start < end && alpha < 1f) next += StreamFadeSpan(c.start, end, alpha)
+            }
+            // 仅在量化 alpha 真正跨档变化时写 State，避免每 40ms 无变化强制重排整段文本
+            if (next != activeSpans) activeSpans = next
             if (chunks.isEmpty()) break
             delay(STREAM_FADE_TICK_MS)
         }
-    }
-    val spans = ArrayList<StreamFadeSpan>(chunks.size + 1)
-    chunks.forEach { c ->
-        val end = min(c.end, length)
-        val alpha = streamFadeAlpha(now - c.bornAt)
-        if (c.start < end && alpha < 1f) spans += StreamFadeSpan(c.start, end, alpha)
+        if (activeSpans.isNotEmpty()) activeSpans = emptyList()
     }
     // 本帧新到、LaunchedEffect 还没登记的字符：先按 0 渲染，避免「整亮一帧再变暗」的闪烁
-    if (length > settled) spans += StreamFadeSpan(settled, length, 0f)
-    return spans
+    if (length > settled) {
+        return activeSpans + StreamFadeSpan(settled, length, 0f)
+    }
+    return activeSpans
 }
 
 /** 在定稿 AnnotatedString 上叠加尾部淡入与行内光标（光标作为 inline content 跟随最后一个字）。 */

@@ -61,8 +61,10 @@ internal class WorkspaceViewModel(
                 withContext(Dispatchers.IO) { client.answerApproval(sessionId, approvalId, outcome) }
             }.getOrDefault(false)
             if (accepted) {
-                messages.value = messages.value.map { msg ->
-                    if (msg.approvalId == approvalId) applyRequestState(msg, approvalUiStatus(outcome), outcome) else msg
+                if (currentSessionId.value == sessionId) {
+                    messages.value = messages.value.map { msg ->
+                        if (msg.approvalId == approvalId) applyRequestState(msg, approvalUiStatus(outcome), outcome) else msg
+                    }
                 }
                 DshNotifier.cancelApproval(appContext, host, sessionId)
             }
@@ -76,7 +78,7 @@ internal class WorkspaceViewModel(
             val accepted = runCatching {
                 withContext(Dispatchers.IO) { client.answerQuestion(sessionId, rpcId, answer) }
             }.getOrDefault(false)
-            if (accepted) {
+            if (accepted && currentSessionId.value == sessionId) {
                 messages.value = messages.value.map { msg ->
                     if (msg.questionRpcId == rpcId) applyRequestState(msg, REQUEST_RESOLVED, null) else msg
                 }
@@ -179,24 +181,28 @@ internal class WorkspaceViewModel(
         }
     }
 
-    /** 从消息流推导所有会话的 goal 摘要（反向遍历取最新）。 */
+    /** 从消息流推导当前会话的 goal 摘要并增量并入跨会话映射（反向遍历取最新，不覆盖其他会话）。 */
     fun recomputeGoalSummaries(allMessages: List<MobileMessage> = messages.value) {
-        val result = mutableMapOf<String, String>()
-        for (msg in allMessages.asReversed()) {
-            if (msg.role == "goal" && msg.goalSummary != null) {
-                val sid = msg.id.removePrefix("goal-").substringBefore('-').takeIf { it.length >= 8 }
-                if (sid != null) result.putIfAbsent(sid, msg.goalSummary)
+        val sid = currentSessionId.value
+        val latest = latestGoalSummary(allMessages)
+        currentGoalSummary.value = latest
+        if (sid != null) {
+            goalSummaries.value = if (latest != null) {
+                goalSummaries.value + (sid to latest)
+            } else {
+                goalSummaries.value - sid
             }
-        }
-        goalSummaries.value = result
-        currentSessionId.value?.let { sid ->
-            currentGoalSummary.value = result[sid]
-                ?: latestGoalSummary(allMessages)
         }
     }
 
     /** 认证失效回调（由屏幕注册：清凭据 + 跳转设备页）。 */
     var authListener: ((Throwable) -> Unit)? = null
+
+    override fun onCleared() {
+        releaseStream()
+        authListener = null
+        super.onCleared()
+    }
 
     // ===== SSE：VM 持有，Activity 重建不断流（WI-R2） =====
 
@@ -344,9 +350,11 @@ internal class WorkspaceViewModel(
     private var sessionListWriteJob: Job? = null
     private var pendingSessionList: dev.deeplinks.native.util.SessionListSnapshot? = null
 
-    /** S1：冷启动先把缓存的会话列表铺出来（网络数据回来再整体替换）。返回缓存供屏幕补工作区目录。 */
-    fun hydrateFromSessionListCache(): dev.deeplinks.native.util.SessionListSnapshot? {
-        val snapshot = runCatching { repo.sessionListCache.read() }.getOrNull() ?: return null
+    /** S1：冷启动先把缓存的会话列表铺出来（IO 线程读盘 + Keystore 解密，网络数据回来再整体替换）。 */
+    suspend fun hydrateFromSessionListCache(): dev.deeplinks.native.util.SessionListSnapshot? {
+        val snapshot = withContext(Dispatchers.IO) {
+            runCatching { repo.sessionListCache.read() }.getOrNull()
+        } ?: return null
         if (sessions.value.isEmpty() && snapshot.sessions.isNotEmpty()) sessions.value = snapshot.sessions
         if (snapshot.sessions.isNotEmpty()) sessionsInitialLoad.value = false
         return snapshot
@@ -374,7 +382,12 @@ internal class WorkspaceViewModel(
 
     /** 配对解除 / token 失效时删掉该主机的列表缓存。 */
     fun clearSessionListCache() {
-        runCatching { repo.sessionListCache.clear() }
+        sessionListWriteJob?.cancel()
+        viewModelScope.launch(Dispatchers.IO) { runCatching { repo.sessionListCache.clear() } }
+    }
+
+    fun resetSeedMaxSeq(cursor: Long = 0L) {
+        seedMaxSeq.value = cursor.coerceAtLeast(0L)
     }
 
     // ===== 会话历史编排 =====
@@ -450,8 +463,6 @@ internal class WorkspaceViewModel(
                     current.contentSignature() == merged.contentSignature()
                 if (!sameContent) messages.value = merged
                 CrashRecorder.breadcrumb("history", "loaded ${merged.size}")
-                // 同步推导各会话的 goal 摘要（供侧栏 / 顶栏 / 粘性摘要卡消费）
-                recomputeGoalSummaries()
                 sessionStats.value = result.stats
                 sessionControl.applyHistory(result)
                 hasMoreMessages.value = result.hasMore
@@ -537,11 +548,15 @@ internal class WorkspaceViewModel(
 
     // ===== 模型目录 / Agent 预设 / 设置 =====
 
+    private var modelCatalogJob: Job? = null
+    private var modelCatalogGeneration = 0L
+
     fun loadModelCatalog(sessionId: String?, pending: Triple<String, String, String?>?) {
-        if (modelCatalogLoading.value) return
+        val generation = ++modelCatalogGeneration
+        modelCatalogJob?.cancel()
         modelCatalogLoading.value = true
         modelCatalogError.value = null
-        viewModelScope.launch {
+        modelCatalogJob = viewModelScope.launch {
             try {
                 val catalog = if (sessionId == null) {
                     // 草稿态（N2）：没手动选过就用全局默认模型作为「当前选中」，列表才打得开勾。
@@ -557,22 +572,29 @@ internal class WorkspaceViewModel(
                 } else {
                     repo.models(sessionId)
                 }
+                if (generation != modelCatalogGeneration || currentSessionId.value != sessionId) return@launch
                 modelCatalog.value = catalog
                 modelCatalogError.value = null
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                if (modelCatalog.value == null) {
+                if (generation == modelCatalogGeneration && currentSessionId.value == sessionId && modelCatalog.value == null) {
                     modelCatalogError.value = e.message?.takeIf { it.isNotBlank() } ?: L.loadModelListFailed
                 }
             } finally {
-                modelCatalogLoading.value = false
+                if (generation == modelCatalogGeneration) {
+                    modelCatalogLoading.value = false
+                }
             }
         }
     }
 
-    /** 清空模型目录（N2）：进草稿态先清掉上一个会话的目录，避免座位显示旧模型。 */
+    /** 清空模型目录（N2）：进草稿态先清掉上一个会话的目录，并取消在途旧请求，避免座位显示旧模型。 */
     fun resetModelCatalog() {
+        modelCatalogGeneration++
+        modelCatalogJob?.cancel()
+        modelCatalogJob = null
+        modelCatalogLoading.value = false
         modelCatalog.value = null
         modelCatalogError.value = null
     }
@@ -588,18 +610,24 @@ internal class WorkspaceViewModel(
         effort: String?,
         onError: (String) -> Unit,
     ) {
+        val generation = ++modelCatalogGeneration
+        modelCatalogJob?.cancel()
         val optimism = ModelSelectionOptimism(modelCatalog.value)
         modelCatalog.value = optimism.select(provider, model, effort)
         modelCatalogError.value = null
         viewModelScope.launch {
             try {
                 withContext(Dispatchers.IO) { client.selectModel(sessionId, provider, model, effort) }
-                loadModelCatalog(sessionId, null)
+                if (generation == modelCatalogGeneration && currentSessionId.value == sessionId) {
+                    loadModelCatalog(sessionId, null)
+                }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                modelCatalog.value = optimism.rollback()
-                onError(L.switchModelFailed.format(friendlySelectModelError(e.message)))
+                if (generation == modelCatalogGeneration && currentSessionId.value == sessionId) {
+                    modelCatalog.value = optimism.rollback()
+                    onError(L.switchModelFailed.format(friendlySelectModelError(e.message)))
+                }
             }
         }
     }

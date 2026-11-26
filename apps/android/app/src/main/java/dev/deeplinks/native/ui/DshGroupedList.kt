@@ -259,8 +259,6 @@ private fun DshSectionRows(
     content: @Composable () -> Unit,
 ) {
     // v4：平铺列表不画行间线；只有 Tonal（当前电脑这种独立数据块）是容器色块
-    val dividerColor = Color.Transparent
-    val boundaries = remember { mutableListOf<Pair<Float, Float>>() }
     val surface = when (container) {
         DshSectionContainer.Tonal -> Modifier
             .padding(horizontal = DshSpace.s12)
@@ -268,42 +266,12 @@ private fun DshSectionRows(
             .background(Dsh.surface1)
         DshSectionContainer.Card, DshSectionContainer.Flat -> Modifier
     }
-    Layout(
-        content = content,
+    Column(
         modifier = Modifier
             .fillMaxWidth()
-            .then(surface)
-            .drawWithContent {
-                drawContent()
-                val stroke = 0.5.dp.toPx()
-                boundaries.forEach { (y, start) ->
-                    val (x0, x1) = if (layoutDirection == LayoutDirection.Rtl) {
-                        0f to size.width - start
-                    } else {
-                        start to size.width
-                    }
-                    drawLine(dividerColor, Offset(x0, y), Offset(x1, y), strokeWidth = stroke)
-                }
-            },
-    ) { measurables, constraints ->
-        val width = constraints.maxWidth
-        val rowConstraints = constraints.copy(minWidth = width, minHeight = 0)
-        val placeables = measurables.map { it.measure(rowConstraints) }
-        val insets = measurables.map { (it.parentData as? DividerInset)?.start ?: RowPaddingH }
-        val height = placeables.sumOf { it.height }
-        layout(width, height) {
-            boundaries.clear()
-            var y = 0
-            var seenRow = false
-            placeables.forEachIndexed { index, placeable ->
-                if (placeable.height > 0) {
-                    if (seenRow) boundaries += y.toFloat() to insets[index].toPx()
-                    seenRow = true
-                }
-                placeable.placeRelative(0, y)
-                y += placeable.height
-            }
-        }
+            .then(surface),
+    ) {
+        content()
     }
 }
 

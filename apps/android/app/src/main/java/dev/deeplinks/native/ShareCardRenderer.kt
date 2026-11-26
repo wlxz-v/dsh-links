@@ -24,6 +24,7 @@ import java.io.File
  */
 object ShareCardRenderer {
     private const val WIDTH = 1080
+    private const val MAX_HEIGHT = 16_384
     private const val PAD = 56
     private const val GAP = 28
     private const val RADIUS = 28f
@@ -56,7 +57,7 @@ object ShareCardRenderer {
             height += layout.height + 36 + GAP
         }
         height += PAD
-        val bmp = createBitmap(WIDTH, height.toInt().coerceAtLeast(PAD * 4))
+        val bmp = createBitmap(WIDTH, height.toInt().coerceIn(PAD * 4, MAX_HEIGHT))
         val canvas = Canvas(bmp)
         canvas.drawColor(colors.bgBase)
         val barPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = colors.brand }
@@ -73,15 +74,17 @@ object ShareCardRenderer {
         canvas.restore()
         y += metaLayout.height + GAP
         val bubblePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = colors.bubble }
+        val assistantPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = colors.assistantBg }
         bodyLayouts.forEach { (turn, layout) ->
             val bubbleW = layout.width + 40
             val bubbleH = layout.height + 32
+            if (y >= bmp.height) return@forEach
             val left = if (turn.role == "user") (WIDTH - PAD - bubbleW).toFloat() else PAD.toFloat()
             canvas.drawRoundRect(
                 RectF(left, y, left + bubbleW, y + bubbleH),
                 RADIUS,
                 RADIUS,
-                if (turn.role == "user") bubblePaint else Paint(Paint.ANTI_ALIAS_FLAG).apply { color = colors.assistantBg },
+                if (turn.role == "user") bubblePaint else assistantPaint,
             )
             canvas.save()
             canvas.translate(left + 20f, y + 16f)
@@ -92,12 +95,16 @@ object ShareCardRenderer {
         return bmp
     }
 
-    fun sharePng(context: Context, bitmap: Bitmap, title: String, chooserTitle: String) {
+    /** IO 线程写 PNG 并返回 FileProvider URI，避免在主线程执行磁盘清理与无损 PNG 压缩。 */
+    internal fun writeSharePng(context: Context, bitmap: Bitmap): android.net.Uri {
         pruneShareExports(context.cacheDir, System.currentTimeMillis())
         val dir = File(context.cacheDir, "share").apply { mkdirs() }
         val file = File(dir, "$SHARE_EXPORT_PREFIX${System.currentTimeMillis()}.png")
         file.outputStream().use { bitmap.compress(Bitmap.CompressFormat.PNG, 92, it) }
-        val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
+        return FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
+    }
+
+    internal fun launchSharePng(context: Context, uri: android.net.Uri, title: String, chooserTitle: String) {
         val send = Intent(Intent.ACTION_SEND).apply {
             type = "image/png"
             putExtra(Intent.EXTRA_STREAM, uri)
@@ -108,6 +115,11 @@ object ShareCardRenderer {
         context.startActivity(Intent.createChooser(send, chooserTitle).apply {
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         })
+    }
+
+    fun sharePng(context: Context, bitmap: Bitmap, title: String, chooserTitle: String) {
+        val uri = writeSharePng(context, bitmap)
+        launchSharePng(context, uri, title, chooserTitle)
     }
 
     private fun layout(text: String, paint: TextPaint, width: Int): StaticLayout =

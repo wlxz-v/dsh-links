@@ -19,18 +19,23 @@ internal class SessionHistoryCache(
 ) {
     private val dir = File(root, hostDirName(slotKey))
 
-    /** 同一内容不重复写（history 轮询很频繁）。 */
-    private val lastWritten = HashMap<String, Int>()
+    /** 同一内容不重复写（history 轮询很频繁），key 为文件名哈希，随 prune 同步清理。 */
+    private val lastWritten = HashMap<String, String>()
 
+    @Synchronized
     fun read(sessionId: String): HistoryResult? {
         val file = fileFor(sessionId)
         if (!file.isFile) return null
         return try {
-            val plain = codec.decode(file.readBytes()) ?: return null.also { file.delete() }
+            val plain = codec.decode(file.readBytes()) ?: return null.also {
+                lastWritten.remove(file.name)
+                file.delete()
+            }
             file.setLastModified(System.currentTimeMillis())
             val parsed = parseHistoryResponse(org.json.JSONObject(String(plain, Charsets.UTF_8)), beforeSeq = null)
             parsed.copy(messages = sanitizeCachedMessages(parsed.messages))
         } catch (_: Exception) {
+            lastWritten.remove(file.name)
             file.delete()
             null
         }
@@ -43,18 +48,18 @@ internal class SessionHistoryCache(
             remove(sessionId)
             return
         }
-        val hash = rawJson.hashCode()
-        if (lastWritten[sessionId] == hash) return
+        val target = fileFor(sessionId)
+        val digest = sha256(rawJson)
+        if (lastWritten[target.name] == digest) return
         try {
             dir.mkdirs()
-            val target = fileFor(sessionId)
-            val tmp = File(dir, target.name + ".tmp")
+            val tmp = File(dir, "${target.name}.${System.nanoTime()}.tmp")
             tmp.writeBytes(codec.encode(bytes))
             if (!tmp.renameTo(target)) {
                 tmp.delete()
                 return
             }
-            lastWritten[sessionId] = hash
+            lastWritten[target.name] = digest
             prune()
         } catch (_: Exception) {
             // 缓存写失败不影响主流程
@@ -63,8 +68,9 @@ internal class SessionHistoryCache(
 
     @Synchronized
     fun remove(sessionId: String) {
-        lastWritten.remove(sessionId)
-        fileFor(sessionId).delete()
+        val target = fileFor(sessionId)
+        lastWritten.remove(target.name)
+        target.delete()
     }
 
     @Synchronized
@@ -76,7 +82,10 @@ internal class SessionHistoryCache(
     private fun prune() {
         val files = dir.listFiles { f -> f.isFile && f.name.endsWith(SUFFIX) } ?: return
         if (files.size <= MAX_SESSIONS) return
-        files.sortedByDescending { it.lastModified() }.drop(MAX_SESSIONS).forEach { it.delete() }
+        files.sortedByDescending { it.lastModified() }.drop(MAX_SESSIONS).forEach {
+            lastWritten.remove(it.name)
+            it.delete()
+        }
     }
 
     private fun fileFor(sessionId: String) = File(dir, sha256(sessionId).take(32) + SUFFIX)

@@ -57,15 +57,17 @@ object BoundedIo {
 
     fun readLine(stream: InputStream, maxBytes: Int = MAX_SSE_LINE_BYTES): String? {
         val out = ByteArrayOutputStream()
+        var consumed = 0
         while (true) {
             val b = stream.read()
             if (b < 0) {
-                if (out.size() == 0) return null
+                if (consumed == 0) return null
                 break
             }
             if (b == '\n'.code) break
+            consumed++
+            if (consumed > maxBytes) throw IOException("sse line too large")
             if (b != '\r'.code) out.write(b)
-            if (out.size() > maxBytes) throw IOException("sse line too large")
         }
         return out.toString(Charsets.UTF_8.name())
     }

@@ -443,8 +443,8 @@ fun DshTheme(
     // 系统栏图标亮暗随主题联动（背景保持透明，由 enableEdgeToEdge 设置）
     val view = LocalView.current
     if (!view.isInEditMode) {
-        SideEffect {
-            val activity = view.context.findActivity() ?: return@SideEffect
+        LaunchedEffect(isDark, colors.bgBase, recentsLabel) {
+            val activity = view.context.findActivity() ?: return@LaunchedEffect
             val window = activity.window
             val controller = WindowCompat.getInsetsController(window, view)
             controller.isAppearanceLightStatusBars = !isDark
@@ -466,11 +466,29 @@ fun DshTheme(
         }
     }
 
-    val materialColors = dshColorScheme(colors)
+    val materialColors = remember(colors) { dshColorScheme(colors) }
 
     val baseDensity = LocalDensity.current
     val fontMultiplier = fontScaleMultiplier(FontScaleManager.currentScale)
+    val effectiveDensity = remember(baseDensity.density, baseDensity.fontScale, fontMultiplier) {
+        Density(
+            density = baseDensity.density,
+            fontScale = baseDensity.fontScale * fontMultiplier,
+        )
+    }
     val typography = remember { dshTypography() }
+    val rippleIndication = dshRipple()
+    val rippleConfig = remember(colors.labelPrimary) {
+        RippleConfiguration(
+            color = colors.labelPrimary,
+            rippleAlpha = RippleAlpha(
+                draggedAlpha = 0.08f,
+                focusedAlpha = 0.08f,
+                hoveredAlpha = 0.04f,
+                pressedAlpha = 0.06f,
+            ),
+        )
+    }
     MaterialTheme(
         colorScheme = materialColors,
         typography = typography,
@@ -480,22 +498,11 @@ fun DshTheme(
             LocalDshColors provides colors,
             LocalDshStrings provides strings,
             LocalTextStyle provides typography.bodyMedium,
-            LocalDensity provides Density(
-                density = baseDensity.density,
-                fontScale = baseDensity.fontScale * fontMultiplier,
-            ),
+            LocalDensity provides effectiveDensity,
         ) {
             CompositionLocalProvider(
-                LocalIndication provides dshRipple(),
-                LocalRippleConfiguration provides RippleConfiguration(
-                    color = colors.labelPrimary,
-                    rippleAlpha = RippleAlpha(
-                        draggedAlpha = 0.08f,
-                        focusedAlpha = 0.08f,
-                        hoveredAlpha = 0.04f,
-                        pressedAlpha = 0.06f,
-                    ),
-                ),
+                LocalIndication provides rippleIndication,
+                LocalRippleConfiguration provides rippleConfig,
             ) {
                 content()
             }

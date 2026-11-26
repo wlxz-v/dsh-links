@@ -26,6 +26,7 @@ object LocalCacheCrypto : ByteCodec {
     private const val KEY_ALIAS = "dsh_local_cache_key_v1"
     private const val GCM_TAG_BITS = 128
     private const val IV_BYTES = 12
+    @Volatile private var cachedKey: SecretKey? = null
 
     override fun encode(plain: ByteArray): ByteArray {
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
@@ -40,14 +41,19 @@ object LocalCacheCrypto : ByteCodec {
             cipher.init(Cipher.DECRYPT_MODE, key(), GCMParameterSpec(GCM_TAG_BITS, blob, 0, IV_BYTES))
             cipher.doFinal(blob, IV_BYTES, blob.size - IV_BYTES)
         } catch (_: Exception) {
+            cachedKey = null
             null
         }
     }
 
     @Synchronized
     private fun key(): SecretKey {
+        cachedKey?.let { return it }
         val keyStore = KeyStore.getInstance(KEYSTORE).apply { load(null) }
-        (keyStore.getKey(KEY_ALIAS, null) as? SecretKey)?.let { return it }
+        (keyStore.getKey(KEY_ALIAS, null) as? SecretKey)?.let {
+            cachedKey = it
+            return it
+        }
         val generator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, KEYSTORE)
         generator.init(
             KeyGenParameterSpec.Builder(KEY_ALIAS, KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT)
@@ -56,6 +62,6 @@ object LocalCacheCrypto : ByteCodec {
                 .setKeySize(256)
                 .build(),
         )
-        return generator.generateKey()
+        return generator.generateKey().also { cachedKey = it }
     }
 }

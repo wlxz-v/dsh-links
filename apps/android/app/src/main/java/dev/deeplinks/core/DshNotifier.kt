@@ -21,8 +21,9 @@ import java.util.concurrent.ConcurrentHashMap
  * 纯函数：根据设置与 SDK 版本决定审批通知里要挂几个 action，以及每个 action 是不是「允许」。
  * v4 8.2：默认不挂动作，只能点开 App；打开「允许在通知栏直接批准」且系统支持时才给「拒绝 / 允许一次」。
  */
-internal fun approvalActionKinds(quickApprove: Boolean, sdkInt: Int): List<Boolean> =
-    if (quickApprove && sdkInt >= Build.VERSION_CODES.S) listOf(false, true) else emptyList()
+internal fun approvalActionKinds(quickApprove: Boolean, sdkInt: Int): List<Boolean> {
+    return if (quickApprove && sdkInt >= Build.VERSION_CODES.S) listOf(false, true) else emptyList()
+}
 
 /**
  * DSH 会话事件系统通知：审批请求（会话在后台等你处理）与任务完成 / 已停止。
@@ -57,6 +58,17 @@ object DshNotifier {
 
     private fun channelOf(id: String, name: String, desc: String, importance: Int): NotificationChannel =
         NotificationChannel(id, name, importance).apply { description = desc }
+
+    /** 前台服务启动即发现会话/主机已失效时用于合规调用 startForeground() 后立即 stopSelf() 的静默占位通知。 */
+    internal fun stoppingMonitorNotification(context: Context): Notification {
+        ensureChannel(context)
+        return NotificationCompat.Builder(context, CHANNEL_ID_MONITOR)
+            .setSmallIcon(R.drawable.ic_stat_dsh)
+            .setContentTitle(L.notifChannelMonitor)
+            .setSilent(true)
+            .setOngoing(false)
+            .build()
+    }
 
     /** Required by Android while a user-started conversation is monitored in the background. */
     internal fun taskMonitorNotification(context: Context, host: Host, sessionId: String, snapshot: TaskProgressSnapshot): Notification {

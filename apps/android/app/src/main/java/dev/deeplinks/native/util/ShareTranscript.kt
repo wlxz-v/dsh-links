@@ -10,6 +10,9 @@ const val SHARE_MAX_TURNS = 8
 const val SHARE_MAX_CHARS_PER_TURN = 420
 
 private val CLOSED_FENCE = Regex("```[^\\n]*\\n?[\\s\\S]*?```")
+private val HORIZONTAL_WS = Regex("[ \\t]+")
+private val EXCESS_NEWLINES = Regex("\\n{3,}")
+private val FENCE_MARKER = Regex("```")
 
 /** 分享卡片用：去掉未闭合围栏、折叠代码/图为占位，再截断。 */
 fun flattenShareText(
@@ -24,15 +27,15 @@ fun flattenShareText(
         if (header.startsWith("mermaid")) strings.shareFenceDiagram else strings.shareFenceCode
     }
     val collapsed = placeholders
-        .replace(Regex("[ \\t]+"), " ")
-        .replace(Regex("\\n{3,}"), "\n\n")
+        .replace(HORIZONTAL_WS, " ")
+        .replace(EXCESS_NEWLINES, "\n\n")
         .trim()
     if (collapsed.length <= maxChars) return collapsed
     return collapsed.take(maxChars - 1).trimEnd() + "…"
 }
 
 fun stripIncompleteFence(text: String): String {
-    val count = Regex("```").findAll(text).count()
+    val count = FENCE_MARKER.findAll(text).count()
     if (count % 2 == 0) return text
     val last = text.lastIndexOf("```")
     return if (last >= 0) text.substring(0, last).trimEnd() else text

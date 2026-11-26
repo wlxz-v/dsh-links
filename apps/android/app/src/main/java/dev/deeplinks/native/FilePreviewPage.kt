@@ -73,8 +73,9 @@ internal fun FilePreviewPage(
     val copiedNotice = DshS.filePathCopied
     val subtitle = remember(path, body) {
         val dir = path.trim().substringBeforeLast('/', missingDelimiterValue = "")
-        listOfNotNull(dir.ifEmpty { null }, formatFileSize(body.encodeToByteArray().size.toLong())).joinToString(" · ")
+        listOfNotNull(dir.ifEmpty { null }, formatFileSize(utf8ByteLength(body))).joinToString(" · ")
     }
+    val chunks = remember(body) { chunkPreviewLines(body) }
     Column(Modifier.fillMaxSize().background(Dsh.bgBase).systemBarsPadding()) {
         DlTopBar(
             title = producedFileName(path),
@@ -85,15 +86,21 @@ internal fun FilePreviewPage(
         )
         Box(Modifier.weight(1f).fillMaxWidth().horizontalScroll(rememberScrollState())) {
             SelectionContainer {
-                Text(
-                    body,
-                    color = Dsh.labelPrimary,
-                    style = DshType.supporting.copy(fontFamily = FontFamily.Monospace),
-                    softWrap = false,
-                    modifier = Modifier
-                        .verticalScroll(rememberScrollState())
-                        .padding(horizontal = DshSpace.s16, vertical = DshSpace.s12),
-                )
+                androidx.compose.foundation.lazy.LazyColumn(
+                    contentPadding = androidx.compose.foundation.layout.PaddingValues(
+                        horizontal = DshSpace.s16,
+                        vertical = DshSpace.s12,
+                    ),
+                ) {
+                    items(chunks.size, key = { it }) { index ->
+                        Text(
+                            chunks[index],
+                            color = Dsh.labelPrimary,
+                            style = DshType.supporting.copy(fontFamily = FontFamily.Monospace),
+                            softWrap = false,
+                        )
+                    }
+                }
             }
         }
         HorizontalDivider(color = Dsh.outline)
@@ -125,6 +132,45 @@ internal fun FilePreviewPage(
 internal fun copyWorkspacePath(context: Context, path: String) {
     val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager ?: return
     clipboard.setPrimaryClip(ClipData.newPlainText("workspace path", path))
+}
+
+internal fun utf8ByteLength(s: String): Long {
+    var total = 0L
+    var i = 0
+    while (i < s.length) {
+        val cp = s.codePointAt(i)
+        total += when {
+            cp <= 0x7F -> 1L
+            cp <= 0x7FF -> 2L
+            cp <= 0xFFFF -> 3L
+            else -> 4L
+        }
+        i += Character.charCount(cp)
+    }
+    return total
+}
+
+internal fun chunkPreviewLines(body: String, linesPerChunk: Int = 50): List<String> {
+    if (body.isEmpty()) return listOf("")
+    val out = ArrayList<String>()
+    val sb = StringBuilder()
+    var count = 0
+    var start = 0
+    while (start <= body.length) {
+        val nl = body.indexOf('\n', start)
+        val end = if (nl < 0) body.length else nl
+        if (count > 0) sb.append('\n')
+        sb.append(body, start, end)
+        count++
+        if (count >= linesPerChunk || nl < 0) {
+            out += sb.toString()
+            sb.setLength(0)
+            count = 0
+        }
+        if (nl < 0) break
+        start = nl + 1
+    }
+    return out
 }
 
 private fun shareFileText(context: Context, path: String, body: String) {

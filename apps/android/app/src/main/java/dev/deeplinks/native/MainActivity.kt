@@ -94,6 +94,7 @@ class MainActivity : ComponentActivity() {
         if (!isGranted) {
             voiceError?.invoke(L.voicePermissionRequired)
             voiceIdle?.invoke()
+            clearVoiceCallbacks()
             return@registerForActivityResult
         }
         val onResult = voiceResult
@@ -111,14 +112,31 @@ class MainActivity : ComponentActivity() {
         enableDshEdgeToEdge()
         incomingIntent.value = intent
         hostNotice.value = intent.getStringExtra(EXTRA_AUTH_NOTICE)
-        launchRoute = resolveLaunchRoute(applicationContext, intent)
-        // 设置页也带主机上下文（SettingsActivity 兼容壳转发时经 Intent 传入）
-        launchHost = if (launchRoute == AppRoute.WORKSPACE || launchRoute == AppRoute.SETTINGS) {
-            resolveLaunchHost(applicationContext, intent)
+        val isLocked = HostStore.isLocked(applicationContext)
+        val loadResult = if (isLocked) HostLoadResult.Undecryptable else HostStore.loadResult(applicationContext)
+        val loadedHosts = (loadResult as? HostLoadResult.Ok)?.hosts.orEmpty()
+        val resolvedHost = if (loadResult is HostLoadResult.Ok) {
+            pickStartupHost(
+                hosts = loadedHosts,
+                intentHost = loadedHosts.resolveFromIntentStrict(intent),
+                lastIdentity = HostStore.lastHostIdentity(applicationContext),
+            )
         } else {
             null
         }
-        initSpeechRecognizer()
+        launchRoute = intent.getStringExtra(EXTRA_START_ROUTE)?.takeIf { it.isNotBlank() } ?: when {
+            isLocked -> AppRoute.DEVICES
+            else -> when (resolveStartSurface(resolvedHost, loadResult is HostLoadResult.Undecryptable)) {
+                DshStartSurface.Workspace -> AppRoute.WORKSPACE
+                DshStartSurface.Devices -> AppRoute.DEVICES
+            }
+        }
+        // 设置页也带主机上下文（SettingsActivity 兼容壳转发时经 Intent 传入）
+        launchHost = if (launchRoute == AppRoute.WORKSPACE || launchRoute == AppRoute.SETTINGS) {
+            resolvedHost
+        } else {
+            null
+        }
 
         setContent {
             DshTheme {
@@ -145,10 +163,22 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun initSpeechRecognizer() {
-        if (SpeechRecognizer.isRecognitionAvailable(this)) {
-            speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this)
+    private var speechInitAttempted = false
+
+    private fun ensureSpeechRecognizer(): SpeechRecognizer? {
+        if (!speechInitAttempted) {
+            speechInitAttempted = true
+            if (SpeechRecognizer.isRecognitionAvailable(this)) {
+                speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this)
+            }
         }
+        return speechRecognizer
+    }
+
+    private fun clearVoiceCallbacks() {
+        voiceIdle = null
+        voiceError = null
+        voiceResult = null
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -163,9 +193,11 @@ class MainActivity : ComponentActivity() {
         voiceIdle = onIdle
         voiceError = onError
         voiceResult = onResult
-        if (speechRecognizer == null) {
+        val recognizer = ensureSpeechRecognizer()
+        if (recognizer == null) {
             onError(L.voiceUnavailable)
             onIdle()
+            clearVoiceCallbacks()
             return
         }
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
@@ -179,7 +211,7 @@ class MainActivity : ComponentActivity() {
             putExtra(RecognizerIntent.EXTRA_PROMPT, L.voiceListeningPrompt)
         }
 
-        speechRecognizer?.setRecognitionListener(object : RecognitionListener {
+        recognizer.setRecognitionListener(object : RecognitionListener {
             override fun onReadyForSpeech(params: Bundle?) {}
             override fun onBeginningOfSpeech() {}
             override fun onRmsChanged(rmsdB: Float) {}
@@ -195,6 +227,7 @@ class MainActivity : ComponentActivity() {
                     VoiceRecognitionIssue.RETRY -> L.voiceRecognitionRetry
                 }
                 onError(message)
+                clearVoiceCallbacks()
             }
             override fun onResults(results: Bundle?) {
                 onIdle()
@@ -204,15 +237,18 @@ class MainActivity : ComponentActivity() {
                 } else {
                     onError(L.voiceNoSpeech)
                 }
+                clearVoiceCallbacks()
             }
             override fun onPartialResults(partialResults: Bundle?) {}
             override fun onEvent(eventType: Int, params: Bundle?) {}
         })
-        speechRecognizer?.startListening(intent)
+        recognizer.startListening(intent)
     }
 
     override fun onDestroy() {
+        clearVoiceCallbacks()
         super.onDestroy()
         speechRecognizer?.destroy()
+        speechRecognizer = null
     }
 }

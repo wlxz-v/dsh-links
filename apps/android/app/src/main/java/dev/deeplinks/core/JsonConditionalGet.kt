@@ -55,7 +55,12 @@ internal fun conditionalJsonGet(
             JsonHttpCache.invalidate(cacheKey)
             return ConditionalJsonGet(code, text)
         }
-        response.header("etag")?.let { etag -> JsonHttpCache.put(cacheKey, etag, text) }
+        val etag = response.header("etag")?.takeIf { it.isNotBlank() }
+        if (etag != null) {
+            JsonHttpCache.put(cacheKey, etag, text)
+        } else {
+            JsonHttpCache.invalidate(cacheKey)
+        }
         return ConditionalJsonGet(code, text)
     }
 }

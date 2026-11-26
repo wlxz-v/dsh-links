@@ -11,8 +11,10 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import org.json.JSONObject
 import org.json.JSONTokener
-import java.nio.IntBuffer
+import java.io.ByteArrayInputStream
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 
 /**
  * 收紧渲染不受信内容的离屏 WebView（Mermaid / KaTeX）。
@@ -78,8 +80,8 @@ internal fun createOffscreenWebView(
     onPageFinished: () -> Unit,
 ): WebView {
     val density = context.resources.displayMetrics.density
-    val width = (cssWidth * density).toInt()
-    val height = (cssHeight * density).toInt()
+    val width = (cssWidth * density).toInt().coerceIn(1, MAX_OFFSCREEN_WEBVIEW_EDGE)
+    val height = (cssHeight * density).toInt().coerceIn(1, MAX_OFFSCREEN_WEBVIEW_EDGE)
     val wv = WebView(context)
     wv.hardenLocalBundleSettings()
     wv.setBackgroundColor(android.graphics.Color.TRANSPARENT)
@@ -107,8 +109,8 @@ internal fun createOffscreenWebView(
             // 公式/图表全部静默失败（「合法公式应渲染成功」）。主框架 data: 放行，
             // 子资源仍受页面 CSP（default-src 'none'）与本拦截器约束。
             if (request.isForMainFrame && url.startsWith("data:")) return null
-            return if (url.startsWith("file:///android_asset/")) null
-            else WebResourceResponse("text/plain", "utf-8", 403, "blocked", emptyMap(), null)
+            return if (isSafeLocalAssetUrl(url)) null
+            else WebResourceResponse("text/plain", "utf-8", 403, "blocked", emptyMap(), ByteArrayInputStream(ByteArray(0)))
         }
 
         override fun onReceivedError(
@@ -139,9 +141,21 @@ internal fun parseJsResult(json: String?): JSONObject? {
     return runCatching { JSONObject(JSONTokener(json).nextValue().toString()) }.getOrNull()
 }
 
+private const val MAX_OFFSCREEN_WEBVIEW_EDGE = 2048
+
+internal fun isSafeLocalAssetUrl(url: String): Boolean {
+    if (!url.startsWith("file:///android_asset/")) return false
+    val path = url.removePrefix("file:///android_asset/").substringBefore('?').substringBefore('#')
+    if (path.contains('\\') || path.contains("%5c", ignoreCase = true) || path.contains("%2e", ignoreCase = true)) {
+        return false
+    }
+    return path.split('/').none { it == ".." || it == "." }
+}
+
 /**
  * 把离屏 WebView 绘制成位图。离屏 WebView 无 UI 循环：draw 回调后合成器可能还没提交
  * 可见帧，因此检测非全透明像素，空帧则延时重画（最多 [attempts] 轮）。
+ * 像素扫描切到 Default 线程并按行复用缓冲，避免在主线程分配与遍历整幅 16~32MB 数组。
  */
 internal suspend fun drawWebViewToBitmap(
     wv: WebView,
@@ -151,14 +165,28 @@ internal suspend fun drawWebViewToBitmap(
     offsetY: Int,
     attempts: Int = 4,
 ): Bitmap? {
+    if (physWidth !in 1..MAX_OFFSCREEN_WEBVIEW_EDGE || physHeight !in 1..MAX_OFFSCREEN_WEBVIEW_EDGE) return null
     repeat(attempts) { attempt ->
         val bmp = Bitmap.createBitmap(physWidth, physHeight, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(bmp)
         canvas.translate(-offsetX.toFloat(), -offsetY.toFloat())
         wv.draw(canvas)
-        val pixels = IntArray(physWidth * physHeight)
-        bmp.copyPixelsToBuffer(IntBuffer.wrap(pixels))
-        if (pixels.any { (it ushr 24) != 0 }) return bmp
+        val hasOpaque = withContext(Dispatchers.Default) {
+            val row = IntArray(physWidth)
+            var found = false
+            for (y in 0 until physHeight) {
+                bmp.getPixels(row, 0, physWidth, 0, y, physWidth, 1)
+                for (px in row) {
+                    if ((px ushr 24) != 0) {
+                        found = true
+                        break
+                    }
+                }
+                if (found) break
+            }
+            found
+        }
+        if (hasOpaque) return bmp
         bmp.recycle()
         if (attempt < attempts - 1) delay(200L)
     }

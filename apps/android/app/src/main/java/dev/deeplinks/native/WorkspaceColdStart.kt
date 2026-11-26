@@ -9,6 +9,8 @@ import dev.deeplinks.core.Host
 import dev.deeplinks.core.HostStore
 import dev.deeplinks.core.StartupTrace
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 /**
  * 冷启动相关的前台副作用（第三轮 S1 / S7 从 WorkspaceScreen 抽出）：
@@ -78,8 +80,10 @@ internal suspend fun WorkspaceViewModel.runColdStartBootstrap(
         sessionControl.supported.value = boot.sessionControl
         previewSupported.value = boot.preview
         previewDetect.value = boot.previewDetect
-        // 远程能力补齐 / 清除（bootstrap 的 remote，RFC §6.4）
-        if (refreshed != host) runCatching { HostStore.upsert(context, refreshed) }
+        // 远程能力补齐 / 清除（bootstrap 的 remote，RFC §6.4）；落盘切 IO 避免主线程 Keystore + commit
+        if (refreshed != host) {
+            withContext(Dispatchers.IO) { runCatching { HostStore.upsert(context, refreshed) } }
+        }
         // Bootstrap carries the same durable archive set as Web. Apply it before selecting a session,
         // so an archived Web session cannot flash back into the App during cold start.
         val nextArchivedIds = if (boot.archiveSnapshotAvailable) {

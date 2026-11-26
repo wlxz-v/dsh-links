@@ -23,6 +23,9 @@ internal fun diagnosticsRunnerFor(host: Host, lanUrls: List<String>): Diagnostic
         probeRemote = {
             if (!host.hasRemote) {
                 RemoteHit(RemoteProbeStatus.UNCONFIGURED)
+            } else if (host.token.isBlank()) {
+                // 本地无 token 时未发网络请求，不可把本地返回的 Unauthorized 误判成远程可达
+                RemoteHit(RemoteProbeStatus.DOWN)
             } else {
                 val fetched = fetchDiagnostics(host, HostRoute.REMOTE)
                 remoteFetch = fetched
@@ -72,7 +75,9 @@ internal fun fetchDiagnostics(host: Host, forceRoute: HostRoute?): DiagnosticsFe
             forceRoute = forceRoute,
         ).use { response ->
             val code = response.code
-            val text = response.body.string().take(MAX_BODY)
+            val text = response.body.byteStream().use { stream ->
+                runCatching { BoundedIo.readText(stream, MAX_BODY) }.getOrDefault("")
+            }
             when (code) {
                 in 200..299 -> DiagnosticsFetch.Ok(parseDiagnosticsChecks(text))
                 401, 403 -> DiagnosticsFetch.Unauthorized

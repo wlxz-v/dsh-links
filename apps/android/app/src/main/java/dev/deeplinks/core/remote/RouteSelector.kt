@@ -86,11 +86,13 @@ class RouteSelector(
         probeDirect: (String) -> Boolean,
     ): List<HostRoute> {
         if (!hasRemote) {
+            val nonBlank = candidates.filter { it.isNotBlank() }
+            if (nonBlank.size <= 1) return listOf(HostRoute.LAN)
             fresh(key)?.let { return listOf(HostRoute.LAN) }
             val lock = locks.computeIfAbsent(key) { Any() }
             synchronized(lock) {
                 fresh(key)?.let { return listOf(HostRoute.LAN) }
-                remember(key, HostRoute.LAN, firstDirect(candidates, probeDirect), LAN_TTL_MS)
+                remember(key, HostRoute.LAN, firstDirect(nonBlank, probeDirect), LAN_TTL_MS)
                 return listOf(HostRoute.LAN)
             }
         }

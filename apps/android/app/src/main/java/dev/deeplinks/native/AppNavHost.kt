@@ -104,7 +104,12 @@ internal fun AppNavHost(
 
     LaunchedEffect(requestedRoute) {
         if (requestedRoute != null) {
-            navController.navigate(requestedRoute) { launchSingleTop = true }
+            navController.navigate(requestedRoute) {
+                launchSingleTop = true
+                if (requestedRoute == AppRoute.WORKSPACE) {
+                    popUpTo(AppRoute.DEVICES) { inclusive = true }
+                }
+            }
             onRouteHandled()
         }
     }
@@ -127,16 +132,20 @@ internal fun AppNavHost(
     // 站内转场时长：在可组合作用域捕获（enter/pop 各 lambda 非 @Composable，不能现调 motionDuration）
     val navMotionMs = motionDuration(DshDuration.slow)
 
-    /** 配对结果落库；锁定（旧记录不可读）时清锁重写。返回是否成功。 */
-    fun persistPairHost(host: Host, onError: (String) -> Unit): Boolean {
-        if (HostStore.upsert(context, host)) return true
-        if (HostStore.isLocked(context)) {
-            HostStore.clearLockAndReplace(context, host)
-            onHostNotice(L.credentialsResetToast)
-            return true
+    /** 配对结果落库（IO 线程，避免主线程 Keystore + commit）；锁定（旧记录不可读）时清锁重写。返回是否成功。 */
+    suspend fun persistPairHost(host: Host, onError: (String) -> Unit): Boolean {
+        val (saved, resetLocked) = withContext(Dispatchers.IO) {
+            if (HostStore.upsert(context, host)) {
+                true to false
+            } else if (HostStore.isLocked(context)) {
+                HostStore.clearLockAndReplace(context, host) to true
+            } else {
+                false to false
+            }
         }
-        onError(L.credentialsSaveFailedToast)
-        return false
+        if (resetLocked && saved) onHostNotice(L.credentialsResetToast)
+        if (!saved) onError(L.credentialsSaveFailedToast)
+        return saved
     }
 
     /**
@@ -199,18 +208,12 @@ internal fun AppNavHost(
                 showsBack = navController.previousBackStackEntry != null,
                 onNavigateBack = { navController.popBackStack() },
                 onOpenHost = { host, onDone ->
-                    // 可达性与会话加载交给 Workspace 的 bootstrap。
-                    val saved = HostStore.upsert(context, host)
-                    if (!saved && HostStore.isLocked(context)) {
-                        HostStore.clearLockAndReplace(context, host)
-                        onHostNotice(L.credentialsResetToast)
-                    } else if (!saved) {
-                        onDone(false)
-                        onHostNotice(L.credentialsSaveFailedToast)
-                        return@DevicesScreen
+                    // 可达性与会话加载交给 Workspace 的 bootstrap；落盘切 IO 避免阻塞主线程。
+                    scope.launch {
+                        val saved = persistPairHost(host) { onHostNotice(it) }
+                        onDone(saved)
+                        if (saved) openWorkspace()
                     }
-                    onDone(true)
-                    openWorkspace()
                 },
                 onHostChanged = { reloadHost() },
                 onScanClick = onScan,
@@ -248,7 +251,8 @@ internal fun AppNavHost(
                 } else {
                     null
                 }
-                key(host.slotKey) {
+                val hostSessionKey = "${host.slotKey}|${host.token.hashCode()}|${host.certFingerprint}|${host.remoteEndpoint}|${host.remoteRouteId}|${host.tailnetUrl}"
+                key(hostSessionKey) {
                     WorkspaceScreen(
                         host = host,
                         initialSessionId = deepLinkSessionId,
@@ -276,11 +280,11 @@ internal fun AppNavHost(
                             if (notice.isNullOrBlank()) {
                                 deviceSheetOpen = true
                             } else {
-                                // 凭据失效：配对已不可用，整页设备页负责重新配对
+                                // 凭据失效：配对已不可用，清掉整个返回栈再进设备页重新配对
                                 onHostNotice(notice)
                                 navController.navigate(AppRoute.DEVICES) {
                                     launchSingleTop = true
-                                    popUpTo(AppRoute.DEVICES) { inclusive = true }
+                                    popUpTo(0) { inclusive = true }
                                 }
                             }
                         },

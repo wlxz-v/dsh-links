@@ -146,17 +146,22 @@ fun motionDuration(ms: Int): Int = if (isReduceMotionEnabled()) 0 else ms
  * 无限旋转角度：reduce-motion 时返回 null（调用方渲染静态图标）。
  * 对应 Web CSS `animation: spin .8s linear infinite`。
  */
+/** 无限旋转角度 State：调用方在 graphicsLayer 内读 value，避免每帧触发组合阶段重组。 */
 @Composable
-fun rememberMotionSpin(periodMs: Int, label: String = "spin"): Float? {
+fun rememberMotionSpinState(periodMs: Int, label: String = "spin"): State<Float>? {
     if (isReduceMotionEnabled()) return null
     val transition = rememberInfiniteTransition(label = label)
     return transition.animateFloat(
         initialValue = 0f,
         targetValue = 360f,
         animationSpec = infiniteRepeatable(tween(periodMs, easing = LinearEasing)),
-        label = label
-    ).value
+        label = label,
+    )
 }
+
+@Composable
+fun rememberMotionSpin(periodMs: Int, label: String = "spin"): Float? =
+    rememberMotionSpinState(periodMs, label)?.value
 
 /** Dialog 进出场动画的渲染层状态：只读值走 graphicsLayer，关闭走 [requestDismiss]。 */
 class DshDialogMotion(

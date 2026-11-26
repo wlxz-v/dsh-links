@@ -112,17 +112,18 @@ internal fun shareConversationAsImage(
     scope.launch(Dispatchers.IO) {
         try {
             val turns = selectShareTurns(loadSessionMessagesForExport(client, sessionId))
+            if (turns.isEmpty()) {
+                withContext(Dispatchers.Main) { onError(L.shareConversationEmpty) }
+                return@launch
+            }
+            val bitmap: Bitmap = ShareCardRenderer.render(title, turns, dark, "DeepLinks")
+            val uri = try {
+                ShareCardRenderer.writeSharePng(context, bitmap)
+            } finally {
+                bitmap.recycle()
+            }
             withContext(Dispatchers.Main) {
-                if (turns.isEmpty()) {
-                    onError(L.shareConversationEmpty)
-                } else {
-                    val bitmap: Bitmap = ShareCardRenderer.render(title, turns, dark, "DeepLinks")
-                    try {
-                        ShareCardRenderer.sharePng(context, bitmap, title, L.shareConversationImage)
-                    } finally {
-                        bitmap.recycle()
-                    }
-                }
+                ShareCardRenderer.launchSharePng(context, uri, title, L.shareConversationImage)
             }
         } catch (e: kotlinx.coroutines.CancellationException) {
             throw e

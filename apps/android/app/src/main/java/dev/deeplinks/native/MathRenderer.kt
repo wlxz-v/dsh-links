@@ -116,19 +116,34 @@ object MathRenderer {
      * 真机白屏无响应）。
      */
     fun resetForTests() {
-        webView?.destroy()
-        webView = null
-        pageReady = null
+        trimMemory(releaseWebView = true)
+    }
+
+    /** 内存紧张或退到后台时释放公式位图缓存；需要时销毁离屏 WebView（下次渲染自动懒建）。 */
+    fun trimMemory(releaseWebView: Boolean = false) {
         synchronized(cacheLock) {
             cache.clear()
             cachePixels = 0L
             failures.clear()
             inFlight.clear()
         }
+        if (releaseWebView) {
+            mainHandler.post {
+                webView?.destroy()
+                webView = null
+                pageReady = null
+            }
+        }
     }
 
     private fun cacheKey(latex: String, cssFontPx: Float, colorArgb: Int, displayMode: Boolean) =
         "$latex\u0000$cssFontPx\u0000$colorArgb\u0000$displayMode"
+
+    /** 只读缓存查询（供块级公式 remember 使用，避免与 LaunchedEffect 双重触发）。 */
+    internal fun cached(latex: String, cssFontPx: Float, colorArgb: Int, displayMode: Boolean = false): Rendered? {
+        val key = cacheKey(latex, cssFontPx, colorArgb, displayMode)
+        return synchronized(cacheLock) { cache[key] }
+    }
 
     /** 缓存优先；未命中且未在渲染中则后台排队，完成或失败后 bumpRevision()。 */
     fun peek(latex: String, cssFontPx: Float, colorArgb: Int, displayMode: Boolean = false): Rendered? {
@@ -346,11 +361,10 @@ fun LatexDisplayBlock(latex: String, modifier: Modifier = Modifier) {
     val context = LocalContext.current
     val density = LocalDensity.current
     SideEffect { MathRenderer.attach(context.applicationContext) }
-    val revision = MathRenderer.revision
-    var rendered by remember(latex, color, revision) {
-        mutableStateOf(MathRenderer.peek(latex, MathRenderer.DISPLAY_FONT_CSS_PX, color.toArgb(), displayMode = true))
+    var rendered by remember(latex, color) {
+        mutableStateOf(MathRenderer.cached(latex, MathRenderer.DISPLAY_FONT_CSS_PX, color.toArgb(), displayMode = true))
     }
-    LaunchedEffect(latex, color, revision) {
+    LaunchedEffect(latex, color) {
         if (rendered == null) {
             rendered = MathRenderer.render(latex, MathRenderer.DISPLAY_FONT_CSS_PX, color.toArgb(), displayMode = true)
         }

@@ -30,6 +30,8 @@ class DshApplication : Application(), SingletonImageLoader.Factory {
         PrivacySafeDiagnostics.install(dev.deeplinks.BuildConfig.DEBUG)
         val app = this
         Thread({
+            // 错开冷启动首帧，避免与主界面 SharedPreferences / OkHttp 初始化抢 CPU
+            runCatching { Thread.sleep(2_500L) }
             dev.deeplinks.core.UpdateChecker.checkBlocking(app, dev.deeplinks.BuildConfig.VERSION_NAME)
         }, "update-check").apply { isDaemon = true }.start()
         // S7：启动打点从进程最早期开始。
@@ -54,29 +56,43 @@ class DshApplication : Application(), SingletonImageLoader.Factory {
         runCatching {
             cm.registerDefaultNetworkCallback(object : ConnectivityManager.NetworkCallback() {
                 override fun onAvailable(network: Network) {
-                    val action = networkChangeAction(defaultHandle, network.networkHandle, defaultAddrs, defaultAddrs)
-                    defaultHandle = network.networkHandle
-                    defaultAddrs = emptySet()
+                    val action = synchronized(networkLock) {
+                        val a = networkChangeAction(defaultHandle, network.networkHandle, defaultAddrs, defaultAddrs)
+                        defaultHandle = network.networkHandle
+                        defaultAddrs = emptySet()
+                        a
+                    }
                     applyNetworkAction(action, cm)
                 }
 
                 override fun onLost(network: Network) {
-                    val action = networkChangeAction(defaultHandle, null, defaultAddrs, emptySet())
-                    defaultHandle = null
-                    defaultAddrs = emptySet()
+                    val action = synchronized(networkLock) {
+                        // Wi-Fi/蜂窝切换时系统常先派发新网 onAvailable 再派发旧网 onLost；
+                        // 只处理当前活动默认网的丢失，避免误杀刚建立的新网络连接池。
+                        if (defaultHandle != null && network.networkHandle != defaultHandle) return
+                        val a = networkChangeAction(defaultHandle, null, defaultAddrs, emptySet())
+                        defaultHandle = null
+                        defaultAddrs = emptySet()
+                        a
+                    }
                     applyNetworkAction(action, cm)
                 }
 
                 override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
                     val addrs = linkProperties.linkAddresses.mapNotNull { it.address?.hostAddress }.toSet()
-                    val action = networkChangeAction(defaultHandle, network.networkHandle, defaultAddrs, addrs)
-                    defaultAddrs = addrs
+                    val action = synchronized(networkLock) {
+                        val a = networkChangeAction(defaultHandle, network.networkHandle, defaultAddrs, addrs)
+                        defaultHandle = network.networkHandle
+                        defaultAddrs = addrs
+                        a
+                    }
                     applyNetworkAction(action, cm)
                 }
             })
         }
     }
 
+    private val networkLock = Any()
     private var defaultHandle: Long? = null
     private var defaultAddrs: Set<String> = emptySet()
 
@@ -87,7 +103,15 @@ class DshApplication : Application(), SingletonImageLoader.Factory {
             NetworkChangeAction.None -> Unit
         }
         NetworkTransport.refresh(cm)
-        ConnectivitySignals.requestProbe()
+        ConnectivitySignals.requestProbe(action)
+    }
+
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        if (level >= TRIM_MEMORY_UI_HIDDEN) {
+            runCatching { dev.deeplinks.native.MathRenderer.trimMemory(releaseWebView = level >= TRIM_MEMORY_BACKGROUND) }
+            runCatching { dev.deeplinks.native.MermaidRenderer.trimMemory(releaseWebView = level >= TRIM_MEMORY_BACKGROUND) }
+        }
     }
 
     /** Coil3 全局 ImageLoader：Markdown 图片只允许 https 公网（DNS 层 + 拦截器双保险）。 */

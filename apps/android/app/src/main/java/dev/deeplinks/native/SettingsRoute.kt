@@ -163,7 +163,10 @@ internal fun SettingsRoute(
     var savingNs by settingsViewModel.savingNamespace
     var saveErrors by settingsViewModel.saveErrors
 
-    LaunchedEffect(host) {
+    var failedPatches by remember(host) { mutableStateOf<Map<String, org.json.JSONObject>>(emptyMap()) }
+    var settingsReloadTick by remember(host) { mutableIntStateOf(0) }
+
+    LaunchedEffect(host, settingsReloadTick) {
         if (host == null) return@LaunchedEffect
         if ("settings.describe" in dev.deeplinks.core.HostCapabilitiesCache.missing(host.slotKey)) return@LaunchedEffect
         withContext(Dispatchers.IO) {
@@ -179,6 +182,8 @@ internal fun SettingsRoute(
                         ThemeManager.setThemeMode(context, loaded.theme)
                     }
                 }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
             } catch (e: Exception) {
                 // 离线：回退本地缓存，设置项仍可展示（保存时会提示错误）
             }
@@ -190,6 +195,7 @@ internal fun SettingsRoute(
         val h = host
         if (h == null) {
             saveErrors = saveErrors + (ns to s.notConnectedCannotSave)
+            failedPatches = failedPatches + (ns to patch)
             return
         }
         if (savingNs != null) return
@@ -201,16 +207,28 @@ internal fun SettingsRoute(
                     appSettings = AppSettingsStore.cached(context, h)
                     namespaceRevisions = namespaceRevisions + (ns to updated.revision)
                     saveErrors = saveErrors - ns
+                    failedPatches = failedPatches - ns
                     onSuccess()
                 }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
             } catch (e: Exception) {
+                val isConflict = (e as? MobileApiHttpException)?.httpCode == 409 ||
+                    e.message.orEmpty().contains("revision conflict", ignoreCase = true)
                 withContext(Dispatchers.Main) {
+                    failedPatches = failedPatches + (ns to patch)
                     saveErrors = saveErrors + (ns to (e.message?.let { friendlyNetworkError(e) } ?: s.saveFailed))
+                    // 409 版本冲突：立刻拉取最新 revision，用户点重试即可用新 revision 提交
+                    if (isConflict) settingsReloadTick++
                 }
             } finally {
                 withContext(Dispatchers.Main) { savingNs = null }
             }
         }
+    }
+
+    fun retryNamespace(ns: String, fallbackPatch: org.json.JSONObject) {
+        saveNamespace(ns, failedPatches[ns] ?: fallbackPatch)
     }
 
     // 模型目录（llm.models）—— 模型 Tab 浏览用；失败不得伪装成加载中
@@ -219,6 +237,10 @@ internal fun SettingsRoute(
         if (host == null) {
             llmLoading = false
             llmError = s.notConnectedCannotSave
+            return@LaunchedEffect
+        }
+        if (llmReloadEpoch == 0 && llmGroups.isNotEmpty() && llmError == null) {
+            llmLoading = false
             return@LaunchedEffect
         }
         llmLoading = true
@@ -230,6 +252,8 @@ internal fun SettingsRoute(
                     llmGroups = groups
                     llmError = null
                 }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
                     llmError = e.message?.takeIf { it.isNotBlank() } ?: s.loadModelListFailed
@@ -286,6 +310,7 @@ internal fun SettingsRoute(
                         savingNs = savingNs,
                         saveErrors = saveErrors,
                         onSave = { ns, patch, onSuccess -> saveNamespace(ns, patch, onSuccess) },
+                        onRetryNamespace = { ns, fallback -> retryNamespace(ns, fallback) },
                     )
                 }
             }
@@ -312,6 +337,7 @@ internal fun SettingsRoute(
                         saveErrors = saveErrors,
                         onShowFullAccessConfirm = { showFullAccessConfirm = true },
                         onSave = { ns, patch, onSuccess -> saveNamespace(ns, patch, onSuccess) },
+                        onRetryNamespace = { ns, fallback -> retryNamespace(ns, fallback) },
                     )
                 }
             }
@@ -376,10 +402,12 @@ internal fun SettingsRoute(
 private fun LegalDocDialog(fileName: String, title: String, onDismiss: () -> Unit) {
     val context = androidx.compose.ui.platform.LocalContext.current
     val s = DshS
-    val body = remember(fileName) {
-        runCatching {
-            context.assets.open("legal/$fileName").bufferedReader(Charsets.UTF_8).use { it.readText() }
-        }.getOrElse { s.legalLoadFailed.replace("%s", fileName) }
+    val body by produceState(initialValue = "", key1 = fileName) {
+        value = withContext(Dispatchers.IO) {
+            runCatching {
+                context.assets.open("legal/$fileName").bufferedReader(Charsets.UTF_8).use { it.readText() }
+            }.getOrElse { s.legalLoadFailed.replace("%s", fileName) }
+        }
     }
     DshDialogFrame(
         onDismiss = onDismiss,
@@ -541,6 +569,7 @@ internal fun LanguageSettings(
     savingNs: String?,
     saveErrors: Map<String, String>,
     onSave: (ns: String, patch: org.json.JSONObject, onSuccess: () -> Unit) -> Unit,
+    onRetryNamespace: (ns: String, fallback: org.json.JSONObject) -> Unit = { ns, p -> onSave(ns, p, {}) },
 ) {
     val context = androidx.compose.ui.platform.LocalContext.current
     val s = DshS
@@ -553,7 +582,7 @@ internal fun LanguageSettings(
             selectedId = appSettings.language,
             saving = savingNs == "locale",
             error = saveErrors["locale"],
-            onRetry = { onSave("locale", org.json.JSONObject().put("preference", appSettings.language), {}) },
+            onRetry = { onRetryNamespace("locale", org.json.JSONObject().put("preference", appSettings.language)) },
             onSelect = { _, id ->
                 LocaleManager.setLanguage(context, id)
                 onSave("locale", org.json.JSONObject().put("preference", id), {})
@@ -633,6 +662,7 @@ internal fun ConversationSettings(
     saveErrors: Map<String, String>,
     onShowFullAccessConfirm: () -> Unit,
     onSave: (ns: String, patch: org.json.JSONObject, onSuccess: () -> Unit) -> Unit,
+    onRetryNamespace: (ns: String, fallback: org.json.JSONObject) -> Unit = { ns, p -> onSave(ns, p, {}) },
 ) {
     val s = DshS
     DshListSection(header = s.sectionNewSessionDefaults, footer = s.agentPresetDesc) {
@@ -649,7 +679,7 @@ internal fun ConversationSettings(
             selectedId = appSettings.agentPreset,
             saving = savingNs == "agent-presets",
             error = saveErrors["agent-presets"],
-            onRetry = { onSave("agent-presets", org.json.JSONObject().put("default", appSettings.agentPreset), {}) },
+            onRetry = { onRetryNamespace("agent-presets", org.json.JSONObject().put("default", appSettings.agentPreset)) },
             onSelect = { _, id ->
                 onSave("agent-presets", org.json.JSONObject().put("default", id), {})
             },
@@ -670,7 +700,7 @@ internal fun ConversationSettings(
             selectedId = appSettings.permissionPreset,
             saving = savingNs == "permission",
             error = saveErrors["permission"],
-            onRetry = { onSave("permission", org.json.JSONObject().put("defaultPreset", appSettings.permissionPreset), {}) },
+            onRetry = { onRetryNamespace("permission", org.json.JSONObject().put("defaultPreset", appSettings.permissionPreset)) },
             onSelect = { _, id ->
                 if (id == "danger-full-access") {
                     onShowFullAccessConfirm()
@@ -694,7 +724,7 @@ internal fun ConversationSettings(
             selectedId = busyEnterId,
             saving = savingNs == "ui-conversation",
             error = saveErrors["ui-conversation"],
-            onRetry = { onSave("ui-conversation", org.json.JSONObject().put("busyEnter", busyEnterId), {}) },
+            onRetry = { onRetryNamespace("ui-conversation", org.json.JSONObject().put("busyEnter", busyEnterId)) },
             onSelect = { _, id -> onSave("ui-conversation", org.json.JSONObject().put("busyEnter", id), {}) },
             description = s.busyEnterDesc,
         )
@@ -901,32 +931,42 @@ private fun SessionsSettings(host: Host?) {
                             if (syncedArchivedIds != prefs.archivedSessionIds) {
                                 prefs.archivedSessionIds = syncedArchivedIds
                             }
+                            val existingSnaps = prefs.sessionSnapshots
+                            val batchUpdates = LinkedHashMap<String, SessionSnapshot>()
+                            val liveMap = sessions.associateBy { it.sessionId }
                             // 为仅有 id、尚无快照的归档项补一条占位
                             (syncedArchivedIds - nextRestored).forEach { id ->
-                                if (id !in prefs.sessionSnapshots) {
-                                    val live = sessions.firstOrNull { it.sessionId == id }
-                                    prefs.rememberSessionSnapshot(
+                                if (id !in existingSnaps) {
+                                    val live = liveMap[id]
+                                    batchUpdates[id] = SessionSnapshot(
                                         sessionId = id,
-                                        title = live?.title ?: id.take(8),
+                                        title = (live?.title ?: id.take(8)).ifBlank { id },
                                         cwd = live?.cwd,
                                         updatedAt = live?.updatedAt ?: 0L,
                                     )
                                 }
                             }
+                            if (batchUpdates.isNotEmpty()) prefs.rememberSessionSnapshots(batchUpdates)
                         }
-                        // 活跃列表里仍能拿到的归档/删除项，刷新快照标题
+                        // 活跃列表里仍能拿到的归档/删除项，批量刷新快照标题（单次序列化写回）
+                        val archivedSet = prefs.archivedSessionIds
+                        val deletedSet = prefs.deletedSessionIds
+                        val refreshedSnaps = LinkedHashMap<String, SessionSnapshot>()
                         sessions.forEach { session ->
-                            if (session.sessionId in prefs.archivedSessionIds || session.sessionId in prefs.deletedSessionIds) {
-                                prefs.rememberSessionSnapshot(
+                            if (session.sessionId in archivedSet || session.sessionId in deletedSet) {
+                                refreshedSnaps[session.sessionId] = SessionSnapshot(
                                     sessionId = session.sessionId,
-                                    title = session.title,
+                                    title = session.title.ifBlank { session.sessionId },
                                     cwd = session.cwd,
                                     updatedAt = session.updatedAt,
                                 )
                             }
                         }
+                        if (refreshedSnaps.isNotEmpty()) prefs.rememberSessionSnapshots(refreshedSnaps)
                         reloadLocal()
                     }
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    throw e
                 } catch (e: Exception) {
                     withContext(Dispatchers.Main) {
                         reloadLocal()

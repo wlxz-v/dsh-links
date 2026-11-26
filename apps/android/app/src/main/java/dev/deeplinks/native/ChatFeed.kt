@@ -23,6 +23,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.Stable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -221,6 +222,8 @@ internal class ChatFeedActions(
         return { setComposerText(insertFeedbackCommand(composerText())) }
     }
 
+    fun isFeedbackSupportedFlag(): Boolean = isFeedbackSupported()
+
     fun feedbackRating(msg: MobileMessage): String? =
         if (isFeedbackSupported()) feedbackFor(msg.id)?.first else null
 
@@ -357,25 +360,35 @@ internal fun LazyListScope.chatMessageItems(
         Box(modifier = rowModifier) {
             when (group) {
                 is MessageGroup.Single -> {
+                    val msg = group.msg
+                    val onCopy = remember(actions, msg.id, msg.text) { actions.onCopy(msg) }
+                    val onQuote = remember(actions, msg.id, msg.text) { actions.onQuote(msg) }
+                    val onFork = remember(actions) { actions.onFork() }
+                    val onRegenerate = remember(actions, msg.id, msg.role) { actions.onRegenerate(msg) }
+                    val onFeedback = remember(actions, msg.id, msg.role) { actions.onFeedback(msg) }
+                    val feedbackSupported = actions.isFeedbackSupportedFlag()
+                    val onRate = remember(actions, msg.id, msg.role, feedbackSupported) { actions.onRate(msg) }
+                    val onRetract = remember(actions, msg.id, msg.role, feedbackSupported) { actions.onRetract(msg) }
+                    val onFetchProducedFile = remember(actions, msg.id, msg.role) { actions.onFetchProducedFile(msg) }
                     MessageItem(
-                        msg = group.msg,
-                        running = sweepingId != null && group.msg.id == sweepingId,
-                        onCopy = actions.onCopy(group.msg),
-                        onQuote = actions.onQuote(group.msg),
-                        onFork = actions.onFork(),
-                        onRegenerate = actions.onRegenerate(group.msg),
-                        onFeedback = actions.onFeedback(group.msg),
-                        feedbackRating = actions.feedbackRating(group.msg),
-                        onRate = actions.onRate(group.msg),
-                        onRetract = actions.onRetract(group.msg),
-                        onFetchProducedFile = actions.onFetchProducedFile(group.msg),
+                        msg = msg,
+                        running = sweepingId != null && msg.id == sweepingId,
+                        onCopy = onCopy,
+                        onQuote = onQuote,
+                        onFork = onFork,
+                        onRegenerate = onRegenerate,
+                        onFeedback = onFeedback,
+                        feedbackRating = actions.feedbackRating(msg),
+                        onRate = onRate,
+                        onRetract = onRetract,
+                        onFetchProducedFile = onFetchProducedFile,
                         onOpenChanges = actions.openChanges,
-                        showActions = group.msg.id in prepared.turnEnds,
-                        turnModelLabel = prepared.turnModelById[group.msg.id],
+                        showActions = msg.id in prepared.turnEnds,
+                        turnModelLabel = prepared.turnModelById[msg.id],
                         isTurnEnd = row.isTurnEnd,
                         textPart = row.part,
                         isLastPart = row.partIndex == row.partCount - 1,
-                        turnChanges = prepared.turnChanges[group.msg.id],
+                        turnChanges = prepared.turnChanges[msg.id],
                     )
                 }
                 is MessageGroup.ToolGroup -> ToolGroupHeader(

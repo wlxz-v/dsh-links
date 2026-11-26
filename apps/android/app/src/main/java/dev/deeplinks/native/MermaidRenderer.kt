@@ -34,8 +34,10 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -123,12 +125,14 @@ object MermaidRenderer {
     }
 
     @Volatile private var appContext: Context? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
     private var webView: WebView? = null
     private var pageReady: CompletableDeferred<Unit>? = null
     private val renderMutex = Mutex()
     private var resultDeferred: CompletableDeferred<JSONObject?>? = null
+    private val inFlight = HashSet<String>()
 
-    var revision: Int = 0
+    var revision by mutableIntStateOf(0)
         private set
 
     private fun bumpRevision() {
@@ -154,25 +158,64 @@ object MermaidRenderer {
         synchronized(cacheLock) {
             cache.clear()
             failures.clear()
+            inFlight.clear()
+        }
+    }
+
+    /** 内存紧张或退到后台时释放图表缓存；必要时销毁离屏 WebView（含 3.5MB JS 堆，下次渲染懒建）。 */
+    fun trimMemory(releaseWebView: Boolean = false) {
+        synchronized(cacheLock) {
+            cache.clear()
+            failures.clear()
+            inFlight.clear()
+        }
+        if (releaseWebView) {
+            mainHandler.post {
+                webView?.destroy()
+                webView = null
+                pageReady = null
+            }
         }
     }
 
     private fun cacheKey(source: String, dark: Boolean) = "$dark\u0000$source"
+
+    /** 只读缓存查询（供 Compose remember 使用，不重复启动渲染，避免与 LaunchedEffect 双画）。 */
+    internal fun cached(source: String, dark: Boolean): Rendered? {
+        val key = cacheKey(source, dark)
+        return synchronized(cacheLock) { cache.get(key) }
+    }
 
     fun peek(source: String, dark: Boolean, persistFailure: Boolean = true): Rendered? {
         val key = cacheKey(source, dark)
         synchronized(cacheLock) {
             cache.get(key)?.let { return it }
             if (persistFailure && failures.containsKey(key)) return null
+            if (!inFlight.add(key)) return null
         }
-        scope.launch { render(source, dark, persistFailure) }
+        scope.launch {
+            try {
+                render(source, dark, persistFailure)
+            } finally {
+                synchronized(cacheLock) { inFlight.remove(key) }
+            }
+        }
         return null
     }
 
     suspend fun render(source: String, dark: Boolean, persistFailure: Boolean = true): Rendered? {
         val key = cacheKey(source, dark)
-        synchronized(cacheLock) { cache.get(key)?.let { return it } }
-        val rendered = renderMutex.withLock { renderUncached(source, dark) }
+        synchronized(cacheLock) {
+            cache.get(key)?.let { return it }
+            if (persistFailure && failures.containsKey(key)) return null
+        }
+        val rendered = renderMutex.withLock {
+            synchronized(cacheLock) {
+                cache.get(key)?.let { return@withLock it }
+                if (persistFailure && failures.containsKey(key)) return@withLock null
+            }
+            renderUncached(source, dark)
+        }
         synchronized(cacheLock) {
             if (rendered != null) {
                 cache.put(key, rendered)
@@ -339,14 +382,14 @@ fun MermaidDiagramBlock(
     val dark = Dsh.isDark
     val context = LocalContext.current
     val density = LocalDensity.current
+    val scope = rememberCoroutineScope()
     SideEffect { MermaidRenderer.attach(context.applicationContext) }
-    val revision = MermaidRenderer.revision
-    var rendered by remember(source, dark, revision) {
+    var rendered by remember(source, dark, ephemeral) {
         mutableStateOf(
-            if (ephemeral) null else MermaidRenderer.peek(source, dark, persistFailure = true),
+            if (ephemeral) null else MermaidRenderer.cached(source, dark),
         )
     }
-    LaunchedEffect(source, dark, revision, ephemeral) {
+    LaunchedEffect(source, dark, ephemeral) {
         if (ephemeral) kotlinx.coroutines.delay(450)
         if (rendered == null) {
             rendered = MermaidRenderer.render(source, dark, persistFailure = !ephemeral)
@@ -368,17 +411,19 @@ fun MermaidDiagramBlock(
     val heightDp = with(density) { drawn.cssHeight.toDp() }.coerceAtMost(480.dp)
     var saveError by remember { mutableStateOf<String?>(null) }
     fun shareDiagram() {
-        runCatching {
-            ShareCardRenderer.sharePng(
-                context,
-                drawn.bitmap.asAndroidBitmap(),
-                L.mermaidDiagram,
-                L.save,
-            )
-        }.onSuccess {
-            saveError = null
-        }.onFailure { e ->
-            saveError = L.exportFailed.format(e.message ?: L.unknownError)
+        val bitmap = drawn.bitmap.asAndroidBitmap()
+        val subject = L.mermaidDiagram
+        val chooser = L.save
+        scope.launch {
+            runCatching {
+                val uri = withContext(Dispatchers.IO) { ShareCardRenderer.writeSharePng(context, bitmap) }
+                ShareCardRenderer.launchSharePng(context, uri, subject, chooser)
+            }.onSuccess {
+                saveError = null
+            }.onFailure { e ->
+                if (e is kotlinx.coroutines.CancellationException) throw e
+                saveError = L.exportFailed.format(e.message ?: L.unknownError)
+            }
         }
     }
     Box(

@@ -5,6 +5,7 @@ import dev.deeplinks.core.BoundedIo
 import dev.deeplinks.core.Host
 import dev.deeplinks.core.HostHttp
 import dev.deeplinks.core.parseHostStateFields
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -15,8 +16,10 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import okhttp3.Call
 import org.json.JSONObject
+import java.io.IOException
 import java.io.InputStream
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * 一台电脑一条主机事件连接。断线后用 Last-Event-ID 续传。
@@ -58,8 +61,8 @@ class HostEventClient(
     private val lastEventId = AtomicLong(0)
     private val attemptGeneration = AtomicLong(0)
     private var job: Job? = null
-    private var call: Call? = null
-    var lastFailure: StreamFailure? = null
+    private val activeCall = AtomicReference<Call?>(null)
+    @Volatile var lastFailure: StreamFailure? = null
         private set
 
     fun start() {
@@ -76,8 +79,7 @@ class HostEventClient(
         attemptGeneration.incrementAndGet()
         job?.cancel()
         job = null
-        try { call?.cancel() } catch (_: Exception) {}
-        call = null
+        try { activeCall.getAndSet(null)?.cancel() } catch (_: Exception) {}
     }
 
     fun noteEventId(seq: Long) {
@@ -91,7 +93,13 @@ class HostEventClient(
     private suspend fun connectLoop() {
         var failures = 0
         while (currentCoroutineContext().isActive) {
-            val result = try { connectOnce() } catch (e: Exception) { HostConnectResult(false, classifyFailure(e)) }
+            val result = try {
+                connectOnce()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                HostConnectResult(false, classifyFailure(e))
+            }
             if (!currentCoroutineContext().isActive) break
             if (result.ok) {
                 failures = 0
@@ -106,6 +114,7 @@ class HostEventClient(
 
     private suspend fun connectOnce(): HostConnectResult {
         val generation = attemptGeneration.get()
+        var attemptCall: Call? = null
         val headers = mutableListOf(
             "Accept-Encoding" to "identity",
             "Cache-Control" to "no-cache",
@@ -128,8 +137,13 @@ class HostEventClient(
                     readTimeoutMs = 90_000,
                     streaming = true,
                 ),
-                onCall = { call = it },
+                onCall = {
+                    attemptCall = it
+                    activeCall.set(it)
+                },
             )
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             return HostConnectResult(false, classifyFailure(e))
         }
@@ -140,11 +154,13 @@ class HostEventClient(
             if (response.code != 200) return HostConnectResult(false, classifyHttpFailure(response.code))
             response.body.byteStream().use { readSSE(it) }
             HostConnectResult(true, null)
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             HostConnectResult(false, classifyFailure(e))
         } finally {
             runCatching { response.close() }
-            call = null
+            if (attemptCall != null) activeCall.compareAndSet(attemptCall, null)
             _items.trySend(Item.Disconnected)
         }
     }
@@ -163,6 +179,9 @@ class HostEventClient(
                     val payload = line.removePrefix("data:").let { if (it.startsWith(" ")) it.drop(1) else it }
                     if (data.isNotEmpty()) data.append('\n')
                     data.append(payload)
+                    if (data.length > BoundedIo.MAX_SSE_LINE_BYTES) {
+                        throw IOException("host event too large")
+                    }
                 }
                 line.isEmpty() -> {
                     if (data.isNotEmpty()) {

@@ -230,7 +230,7 @@ fun DevicesScreen(
             onReplace = { showPairingPanel = true },
             onUnpair = ::requestUnpair,
             alias = alias,
-            onRename = onAliasChanged,
+            onRename = { renameOpen = true },
             onOpenDiagnostics = { showDiagnostics = true },
         )
     } else {
@@ -436,8 +436,6 @@ private fun DevicesForegroundRefresh(
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
-
-    LaunchedEffect(Unit) { reload() }
 
     LaunchedEffect(lifecycleOwner) {
         while (true) {

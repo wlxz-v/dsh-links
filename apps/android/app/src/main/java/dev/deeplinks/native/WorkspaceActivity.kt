@@ -16,6 +16,7 @@ import dev.deeplinks.core.HostStore
 import dev.deeplinks.core.LastOnlineStore
 import dev.deeplinks.core.stableIdentity
 import androidx.activity.ComponentActivity
+import androidx.lifecycle.repeatOnLifecycle
 import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -162,8 +163,9 @@ fun WorkspaceScreen(
     val hostIdentity = remember(host) { host.stableIdentity() }
     // 进入工作区即记录「最近使用设备」；设备重命名不影响该身份。
     LaunchedEffect(hostIdentity) { HostStore.rememberLastHost(context, host) }
+    val hostVmKey = "${host.slotKey}|${host.token.hashCode()}|${host.certFingerprint}|${host.remoteEndpoint}|${host.remoteRouteId}|${host.tailnetUrl}"
     val workspaceViewModel: WorkspaceViewModel = viewModel(
-        key = "workspace:${host.slotKey}",
+        key = "workspace:$hostVmKey",
         factory = WorkspaceViewModel.factory(host),
     )
     val client = workspaceViewModel.client
@@ -662,16 +664,15 @@ fun WorkspaceScreen(
     }
     LaunchedEffect(initialShareSeq, initialShareText, initialShareImages, initialShareNotice, shareOwnerKey) {
         if (initialShareText.isNullOrBlank() && initialShareImages.isEmpty() && initialShareNotice.isNullOrBlank()) return@LaunchedEffect
-        openNewTaskDraft() // 分享进来的内容落在草稿态输入框里预填（N1）
         val token = if (initialShareSeq != 0L) {
             initialShareSeq
         } else {
             (initialShareText.orEmpty() + "\u0000" + initialShareImages.joinToString("\u0000") + "\u0000" + initialShareNotice.orEmpty()).hashCode().toLong()
         }
-        // 已消费的分享不再重复应用；但冷启动时分享先落在「新会话」owner，会话列表随后加载并
-        // switchComposer 会清空输入框——因此 owner 从空变为真实会话时需要再应用一次。
+        // 已消费的分享不再重复应用（须在 openNewTaskDraft 之前拦截，避免切会话时被拉回空草稿）。
         if (shareConsumed && appliedShareSeq == token) return@LaunchedEffect
         if (appliedShareSeq == token && appliedShareOwner == shareOwnerKey) return@LaunchedEffect
+        openNewTaskDraft() // 分享进来的内容落在草稿态输入框里预填（N1）
         appliedShareSeq = token
         appliedShareOwner = shareOwnerKey
         if (shareOwnerKey.isNotEmpty()) shareConsumed = true
@@ -738,8 +739,11 @@ fun WorkspaceScreen(
         onOpenDevice(message)
         // WorkspaceScreen 现宿主于 MainActivity；旧独立 Activity 时代的 finish() 会关掉整个 app
     }
-    // VM 内的周期性请求遇到认证失效时走同一条退出路径（WI-R2）
-    workspaceViewModel.authListener = { error -> onAuthExpired(error) }
+    // VM 内的周期性请求遇到认证失效时走同一条退出路径（WI-R2）；离开组合时清引用防泄漏 Activity
+    DisposableEffect(workspaceViewModel) {
+        workspaceViewModel.authListener = { error -> onAuthExpired(error) }
+        onDispose { workspaceViewModel.authListener = null }
+    }
 
     fun applySessionList(list: List<MobileSession>, selectLatest: Boolean = false): String? {
         if (list === sessions && !selectLatest) return currentSessionId
@@ -989,9 +993,9 @@ fun WorkspaceScreen(
         val sid = currentSessionId ?: return
         val before = nextBeforeSeq ?: return
         if (isLoadingOlder) return
+        val generation = workspaceViewModel.historyGeneration
         isLoadingOlder = true
         loadOlderFailed = false
-        // 锚点：当前第一个可见"消息"（排除加载行/状态行）的 id 与视口偏移
         val anchor = listState.layoutInfo.visibleItemsInfo
             .firstOrNull { it.key !in NON_MESSAGE_ITEM_KEYS }
             ?.let { info -> (info.key as? String) to info.offset }
@@ -1001,21 +1005,13 @@ fun WorkspaceScreen(
                 val older = result.messages
                 val anchorOffset = anchor?.second ?: 0
                 withContext(Dispatchers.Main) {
-                    if (currentSessionId != sid) return@withContext
-                    // 更旧页必须插到现有 olderMessages 前面（WI-002），按稳定 id 去重
+                    if (currentSessionId != sid || workspaceViewModel.historyGeneration != generation) return@withContext
                     olderMessages = mergeHistoryPages(older, olderMessages)
                     hasMoreMessages = result.hasMore
                     nextBeforeSeq = result.nextBeforeSeq
-                    // 恢复锚点：新页插入后，同一消息回到原偏移
-                    val anchorIndex = anchor?.first?.let { id ->
-                        (olderMessages + messages).indexOfFirst { it.id == id }
-                    } ?: -1
+                    val anchorIndex = anchor?.first?.let { id -> (olderMessages + messages).indexOfFirst { it.id == id } } ?: -1
                     if (anchorIndex >= 0 && !listState.isScrollInProgress) {
-                        try {
-                            listState.scrollToItem(anchorIndex, anchorOffset)
-                        } catch (e: Exception) {
-                            Log.w("WorkspaceActivity", "loadOlder anchor restore failed: ${e.message}")
-                        }
+                        runCatching { listState.scrollToItem(anchorIndex, anchorOffset) }
                     }
                 }
             } catch (e: kotlinx.coroutines.CancellationException) {
@@ -1023,11 +1019,12 @@ fun WorkspaceScreen(
             } catch (e: Exception) {
                 Log.w("WorkspaceActivity", "loadOlderMessages($sid) failed: ${e.message}")
                 withContext(Dispatchers.Main) {
-                    if (currentSessionId == sid) loadOlderFailed = true
+                    if (currentSessionId == sid && workspaceViewModel.historyGeneration == generation) loadOlderFailed = true
                 }
-            }
-            withContext(Dispatchers.Main) {
-                isLoadingOlder = false
+            } finally {
+                withContext(Dispatchers.Main + kotlinx.coroutines.NonCancellable) {
+                    if (workspaceViewModel.historyGeneration == generation || currentSessionId != sid) isLoadingOlder = false
+                }
             }
         }
     }
@@ -1082,6 +1079,7 @@ fun WorkspaceScreen(
     var isForeground by remember { mutableStateOf(true) }
     val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner, currentSessionId, streamClient) {
+        var skippedInitialResume = false
         val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
             when (event) {
                 androidx.lifecycle.Lifecycle.Event.ON_START -> {
@@ -1094,13 +1092,16 @@ fun WorkspaceScreen(
                     SessionMonitorLifecycle.onBackground(context, host, currentSessionId, sessions, streamClient)
                 }
                 androidx.lifecycle.Lifecycle.Event.ON_RESUME -> {
+                    // 注册监听时若宿主已处于 RESUMED，Lifecycle 会立即回放一次 ON_RESUME，此时冷启动同步即将运行，跳过防重复拉取
+                    if (!skippedInitialResume && coldStartSync.longValue == 0L) {
+                        skippedInitialResume = true
+                        return@LifecycleEventObserver
+                    }
+                    skippedInitialResume = true
                     dev.deeplinks.native.util.HostConnectivity.requestProbe() // R4：回前台立即重新探测
-                    // SSE 断线时立即补全消息，并刷新会话列表（移动网络切换场景）
                     if (streamClient?.isConnected != true) refreshMessages(autoScroll = true)
-                    // 设置页可能改动了归档/删除集合，回前台重新水合（唯一所有者）
                     localStore.reload()
                     applySessionList(sessions)
-                    // S2：冷启动刚同步过（或同步还在跑）就跳过重复下载会话/工作区/设置
                     if (!dev.deeplinks.native.util.shouldSkipResumeRefresh(
                             System.currentTimeMillis(),
                             coldStartSync.longValue,
@@ -1109,7 +1110,7 @@ fun WorkspaceScreen(
                     ) {
                         refreshSessions()
                         refreshWorkspaces()
-                        refreshAppSettings() // 设置可能在其他端修改，回前台重新读取
+                        refreshAppSettings()
                     }
                 }
                 else -> {}
@@ -1144,22 +1145,25 @@ fun WorkspaceScreen(
         followIfNearBottom()
     }
 
+    var streamScrollJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
     fun updateStreamMessage(id: String, transform: (MobileMessage) -> MobileMessage) {
         val i = messages.indexOfFirst { it.id == id }
         if (i >= 0) {
             messages = messages.toMutableList().apply { this[i] = transform(this[i]) }
-            // 流式变长：贴底时只轻推溢出，避免每个 delta 都重跑整段尾部定位
+            // 流式变长：贴底时合并为单个在途帧回调轻推溢出，避免同帧多个 delta 叠加滚动
             if (viewMode == "chat" && (stickToBottom || isNearBottom())) {
                 stickToBottom = true
                 showScrollToBottom = false
-                scope.launch {
-                    try {
-                        withFrameNanos { }
-                        val info = listState.layoutInfo
-                        val last = info.visibleItemsInfo.lastOrNull() ?: return@launch
-                        val overflow = (last.offset + last.size) - (info.viewportEndOffset - info.afterContentPadding)
-                        if (overflow > 0) listState.scrollBy(overflow.toFloat())
-                    } catch (_: Exception) { }
+                if (streamScrollJob?.isActive != true) {
+                    streamScrollJob = scope.launch {
+                        try {
+                            withFrameNanos { }
+                            val info = listState.layoutInfo
+                            val last = info.visibleItemsInfo.lastOrNull() ?: return@launch
+                            val overflow = (last.offset + last.size) - (info.viewportEndOffset - info.afterContentPadding)
+                            if (overflow > 0) listState.scrollBy(overflow.toFloat())
+                        } catch (_: Exception) { }
+                    }
                 }
             }
         }
@@ -1468,8 +1472,10 @@ fun WorkspaceScreen(
                 olderMessages = emptyList()
                 hasMoreMessages = false
                 nextBeforeSeq = null
+                val nextCursor = if (item.reason == "cursor-ahead") (item.nextCursor ?: 0L) else 0L
+                workspaceViewModel.resetSeedMaxSeq(nextCursor)
                 workspaceViewModel.bumpHistoryGeneration()
-                streamClient?.pauseForResync()
+                streamClient?.pauseForResync(nextCursor)
                 refreshMessages(autoScroll = false, replaceInFlight = true)
             }
             is SessionStreamClient.Item.Message -> {
@@ -1643,7 +1649,7 @@ fun WorkspaceScreen(
     //   updatedAt 前进且非流式生成中时才补 history，执行中完全交给 SSE
     // - 后台暂停，防止 excessive binder traffic；单飞/代际去重全部在 VM
     // - 新会话编辑态也继续拉列表，保证 Web 端增删能同步到侧栏
-    LaunchedEffect(currentSessionId) {
+    LaunchedEffect(currentSessionId, chatVisible, streamClient) {
         var pollTick = 0
         while (true) {
             delay(2000)
@@ -1847,15 +1853,20 @@ fun WorkspaceScreen(
     // 首页顶栏连接状态（稿 01/08）：首页没有会话 SSE，在线与延迟只能来自 30s 一次的健康探测；
     // 探测不到就按离线显示，并用 LastOnlineStore 的时间戳写「离线 · N 分钟前在线」。
     var hostReachable by remember(host) { mutableStateOf(true) }
-    LaunchedEffect(host) {
-        // R4：连续 2 次失败才判离线、失败后快速重探；回前台 / 网络变化 / 「重试」会唤醒它立即探测。
-        runReachabilityLoop(host) { online, ms ->
-            hostReachable = online
-            dev.deeplinks.native.util.HostConnectivity.update(online, dev.deeplinks.core.HostHttp.isViaRemote(host), ms)
-            if (online) LastOnlineStore.record(context)
+    LaunchedEffect(host, lifecycleOwner) {
+        dev.deeplinks.native.util.HostConnectivity.update(null, false, null)
+        // 仅在前台（STARTED）时探测健康，切后台立即挂起避免持续唤醒射频耗电
+        lifecycleOwner.repeatOnLifecycle(androidx.lifecycle.Lifecycle.State.STARTED) {
+            runReachabilityLoop(host) { online, ms ->
+                hostReachable = online
+                dev.deeplinks.native.util.HostConnectivity.update(online, dev.deeplinks.core.HostHttp.isViaRemote(host), ms)
+                if (online) LastOnlineStore.record(context)
+            }
         }
     }
-    val offlineSinceLabel = if (hostReachable) null else dev.deeplinks.native.util.lastOnlineLabel(LastOnlineStore.read(context))
+    val offlineSinceLabel = remember(hostReachable) {
+        if (hostReachable) null else dev.deeplinks.native.util.lastOnlineLabel(LastOnlineStore.read(context))
+    }
 
     // 首页审批卡（D1-A）：只给手机接管的审批按钮；takenOverByPhone 见 MobileMessage 注释。
     // 首页收件箱（2.1）：当前会话里手机能处理的审批 / 提问，与对话页决策栏同一条规则
@@ -1878,14 +1889,7 @@ fun WorkspaceScreen(
                         }?.workspaceId
                         val draftText = inputText
                         val draftImages = pendingImages
-                        workspacePrefs.parkedSend = parkSendForPersistence(
-                            ParkedSend(
-                                slotKey = host.slotKey,
-                                sessionId = startedOnSession,
-                                text = draftText,
-                                images = draftImages,
-                            ),
-                        )
+                        val parkedPayload = ParkedSend(host.slotKey, startedOnSession, draftText, draftImages)
                         composerActionError = null
                         isSending = true
                         stoppedReason = null
@@ -1908,6 +1912,7 @@ fun WorkspaceScreen(
                         }
                         scope.launch(Dispatchers.IO) {
                             try {
+                                workspacePrefs.parkedSend = parkedPayload
                                 var sid = startedOnSession
                                 val createdNow = sid == null
                                 if (sid == null) {
@@ -1990,15 +1995,13 @@ fun WorkspaceScreen(
                                         composerDraftKey(sendOwnerId),
                                         ComposerDraft(draftText, draftImages),
                                     )
-                                    // 发送失败：若尚未真正进入 turn，收回乐观 running
-                                    if (currentSession?.running != true) liveRunning = false
-                                    composerActionError = L.sendFailed.format(e.message ?: L.unknownError)
+                                    val stillOwner = currentSessionId == sendOwnerId
+                                    if (stillOwner && sessions.none { it.sessionId == sendOwnerId && it.running }) liveRunning = false
+                                    if (stillOwner) composerActionError = L.sendFailed.format(e.message ?: L.unknownError)
                                 }
                             } finally {
-                                withContext(Dispatchers.Main) {
-                                    workspacePrefs.parkedSend = null
-                                    isSending = false
-                                }
+                                runCatching { workspacePrefs.parkedSend = null }
+                                withContext(Dispatchers.Main) { isSending = false }
                             }
                         }
                     }
@@ -2332,7 +2335,7 @@ fun WorkspaceScreen(
                     composerText = { inputText },
                     setComposerText = { inputText = it },
                     setComposerError = { composerActionError = it },
-                    isRunning = { running },
+                    isRunning = { liveRunning || sessions.any { it.sessionId == currentSessionId && it.running } },
                     busyEnter = { appSettings.busyEnter },
                     isFeedbackSupported = { feedbackSupported },
                     feedbackFor = { id -> messageFeedback[id] },
@@ -2475,28 +2478,27 @@ fun WorkspaceScreen(
                             }
                             is PaletteCommand.Completable -> {
                                 val sid = currentSessionId
-                                if (!completableCanSubmit(sid != null) || sid == null) return@CommandSuggestions
+                                if (!completableCanSubmit(sid != null) || sid == null || isSending) return@CommandSuggestions
                                 val trigger = picked.trigger
+                                isSending = true
                                 inputText = ""
                                 composerActionError = null
                                 scope.launch(Dispatchers.IO) {
                                     try {
-                                        client.sendPrompt(
-                                            sid,
-                                            trigger,
-                                            mode = resolvePromptMode(running, appSettings.busyEnter),
-                                        )
+                                        client.sendPrompt(sid, trigger, mode = resolvePromptMode(running, appSettings.busyEnter))
                                         withContext(Dispatchers.Main) {
                                             refreshSessions()
-                                            if (streamClient?.isConnected != true) {
-                                                refreshMessages(autoScroll = true)
-                                            }
+                                            if (currentSessionId == sid && streamClient?.isConnected != true) refreshMessages(autoScroll = true)
                                         }
                                     } catch (e: Exception) {
                                         withContext(Dispatchers.Main) {
-                                            inputText = trigger
-                                            composerActionError = L.commandSendFailed.format(e.message ?: L.unknownError)
+                                            if (currentSessionId == sid) {
+                                                inputText = trigger
+                                                composerActionError = L.commandSendFailed.format(e.message ?: L.unknownError)
+                                            }
                                         }
+                                    } finally {
+                                        withContext(Dispatchers.Main) { isSending = false }
                                     }
                                 }
                             }

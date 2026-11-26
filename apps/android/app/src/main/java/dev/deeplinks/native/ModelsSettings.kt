@@ -151,7 +151,13 @@ internal fun ModelsSettingsPage(
         balanceLoading = true
         directoryLoading = true
         launch(Dispatchers.IO) {
-            val result = runCatching { client.getBalance(locale) }
+            val result = try {
+                Result.success(client.getBalance(locale))
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
             withContext(Dispatchers.Main) {
                 result.onSuccess {
                     balance = it
@@ -173,7 +179,13 @@ internal fun ModelsSettingsPage(
                 }
                 return@launch
             }
-            val result = runCatching { client.getProviders() }
+            val result = try {
+                Result.success(client.getProviders())
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
             withContext(Dispatchers.Main) {
                 result.onSuccess { directory = it; directoryError = null; unsupported = false }
                     .onFailure { e ->

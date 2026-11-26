@@ -21,7 +21,7 @@ class ApprovalActionReceiver : BroadcastReceiver() {
         val sessionId = intent.getStringExtra(EXTRA_SESSION_ID) ?: return
         val approvalId = intent.getStringExtra(EXTRA_APPROVAL_ID) ?: return
         val approve = intent.getBooleanExtra(EXTRA_APPROVE, false)
-        val host = HostStore.load(context).resolveFromIntent(intent) ?: return
+        val host = HostStore.load(context).resolveFromIntentExact(intent) ?: return
         val prefs = WorkspacePrefs(context)
         // 兜底顺序：先看接管是否还开着，再看通知栏直批开关，最后才是锁屏。
         // 接管关闭时审批已交回电脑网页，旧通知上的「允许」不许再生效。

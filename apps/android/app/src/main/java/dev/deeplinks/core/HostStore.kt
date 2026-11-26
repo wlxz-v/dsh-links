@@ -74,6 +74,21 @@ const val EXTRA_AUTH_NOTICE = "authNotice"
 fun List<Host>.resolveFromIntent(intent: Intent): Host? =
     resolveHost(intent.getStringExtra(EXTRA_HOST_NAME), intent.getStringExtra(EXTRA_HOST_BASE_URL))
 
+/** 严格匹配通知/动作意图里的目标主机，不回退到列表首项，避免切主机后审批串台。 */
+fun List<Host>.resolveFromIntentExact(intent: Intent): Host? =
+    resolveExactHost(intent.getStringExtra(EXTRA_HOST_NAME), intent.getStringExtra(EXTRA_HOST_BASE_URL))
+
+internal fun List<Host>.resolveExactHost(name: String?, baseUrl: String?): Host? {
+    if (name.isNullOrBlank() && baseUrl.isNullOrBlank()) return null
+    if (!name.isNullOrBlank() && !baseUrl.isNullOrBlank()) {
+        return firstOrNull { it.name == name && it.baseUrl == baseUrl }
+    }
+    if (!name.isNullOrBlank()) {
+        return firstOrNull { it.name == name }
+    }
+    return firstOrNull { it.baseUrl == baseUrl }
+}
+
 internal fun List<Host>.resolveHost(name: String?, baseUrl: String?): Host? {
     if (!name.isNullOrBlank()) {
         val named = filter { it.name == name }
@@ -107,23 +122,40 @@ object HostStore {
     /** 最近成功进入 Workspace 的设备身份（[stableIdentity]，重命名安全）。 */
     private const val KEY_LAST_HOST = "last_host_identity"
 
+    private data class DecryptedCache(val raw: String, val lastIdentity: String?, val host: Host?)
+    @Volatile private var decryptedCache: DecryptedCache? = null
+
+    @Synchronized
     fun loadResult(ctx: Context): HostLoadResult {
         val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        val raw = prefs.getString(KEY, null) ?: return HostLoadResult.Empty
+        val raw = prefs.getString(KEY, null) ?: run {
+            decryptedCache = null
+            return HostLoadResult.Empty
+        }
         val lastIdentity = prefs.getString(KEY_LAST_HOST, null)
+        decryptedCache?.let { cached ->
+            if (cached.raw == raw && cached.lastIdentity == lastIdentity) {
+                return if (cached.host == null) HostLoadResult.Empty else HostLoadResult.Ok(listOf(cached.host))
+            }
+        }
         return if (TokenCrypto.isEncrypted(raw)) {
             val plain = TokenCrypto.decrypt(ctx, raw)
             if (plain == null) {
+                decryptedCache = null
                 prefs.edit().putBoolean(LOCK, true).apply()
                 HostLoadResult.Undecryptable
             } else {
-                prefs.edit().putBoolean(LOCK, false).apply()
+                if (prefs.getBoolean(LOCK, false)) {
+                    prefs.edit().putBoolean(LOCK, false).apply()
+                }
                 val host = singleHostOf(hostsFromJson(plain), lastIdentity)
+                decryptedCache = DecryptedCache(raw, lastIdentity, host)
                 if (host == null) HostLoadResult.Empty else HostLoadResult.Ok(listOf(host))
             }
         } else {
             val legacy = singleHostOf(hostsFromJson(raw), lastIdentity)
             if (legacy == null) {
+                decryptedCache = null
                 prefs.edit().remove(KEY).apply()
                 return HostLoadResult.Empty
             }
@@ -132,6 +164,7 @@ object HostStore {
             if (stored.isNullOrEmpty() || !TokenCrypto.isEncrypted(stored)) {
                 return HostLoadResult.Undecryptable
             }
+            decryptedCache = DecryptedCache(stored, prefs.getString(KEY_LAST_HOST, null), legacy)
             HostLoadResult.Ok(listOf(legacy))
         }
     }
@@ -152,7 +185,10 @@ object HostStore {
         return try {
             val encrypted = TokenCrypto.encrypt(ctx, hostsToJson(hosts))
             val committed = prefs.edit().putString(KEY, encrypted).commit()
-            if (committed) syncLastHostIdentity(prefs, host)
+            if (committed) {
+                syncLastHostIdentity(prefs, host)
+                decryptedCache = DecryptedCache(encrypted, prefs.getString(KEY_LAST_HOST, null), host)
+            }
             committed
         } catch (_: Exception) {
             false
@@ -194,15 +230,27 @@ object HostStore {
             // 解锁态禁止静默覆盖：调用方须显式 clearLockAndReplace
             return false
         }
-        return save(ctx, host)
+        val previous = current(ctx)
+        val ok = save(ctx, host)
+        if (ok && previous != null && hostIdentityChanged(previous, host)) {
+            clearHostCaches(ctx, previous)
+        }
+        return ok
     }
 
     /** 密钥不可用后的显式恢复：清掉不可读的旧记录并写入这一台。 */
     @Synchronized
     fun clearLockAndReplace(ctx: Context, host: Host): Boolean {
         val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val previous = current(ctx)
+        decryptedCache = null
         prefs.edit().putBoolean(LOCK, false).apply()
-        return save(ctx, host)
+        val ok = save(ctx, host)
+        if (ok) {
+            previous?.let { clearHostCaches(ctx, it) }
+            clearHostCaches(ctx, host)
+        }
+        return ok
     }
 
     /** 解除配对（本机侧）。只在存的还是这台时清空，避免误删刚换上的新设备。本机的会话快照与草稿一并清掉。 */
@@ -212,13 +260,23 @@ object HostStore {
         if (current.slotKey != host.slotKey && current.baseUrl != host.baseUrl) return true
         val ok = save(ctx, null)
         if (ok) {
-            JsonHttpCache.clearHost(current.slotKey)
-            HostCapabilitiesCache.clearHost(current.slotKey)
-            runCatching { dev.deeplinks.native.SessionHistoryCache.clearHost(ctx.cacheDir, current.slotKey) }
-            runCatching { dev.deeplinks.native.util.SessionListCache.clearHost(ctx.cacheDir, current.slotKey) }
-            runCatching { dev.deeplinks.native.util.WorkspacePrefs(ctx).saveComposerDrafts(current.slotKey, emptyMap()) }
+            clearHostCaches(ctx, current)
         }
         return ok
+    }
+
+    private fun hostIdentityChanged(previous: Host, next: Host): Boolean =
+        previous.slotKey != next.slotKey ||
+            previous.deviceId != next.deviceId ||
+            previous.certFingerprint != next.certFingerprint
+
+    private fun clearHostCaches(ctx: Context, host: Host) {
+        JsonHttpCache.clearHost(host.slotKey)
+        HostCapabilitiesCache.clearHost(host.slotKey)
+        HostHttp.evictHost(host)
+        runCatching { dev.deeplinks.native.SessionHistoryCache.clearHost(ctx.cacheDir, host.slotKey) }
+        runCatching { dev.deeplinks.native.util.SessionListCache.clearHost(ctx.cacheDir, host.slotKey) }
+        runCatching { dev.deeplinks.native.util.WorkspacePrefs(ctx).saveComposerDrafts(host.slotKey, emptyMap()) }
     }
 
     // ---- 纯函数（单元测试直测，无 Android 依赖） ----

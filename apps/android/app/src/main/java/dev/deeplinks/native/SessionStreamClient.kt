@@ -2,11 +2,14 @@ package dev.deeplinks.native
 import dev.deeplinks.core.BoundedIo
 import dev.deeplinks.core.Host
 import dev.deeplinks.core.HostHttp
+import dev.deeplinks.core.PinnedSsl
 
 import android.util.Log
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshots.Snapshot
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -23,6 +26,7 @@ import java.io.IOException
 import java.io.InputStream
 import java.net.URLEncoder
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 
 private const val MAX_SSE_DATA_CHARS = BoundedIo.MAX_SSE_LINE_BYTES
 private const val TAG = "SessionStream"
@@ -47,6 +51,7 @@ class SessionStreamClient(
             val afterSeq: Long,
             val oldestAvailableSeq: Long?,
             val upgradeRequired: Boolean = false,
+            val nextCursor: Long? = null,
         ) : Item
         object Disconnected : Item
     }
@@ -106,7 +111,11 @@ class SessionStreamClient(
     }
 
     /** 当前在途的 OkHttp 调用；stop() 用 cancel() 打断阻塞中的 SSE 读。 */
-    private var call: Call? = null
+    private val activeCall = AtomicReference<Call?>(null)
+
+    private fun updateState(block: () -> Unit) {
+        Snapshot.withMutableSnapshot { block() }
+    }
 
     fun start() {
         startRequested = true
@@ -126,25 +135,30 @@ class SessionStreamClient(
     /** Safely cancel the current loop and start a fresh connection attempt. */
     fun reconnect() {
         stop()
-        lastFailure = null
-        connectionState = ConnectionState.CONNECTING
+        updateState {
+            lastFailure = null
+            connectionState = ConnectionState.CONNECTING
+        }
         startRequested = true
         // reconnect 时若已 seed，直接连；否则仍等 seed
         if (seeded) ensureLoop()
     }
 
     /** 停止当前流并等待下一次 history seed 再连接，避免用旧 afterSeq 再次撞上补发缺口。 */
-    fun pauseForResync() {
+    fun pauseForResync(initialCursor: Long = 0L) {
         stop()
-        lastFailure = null
-        connectionState = ConnectionState.CONNECTING
+        updateState {
+            lastFailure = null
+            connectionState = ConnectionState.CONNECTING
+        }
         startRequested = true
         seeded = false
-        // 游标必须一并清零：noteSeedMaxSeq 是单调 max，若历史编号空间与 stream 编号空间
+        // 游标必须一并清零（或对齐到服务端给出的 nextCursor）：noteSeedMaxSeq 是单调 max，若历史编号空间与 stream 编号空间
         // 出现过偏高（实机曾见 maxSeq≫stream seq），不清零会让重播种也压不下游标，
         // 之后所有 SSE 事件都会被 isDuplicateEvent 判成重复丢弃，会话视图永久冻结。
-        lastSeqAtomic.set(0)
-        committedSeq.set(0)
+        val resetSeq = initialCursor.coerceAtLeast(0L)
+        lastSeqAtomic.set(resetSeq)
+        committedSeq.set(resetSeq)
     }
 
     fun stop() {
@@ -152,23 +166,38 @@ class SessionStreamClient(
         attemptGeneration.incrementAndGet()
         job?.cancel()
         job = null
-        try { call?.cancel() } catch (_: Exception) {}
-        call = null
-        if (connectionState == ConnectionState.CONNECTED) connectionState = ConnectionState.RETRYING
+        try { activeCall.getAndSet(null)?.cancel() } catch (_: Exception) {}
+        updateState {
+            if (connectionState == ConnectionState.CONNECTED) connectionState = ConnectionState.RETRYING
+        }
     }
 
     private suspend fun CoroutineScope.connectLoop() {
         var failures = 0
         while (isActive) {
-            connectionState = if (failures == 0) ConnectionState.CONNECTING else ConnectionState.RETRYING
-            val result = try { connectOnce() } catch (e: Exception) { ConnectResult(false, classifyFailure(e)) }
+            updateState {
+                connectionState = if (failures == 0) ConnectionState.CONNECTING else ConnectionState.RETRYING
+            }
+            val result = try {
+                connectOnce()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                ConnectResult(false, classifyFailure(e))
+            }
             if (!isActive) break
             if (result.ok) {
                 failures = 0
             } else {
                 failures++
-                lastFailure = result.failure
-                connectionState = if (result.failure == StreamFailure.AUTH || result.failure == StreamFailure.SERVER) ConnectionState.FAILURE else ConnectionState.RETRYING
+                updateState {
+                    lastFailure = result.failure
+                    connectionState = if (result.failure == StreamFailure.AUTH || result.failure == StreamFailure.SERVER) {
+                        ConnectionState.FAILURE
+                    } else {
+                        ConnectionState.RETRYING
+                    }
+                }
                 Log.w(TAG, "stream fail#$failures session=${sessionId.take(8)} kind=${result.failure}")
                 if (!shouldRetryStream(result.failure)) {
                     startRequested = false
@@ -181,6 +210,7 @@ class SessionStreamClient(
 
     private suspend fun connectOnce(): ConnectResult {
         val generation = attemptGeneration.get()
+        var attemptCall: Call? = null
         val response = try {
             val path = "/dsh-link/mobile/sessions/" + URLEncoder.encode(sessionId, "UTF-8") +
                 "/stream?afterSeq=" + lastSeq + "&caps=" + STREAM_CLIENT_CAPS
@@ -202,9 +232,16 @@ class SessionStreamClient(
                     // SSE 是长连接：不经过 RemoteGate，否则会一直占着并发名额（R2）。
                     streaming = true,
                 ),
-                onCall = { call = it },
+                onCall = {
+                    attemptCall = it
+                    activeCall.set(it)
+                },
             )
-        } catch (e: Exception) { return ConnectResult(false, classifyFailure(e)) }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            return ConnectResult(false, classifyFailure(e))
+        }
         return try {
             if (!currentCoroutineContext().isActive || attemptGeneration.get() != generation) {
                 return ConnectResult(false, StreamFailure.NETWORK)
@@ -217,11 +254,14 @@ class SessionStreamClient(
             connectionBytes = 0
             response.body.byteStream().use { readSSE(it) }
             ConnectResult(true, null)
-        } catch (e: Exception) { ConnectResult(false, classifyFailure(e)) }
-        finally {
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            ConnectResult(false, classifyFailure(e))
+        } finally {
             runCatching { response.close() }
-            if (call != null) call = null
-            connectionState = ConnectionState.RETRYING
+            if (attemptCall != null) activeCall.compareAndSet(attemptCall, null)
+            updateState { connectionState = ConnectionState.RETRYING }
             _items.trySend(Item.Disconnected)
         }
     }
@@ -247,6 +287,8 @@ class SessionStreamClient(
                     if (data.isNotEmpty()) {
                         try {
                             dispatch(eventName, data.toString())
+                        } catch (e: CancellationException) {
+                            throw e
                         } catch (_: Exception) {
                         }
                     }
@@ -261,8 +303,10 @@ class SessionStreamClient(
         when (name) {
             "ready" -> {
                 val seq = JSONObject(data).optLong("resumeSeq")
-                connectionState = ConnectionState.CONNECTED
-                lastFailure = null
+                updateState {
+                    connectionState = ConnectionState.CONNECTED
+                    lastFailure = null
+                }
                 alignToResumeSeq(seq)
                 Log.i(TAG, "ready session=${sessionId.take(8)} resumeSeq=$seq seeded=$seeded lastSeq=$lastSeq")
                 _items.send(Item.Ready(seq))
@@ -286,11 +330,17 @@ class SessionStreamClient(
             "stats" -> _items.send(Item.Stats(JSONObject(data)))
             "resync-required" -> {
                 val obj = JSONObject(data)
+                val nextCursor = if (obj.has("nextCursor") && !obj.isNull("nextCursor")) {
+                    obj.optLong("nextCursor", -1L).takeIf { it >= 0L }
+                } else {
+                    null
+                }
                 _items.send(
                     Item.ResyncRequired(
                         reason = obj.optString("reason", "incomplete"),
                         afterSeq = obj.optLong("afterSeq", lastSeq),
                         oldestAvailableSeq = if (obj.has("oldestAvailableSeq") && !obj.isNull("oldestAvailableSeq")) obj.optLong("oldestAvailableSeq") else null,
+                        nextCursor = nextCursor,
                     ),
                 )
             }
@@ -335,9 +385,14 @@ internal fun classifyHttpFailure(code: Int): StreamFailure = when {
     else -> StreamFailure.UNKNOWN
 }
 
-internal fun classifyFailure(error: Throwable): StreamFailure = when (error) {
-    is java.net.UnknownHostException, is java.net.ConnectException, is java.net.SocketTimeoutException, is IOException -> StreamFailure.NETWORK
-    else -> StreamFailure.UNKNOWN
+internal fun classifyFailure(error: Throwable): StreamFailure {
+    if (error is Exception && PinnedSsl.unwrap(error) is PinnedSsl.CertChangedException) {
+        return StreamFailure.AUTH
+    }
+    return when (error) {
+        is java.net.UnknownHostException, is java.net.ConnectException, is java.net.SocketTimeoutException, is IOException -> StreamFailure.NETWORK
+        else -> StreamFailure.UNKNOWN
+    }
 }
 
 internal fun shouldRetryStream(failure: StreamFailure?): Boolean = failure != StreamFailure.AUTH

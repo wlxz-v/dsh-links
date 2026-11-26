@@ -108,7 +108,6 @@ internal fun InputBar(
     focusToken: Int = 0,
 ) {
     ComposerFocusEffect(focusToken, composerFocusRequester)
-    var composerFocused by remember { mutableStateOf(false) }
     // 录音只在设备真的有语音识别服务时出现（不可用的能力不占位）
     val voiceContext = androidx.compose.ui.platform.LocalContext.current
     val voiceAvailable = remember(voiceContext) {
@@ -123,7 +122,7 @@ internal fun InputBar(
         placeholder = composerPlaceholder(isListening, running),
         sendState = DlSendState.Send,
         onSend = onSend,
-        modifier = modifier.onFocusChanged { composerFocused = it.hasFocus },
+        modifier = modifier,
         attachments = if (pendingImages.isEmpty()) null else {
             { ComposerPendingImages(pendingImages, onRemoveImage) }
         },
@@ -197,13 +196,24 @@ internal fun InputBar(
 
 @Composable
 private fun ComposerPendingImages(pendingImages: List<Pair<String, String>>, onRemoveImage: (Int) -> Unit) {
+    val context = androidx.compose.ui.platform.LocalContext.current
     pendingImages.forEachIndexed { index, (_, data) ->
-        val preview = remember(data) { android.util.Base64.decode(data, android.util.Base64.DEFAULT) }
+        val preview by androidx.compose.runtime.produceState<ByteArray?>(initialValue = null, key1 = data) {
+            value = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) {
+                runCatching { android.util.Base64.decode(data, android.util.Base64.DEFAULT) }.getOrNull()
+            }
+        }
+        val request = remember(context, preview) {
+            preview?.let {
+                coil3.request.ImageRequest.Builder(context)
+                    .data(it)
+                    .size(256, 256)
+                    .build()
+            }
+        }
         Box {
             coil3.compose.AsyncImage(
-                model = coil3.request.ImageRequest.Builder(androidx.compose.ui.platform.LocalContext.current)
-                    .data(preview)
-                    .build(),
+                model = request,
                 contentDescription = L.pendingImage,
                 contentScale = androidx.compose.ui.layout.ContentScale.Crop,
                 modifier = Modifier

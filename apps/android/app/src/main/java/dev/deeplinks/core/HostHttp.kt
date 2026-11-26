@@ -296,8 +296,9 @@ object HostHttp {
         var reuseRetried = false
         while (true) {
             val marker = ReuseMarker()
+            val call = newCall(remoteClient(host, remote, key, request), url, request, onCall, marker)
             try {
-                return newCall(remoteClient(host, remote, key, request), url, request, onCall, marker).execute()
+                return call.execute()
             } catch (e: IOException) {
                 // 繁忙：只在隧道建立阶段、请求体尚未写出时退避重试，最多 3 次（R2）。
                 if (isBusy(e) && busyAttempt < BUSY_BACKOFF_MS.size) {
@@ -305,17 +306,27 @@ object HostHttp {
                     busyAttempt++
                     continue
                 }
-                // R5：池里的旧连接被远端关掉（这次 call 没经历 connectStart）时，GET 换新连接再试一次。
-                if (request.method == "GET" && !reuseRetried && !marker.connected() && !isCertChanged(e)) {
+                // R5：池里的旧连接被远端关掉（这次 call 没经历 connectStart）时，GET 换新连接再试一次；
+                // 主动取消或读超时不得重放（避免取消失效或把 30s 超时翻倍成 60s），也不驱逐池中其他正常隧道。
+                if (
+                    request.method == "GET" &&
+                    !reuseRetried &&
+                    !marker.connected() &&
+                    !call.isCanceled() &&
+                    e !is java.net.SocketTimeoutException &&
+                    !isCertChanged(e)
+                ) {
                     reuseRetried = true
-                    remoteClient(host, remote, key, request).connectionPool.evictAll()
                     continue
                 }
                 val rejected = generateSequence<Throwable>(e) { it.cause }
                     .filterIsInstance<RouteRejectedException>().firstOrNull()
                 if (!clockRetried && rejected != null) {
                     when (rejected.code) {
-                        "CLOCK_SKEW" -> rejected.hostNow?.let { selector.noteHostNow(key, it) } ?: throw e
+                        "CLOCK_SKEW" -> rejected.hostNow?.let {
+                            selector.noteHostNow(key, it)
+                            evictRemotePrefix(lanKey(host) + "\u001f" + remote.endpoint + "\u001f" + DlpKey.of(remote) + "\u001f")
+                        } ?: throw e
                         "REPLAY" -> Unit
                         else -> throw e
                     }
@@ -396,6 +407,11 @@ object HostHttp {
     /** 回到前台：清掉空闲的远程连接，避免继续使用可能已被远端关掉的隧道（R5）。 */
     fun evictIdleRemote() {
         evictPools(includeLan = false)
+    }
+
+    /** 解除配对或替换主机后释放该主机的远程连接池，避免线程与套接字长期滞留。 */
+    fun evictHost(host: Host) {
+        evictRemotePrefix(lanKey(host) + "\u001f")
     }
 
     /**
@@ -510,12 +526,38 @@ object HostHttp {
 
     private fun remoteClient(host: Host, remote: RemoteRoute, key: String, request: DshRequest): OkHttpClient {
         val offset = selector.clockOffsetSec(key)
-        val cacheKey = lanKey(host) + "\u001f" + remote.endpoint + "\u001f" + DlpKey.of(remote) + "\u001f" + offset
+        val base = if (remote.kind == "bootstrap") {
+            // 一次性扫码配对通道不进长期缓存，避免泄漏连接池与线程
+            buildRemoteClient(host, remote, offset)
+        } else {
+            val cacheKey = lanKey(host) + "\u001f" + remote.endpoint + "\u001f" + DlpKey.of(remote) + "\u001f" + offset
+            remoteClients.computeIfAbsent(cacheKey) { buildRemoteClient(host, remote, offset) }
+        }
         // 远程多了外层 WSS 与会合两跳：建立期与读取期都放宽，不让调用方各自判断
-        return remoteClients.computeIfAbsent(cacheKey) { buildRemoteClient(host, remote, offset) }.newBuilder()
+        return base.newBuilder()
             .connectTimeout(maxOf(request.connectTimeoutMs, REMOTE_CONNECT_MS).toLong(), TimeUnit.MILLISECONDS)
             .readTimeout(maxOf(request.readTimeoutMs, REMOTE_READ_MS).toLong(), TimeUnit.MILLISECONDS)
             .build()
+    }
+
+    private fun evictRemotePrefix(prefix: String) {
+        val removed = mutableListOf<OkHttpClient>()
+        val it = remoteClients.entries.iterator()
+        while (it.hasNext()) {
+            val entry = it.next()
+            if (entry.key.startsWith(prefix)) {
+                removed += entry.value
+                it.remove()
+            }
+        }
+        if (removed.isEmpty()) return
+        val job = Runnable {
+            removed.forEach { client ->
+                runCatching { client.connectionPool.evictAll() }
+                runCatching { client.dispatcher.executorService.shutdown() }
+            }
+        }
+        if (isMainThread()) poolMaintenance.execute(job) else job.run()
     }
 
     /** 生产配置的远程客户端；抽成 internal 让复用测试直接测这一份配置（R6）。 */

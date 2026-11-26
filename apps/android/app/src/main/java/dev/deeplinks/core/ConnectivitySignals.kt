@@ -17,10 +17,16 @@ object ConnectivitySignals {
     private val _probeNow = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
     val probeNow: SharedFlow<Unit> = _probeNow
 
+    private val _networkActions = MutableSharedFlow<NetworkChangeAction>(extraBufferCapacity = 4)
+    val networkActions: SharedFlow<NetworkChangeAction> = _networkActions
+
     private val lastRequest = AtomicLong(0)
 
     /** 请求一次立即探测（网络变化 / 回前台 / 用户点「重试」）。2 秒去抖。 */
-    fun requestProbe() {
+    fun requestProbe(action: NetworkChangeAction = NetworkChangeAction.None) {
+        if (action != NetworkChangeAction.None) {
+            _networkActions.tryEmit(action)
+        }
         val now = System.currentTimeMillis()
         val previous = lastRequest.get()
         if (now - previous < DEBOUNCE_MS) return

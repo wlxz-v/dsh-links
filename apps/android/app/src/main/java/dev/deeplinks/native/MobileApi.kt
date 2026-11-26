@@ -743,6 +743,9 @@ internal fun shouldBlockLocalHostRemoval(revokeError: Throwable?): Boolean =
 
 internal fun friendlyNetworkError(error: Throwable): String {
     remoteErrorText(error)?.let { return it }
+    if ((error as? MobileApiHttpException)?.httpCode == 409) {
+        return L.settingsChangedElsewhere
+    }
     val msg = error.message.orEmpty()
     return when {
         msg.contains("rate limited") -> L.requestTooFrequent
@@ -763,6 +766,7 @@ internal fun remoteErrorText(error: Throwable): String? {
         is RouteOpenTimeoutException -> L.remoteHostOffline
         is RouteRateLimitedException -> L.requestTooFrequent
         is RouteServerBusyException -> L.remoteBusy
+        is dev.deeplinks.core.remote.RouteBusyException -> L.remoteBusy
         is RouteRejectedException -> when (route.code) {
             "BAD_MAC", "UNKNOWN_KEY" -> L.remoteCredentialInvalid
             "CLOCK_SKEW" -> L.remoteClockSkew

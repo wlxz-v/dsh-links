@@ -9,6 +9,8 @@ import java.net.Socket
 import java.util.Locale
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 
 private val DROP_REQUEST = setOf(
     "host", "connection", "upgrade", "content-length", "transfer-encoding",
@@ -17,6 +19,7 @@ private val DROP_REQUEST = setOf(
 
 /** 把本地预览请求经 HostHttp 转到插件。设备 token 只加在这一跳。 */
 internal fun hostPreviewExchange(host: Host, forward: PreviewForward): PreviewHttpResult {
+    assertSafePreviewPluginPath(forward.pluginPath)
     val headers = authHeaders(host) + forward.headers.filter { it.first.lowercase(Locale.US) !in DROP_REQUEST }
     val media = forward.headers.firstOrNull { it.first.equals("content-type", true) }?.second
     val response = HostHttp.execute(
@@ -45,53 +48,83 @@ internal fun hostPreviewExchange(host: Host, forward: PreviewForward): PreviewHt
 
 /** 本地 WebSocket 与插件上的预览 WebSocket 互转文本和二进制帧。 */
 internal fun hostPreviewWebSocket(host: Host, forward: PreviewForward, client: Socket, accept: () -> Unit) {
+    assertSafePreviewPluginPath(forward.pluginPath)
     val ready = CountDownLatch(1)
-    var failed = false
-    lateinit var upstream: WebSocket
+    val acceptedLatch = CountDownLatch(1)
+    val writeLock = Any()
+    val failed = AtomicBoolean(false)
+    val upstream = AtomicReference<WebSocket?>(null)
     val listener = object : WebSocketListener() {
         override fun onOpen(webSocket: WebSocket, response: Response) {
-            upstream = webSocket
+            upstream.set(webSocket)
             ready.countDown()
         }
 
         override fun onMessage(webSocket: WebSocket, text: String) {
-            writeServerFrame(client.getOutputStream(), 0x1, text.toByteArray(Charsets.UTF_8))
+            if (!acceptedLatch.await(10, TimeUnit.SECONDS)) return
+            synchronized(writeLock) {
+                runCatching { writeServerFrame(client.getOutputStream(), 0x1, text.toByteArray(Charsets.UTF_8)) }
+            }
         }
 
         override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
-            writeServerFrame(client.getOutputStream(), 0x2, bytes.toByteArray())
+            if (!acceptedLatch.await(10, TimeUnit.SECONDS)) return
+            synchronized(writeLock) {
+                runCatching { writeServerFrame(client.getOutputStream(), 0x2, bytes.toByteArray()) }
+            }
         }
 
         override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
             webSocket.close(code, null)
-            try { client.close() } catch (_: Exception) {}
+            runCatching { client.close() }
         }
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-            failed = true
+            failed.set(true)
             ready.countDown()
-            try { client.close() } catch (_: Exception) {}
+            acceptedLatch.countDown()
+            runCatching { client.close() }
         }
     }
     val headers = authHeaders(host) + forward.headers.filter { it.first.lowercase(Locale.US) !in DROP_REQUEST }
     val socket = HostHttp.openWebSocket(host, forward.pluginPath, headers, listener)
-    if (!ready.await(20, TimeUnit.SECONDS) || failed) {
+    if (!ready.await(20, TimeUnit.SECONDS) || failed.get()) {
         socket.cancel()
         return
     }
-    accept()
-    val input = client.getInputStream()
-    while (true) {
-        val frame = readClientFrame(input) ?: break
-        when (frame.opcode) {
-            0x1 -> upstream.send(frame.payload.toString(Charsets.UTF_8))
-            0x2 -> upstream.send(frame.payload.toByteString())
-            0x8 -> {
-                upstream.close(1000, null)
-                break
+    val activeUpstream = upstream.get() ?: run {
+        socket.cancel()
+        return
+    }
+    try {
+        synchronized(writeLock) { accept() }
+        acceptedLatch.countDown()
+        val input = client.getInputStream()
+        while (true) {
+            val frame = readClientFrame(input) ?: break
+            when (frame.opcode) {
+                0x1 -> activeUpstream.send(frame.payload.toString(Charsets.UTF_8))
+                0x2 -> activeUpstream.send(frame.payload.toByteString())
+                0x8 -> {
+                    activeUpstream.close(1000, null)
+                    break
+                }
+                0x9 -> synchronized(writeLock) {
+                    writeServerFrame(client.getOutputStream(), 0xA, frame.payload)
+                }
             }
-            0x9 -> writeServerFrame(client.getOutputStream(), 0xA, frame.payload)
         }
+    } finally {
+        acceptedLatch.countDown()
+        runCatching { activeUpstream.close(1000, null) }
+    }
+}
+
+private fun assertSafePreviewPluginPath(pluginPath: String) {
+    val pathOnly = pluginPath.substringBefore('?')
+    require(pathOnly.startsWith("/dsh-link/mobile/preview/")) { "invalid preview path" }
+    require(!pathOnly.contains("..") && !pathOnly.contains("%2e", ignoreCase = true) && !pathOnly.contains('\\') && !pathOnly.contains("%5c", ignoreCase = true)) {
+        "unsafe preview path"
     }
 }
 

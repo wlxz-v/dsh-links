@@ -73,7 +73,9 @@ class WebSocketTunnelSocketFactory(
     )
 
     private val client: OkHttpClient by lazy {
-        val builder = OkHttpClient.Builder().retryOnConnectionFailure(false)
+        val builder = OkHttpClient.Builder()
+            .retryOnConnectionFailure(false)
+            .pingInterval(30, TimeUnit.SECONDS)
         if (outerPin.isNotEmpty()) {
             val trustManager = PinnedSsl.pinnedTrustManager(outerPin)
             val context = SSLContext.getInstance("TLS")
@@ -109,7 +111,7 @@ class WebSocketTunnelSocketFactory(
         override fun connect(endpoint: SocketAddress?, timeout: Int) {
             if (closed.get()) throw SocketException("Socket is closed")
             if (connected) throw SocketException("already connected")
-            connectTimeoutMs = minOf(if (timeout > 0) timeout else 10_000, 10_000)
+            connectTimeoutMs = if (timeout > 0) minOf(timeout, 30_000) else 15_000
             val request = Request.Builder().url(this@WebSocketTunnelSocketFactory.endpoint).build()
             webSocket = client.newWebSocket(request, TunnelListener())
             try {
@@ -150,13 +152,15 @@ class WebSocketTunnelSocketFactory(
                         offset += count
                     }
                     if (!MessageDigest.isEqual(secret, received)) throw IOException("gateway authentication failed")
-                    peer.soTimeout = readTimeoutMs
+                    // peer 只负责上行转发（client→server），SSE 与空闲池连接长时间无上行字节，必须无限等待；
+                    // OkHttp 的读取超时只作用于 localSocket（下游读方向）。
+                    peer.soTimeout = 0
                     gatewayPeer = peer
                     peerReady.countDown()
                     pumpUpstream(peer)
                 } catch (e: Exception) {
                     if (!closed.get()) failure = e as? IOException ?: IOException("gateway failed", e)
-                    ready.countDown()
+                    peerReady.countDown()
                     closeTunnel()
                 } finally {
                     runCatching { server.close() }
@@ -164,17 +168,21 @@ class WebSocketTunnelSocketFactory(
             }, "dsh-dlp-gateway").apply { isDaemon = true; start() }
 
             val local = Socket()
-            local.tcpNoDelay = tcpNoDelay
-            local.connect(InetSocketAddress(InetAddress.getByName("127.0.0.1"), server.localPort), connectTimeoutMs)
-            local.getOutputStream().write(secret)
-            local.getOutputStream().flush()
-            if (!peerReady.await(connectTimeoutMs.toLong(), TimeUnit.MILLISECONDS)) {
-                local.close()
-                throw SocketTimeoutException("local tunnel gateway timed out")
+            try {
+                local.tcpNoDelay = tcpNoDelay
+                local.connect(InetSocketAddress(InetAddress.getByName("127.0.0.1"), server.localPort), connectTimeoutMs)
+                local.getOutputStream().write(secret)
+                local.getOutputStream().flush()
+                if (!peerReady.await(connectTimeoutMs.toLong(), TimeUnit.MILLISECONDS)) {
+                    throw SocketTimeoutException("local tunnel gateway timed out")
+                }
+                failure?.let { throw it }
+                local.soTimeout = readTimeoutMs
+                localSocket = local
+            } catch (e: Exception) {
+                runCatching { local.close() }
+                throw e
             }
-            failure?.let { throw it }
-            local.soTimeout = readTimeoutMs
-            localSocket = local
         }
 
         private fun pumpUpstream(peer: Socket) {
@@ -267,7 +275,14 @@ class WebSocketTunnelSocketFactory(
             }
 
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
-                signalRemoteEof()
+                if (ready.count != 0L) {
+                    failure = mapClose(code, reason)
+                    ready.countDown()
+                    webSocket.close(1000, "")
+                    closeTunnel()
+                } else {
+                    signalRemoteEof()
+                }
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
