@@ -607,12 +607,21 @@ private fun DiffNoteRow(text: String) {
     )
 }
 
+private const val SYNC_DIFF_LINE_THRESHOLD = 120
+
 @Composable
 private fun DiffLines(diff: WorkspaceFileDiff.Text, wrap: Boolean) {
-    // diffRows 含词级 LCS 行内比对：放到 Default 线程计算，避免大文件在主线程卡顿掉帧
-    val allRows by produceState<List<DiffRow>>(initialValue = emptyList(), key1 = diff) {
-        value = withContext(Dispatchers.Default) { diffRows(diff.hunks) }
+    // 小 diff（≤120 行）同步计算，避免首帧白屏闪动；大文件放到 Default 线程避免掉帧
+    val lineCount = remember(diff) { diff.hunks.sumOf { it.lines.size } }
+    val syncRows = remember(diff, lineCount) {
+        if (lineCount <= SYNC_DIFF_LINE_THRESHOLD) diffRows(diff.hunks) else null
     }
+    val asyncRows by produceState<List<DiffRow>>(initialValue = emptyList(), key1 = diff, key2 = syncRows) {
+        if (syncRows == null) {
+            value = withContext(Dispatchers.Default) { diffRows(diff.hunks) }
+        }
+    }
+    val allRows = syncRows ?: asyncRows
     // 已展开的折叠段（存「被折叠片段在 allRows 里的起始下标」）；切换文件时随 diff 重置
     var expandedFolds by remember(diff) { mutableStateOf(emptySet<Int>()) }
     val rows = remember(allRows, expandedFolds) { foldContextRows(allRows, expandedFolds) }
