@@ -572,4 +572,3 @@ fun busyEnterLabel(value: String?): String = when (canonicalBusyEnter(value)) {
     "steer" -> L.busySteer
     else -> L.busyQueue
 }
-

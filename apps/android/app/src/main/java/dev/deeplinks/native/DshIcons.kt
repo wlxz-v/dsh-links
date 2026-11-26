@@ -3496,6 +3496,3 @@ val ChatOutline16: ImageVector by lazy {
         }
     }.build()
 }
-
-    /** ListTreeOutline16 */
-    /** UsersOutline16 */

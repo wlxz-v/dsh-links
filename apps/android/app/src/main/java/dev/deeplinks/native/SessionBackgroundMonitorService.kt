@@ -18,7 +18,6 @@ import dev.deeplinks.core.ApprovalActionReceiver
 import dev.deeplinks.core.Host
 import dev.deeplinks.core.HOST_MONITOR_IDLE_MS
 import dev.deeplinks.core.HostLink
-import dev.deeplinks.core.NetworkChangeAction
 import dev.deeplinks.core.hostMonitorShouldReconnect
 import dev.deeplinks.core.isHostSessionActive
 import dev.deeplinks.core.stepHostMonitor

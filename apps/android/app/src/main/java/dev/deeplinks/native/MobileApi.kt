@@ -1,6 +1,5 @@
 package dev.deeplinks.native
 import dev.deeplinks.native.util.optStringOrEmpty
-import dev.deeplinks.core.DshStrings
 import dev.deeplinks.core.BoundedIo
 import dev.deeplinks.core.Host
 import dev.deeplinks.core.HostCapabilitiesCache
@@ -27,8 +26,6 @@ import dev.deeplinks.native.MobileApiClient
 import android.util.Log
 import org.json.JSONObject
 import dev.deeplinks.native.util.optNullableString
-import dev.deeplinks.native.util.parseStoppedReason
-import dev.deeplinks.native.util.presentOrNull
 import dev.deeplinks.native.util.redactRequestPath
 
 class MobileApiClient(private val host: Host) {
@@ -778,4 +775,3 @@ internal fun remoteErrorText(error: Throwable): String? {
         else -> L.remoteRelayUnreachable
     }
 }
-
