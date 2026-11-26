@@ -11,7 +11,7 @@
 | --- | --- |
 | 仓库 | `D:/DSH/dsh-links`（本地） / `https://github.com/wlxz-v/dsh-links`（远端） |
 | 来源 | 分叉自原作者 **lunaship** 的 `dsh-links`（MIT）；原仓库已下架，本项目为社区分支 |
-| 分支 / 当前基线 | `main` = `6503f17`（2026-11-27 全绿） |
+| 分支 / 当前基线 | `main` = `6503f17`（最后一次全绿；其后 `a608268` 起为纯文档提交） |
 | 插件版本 | `package.json` → `0.1.0-beta.20`（注意：Android `versionName` 是 `0.5.0-beta.27`，两者独立演进） |
 | 三端 | 插件（Node ESM，`src/`）+ Android（Kotlin/Compose，`apps/android`）+ Go 中继（`relay/`） |
 | 主要门禁 | `ci.yml`（Node 单测 + Go race + DLP/1 e2e）、`ci-android.yml`（ktlint + 864 单测 + 截图基线 + R8 + 模拟器冒烟） |
