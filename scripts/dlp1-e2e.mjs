@@ -466,7 +466,10 @@ async function main() {
   await check("§13.1 Agent 永不连接 127.0.0.1:<pluginPort> 以外的地址", async () => {
     const source = readFileSync(join(ROOT, "src", "remote", "agent.js"), "utf8")
     const dials = source.match(/net\.(?:createConnection|connect)\([^)]*\)/g) ?? []
-    assert(dials.length === 1 && dials[0] === "net.createConnection({ host: \"127.0.0.1\", port: this.#pluginPort })", `本地 dial 点：${JSON.stringify(dials)}`)
+    const isDirect = dials[0] === "net.createConnection({ host: \"127.0.0.1\", port: this.#pluginPort })"
+    const isResolvedPort = dials[0] === "net.createConnection({ host: \"127.0.0.1\", port })" &&
+      /const port = this\.#pluginPort\(\)/.test(source)
+    assert(dials.length === 1 && (isDirect || isResolvedPort), `本地 dial 点：${JSON.stringify(dials)}`)
     assert(!/tls\.connect\(\{[^}]*host:/.test(source), "存在按参数指定 host 的 tls.connect")
     return { note: "唯一的本地 dial 点写死 127.0.0.1 与构造参数 pluginPort；目标地址不来自任何消息" }
   })
