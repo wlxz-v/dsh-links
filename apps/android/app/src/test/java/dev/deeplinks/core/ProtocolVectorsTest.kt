@@ -76,6 +76,13 @@ class ProtocolVectorsTest {
     }
 
     @Test
+    fun pluginCompatSpecIsParseable() {
+        val compatObj = spec().getJSONObject("plugin").getJSONObject("compat")
+        assertTrue(compatObj.getString("minAppVersion").isNotBlank())
+        assertEquals(1, compatObj.getInt("protocolVersion"))
+    }
+
+    @Test
     fun blankSessionIdIsIgnored() {
         assertEquals(null, parseHostStateFields("""{"state":"idle"}"""))
         assertEquals(null, parseHostStateFields("not json"))

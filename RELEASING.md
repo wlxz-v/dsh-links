@@ -21,7 +21,7 @@ GitHub `wlxz-v/dsh-links` = **插件源码、DLP/1 中继源码（`relay/`）、
 - [ ] 用真实 Android 设备完成配对、会话/SSE、审批、吊销、重启后重连验收；远程改动还要在蜂窝网络下跑一遍远程首配与 Wi‑Fi / 蜂窝切换。
 - [ ] 创建 tag `app-v<versionName>`，打 GitHub Release（Pre-release），上传签名 APK 与 `app-release.apk.sha256`；Release 说明附版本号、APK SHA-256、证书 SHA-256、最低 Android 版本与安装说明。
 - [ ] 校验和与 `shasum -a 256` 输出一致。
-- [ ] 更新 `docs/COMPATIBILITY.md` 记录新组合。
+- [ ] 更新 `docs/COMPATIBILITY.md` 记录新组合，并运行 `node scripts/check-versions.mjs` 校验三端版本号一致。
 
 ## 对外口径
 

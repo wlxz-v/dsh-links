@@ -881,5 +881,9 @@ val DshStringsEn = DshStrings(
         put("diagOldPlugin", "This computer's plugin has no diagnostics report. The other checks still apply.")
         put("diagHostEmpty", "No computer-side checks.")
         put("diagRunning", "Checking…")
+        put("compatBannerTitle", "Version compatibility notice")
+        put("compatPluginTooOld", "Computer plugin is %1\$s; %2\$s or newer is recommended.")
+        put("compatAppTooOld", "This plugin requires app %2\$s or newer (current %1\$s).")
+        put("compatLegacyPlugin", "Computer plugin is older and does not report compatibility info.")
     }
 )

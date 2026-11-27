@@ -496,6 +496,15 @@ internal fun SettingsHome(
                     }
                 },
             )
+            val compatText = when (val cs = dev.deeplinks.core.HostCompatCache.status(host.slotKey)) {
+                is dev.deeplinks.core.CompatStatus.PluginTooOld -> s.translation("compatPluginTooOld").format(cs.current, cs.recommended)
+                is dev.deeplinks.core.CompatStatus.AppTooOld -> s.translation("compatAppTooOld").format(cs.current, cs.required)
+                is dev.deeplinks.core.CompatStatus.LegacyPlugin -> s.translation("compatLegacyPlugin")
+                else -> null
+            }
+            if (compatText != null) {
+                DshListRow(title = s.translation("compatBannerTitle"), subtitle = compatText, icon = InfoOutline16)
+            }
         } else {
             DshListRow(
                 title = s.noDevicesYet,

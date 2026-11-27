@@ -880,5 +880,9 @@ val DshStringsZh = DshStrings(
         put("diagOldPlugin", "这台电脑的插件还没有连接诊断，其余检查仍然有效。")
         put("diagHostEmpty", "没有拉到电脑侧的检查结果。")
         put("diagRunning", "正在检查…")
+        put("compatBannerTitle", "版本兼容提示")
+        put("compatPluginTooOld", "电脑端插件为 %1\$s，建议升级至 %2\$s 及以上。")
+        put("compatAppTooOld", "当前插件要求 App %2\$s 及以上（当前 %1\$s）。")
+        put("compatLegacyPlugin", "电脑端插件版本较旧，未声明版本兼容信息。")
     }
 )

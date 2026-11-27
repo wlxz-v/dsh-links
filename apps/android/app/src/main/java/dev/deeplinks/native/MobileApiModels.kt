@@ -165,6 +165,8 @@ data class MobileBootstrap(
     val previewDetect: Boolean = false,
     /** 实测缺失的宿主能力（capabilities.host.missing）；对应入口直接藏，老插件不发为空集。 */
     val hostMissing: Set<String> = emptySet(),
+    /** 插件版本与最低兼容 App 版本声明（capabilities.compat）；老插件为 null。 */
+    val compat: dev.deeplinks.core.PluginCompatInfo? = null,
 )
 
 data class SessionRequestState(

@@ -41,6 +41,7 @@
     "check:patches": "node scripts/check-patches.mjs",
     "check:contracts": "node scripts/probe-host.mjs --static",
     "probe:host": "node scripts/probe-host.mjs",
+    "check:versions": "node scripts/check-versions.mjs",
     "test:dlp1-e2e": "node scripts/dlp1-e2e.mjs"
   },
   "dependencies": {

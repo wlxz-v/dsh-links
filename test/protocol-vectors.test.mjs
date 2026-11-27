@@ -67,6 +67,9 @@ test("protocol vectors: 能力声明包含 spec 里承诺的每一项", () => {
   assert.equal(caps.requests.snapshot, spec.plugin.requests.snapshot)
   assert.equal(caps.files.workspace, spec.plugin.files.workspace)
   assert.equal(caps.diagnostics.v, spec.plugin.diagnostics.v)
+  assert.equal(caps.compat.minAppVersion, spec.plugin.compat.minAppVersion)
+  assert.equal(caps.compat.protocolVersion, spec.plugin.compat.protocolVersion)
+  assert.ok(typeof caps.compat.pluginVersion === "string" && caps.compat.pluginVersion.length > 0)
 })
 
 test("protocol vectors: /requests 快照的审批与澄清条目字段一致", () => {

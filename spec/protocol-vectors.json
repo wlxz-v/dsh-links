@@ -11,7 +11,8 @@
     "requests": { "snapshot": true },
     "events": { "host": true, "since": true },
     "files": { "workspace": true, "sha256": true },
-    "diagnostics": { "v": 1 }
+    "diagnostics": { "v": 1 },
+    "compat": { "minAppVersion": "0.5.0-beta.27", "protocolVersion": 1 }
   },
   "snapshot": {
     "request": "/dsh-link/mobile/sessions/:id/requests",

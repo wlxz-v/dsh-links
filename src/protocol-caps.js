@@ -1,7 +1,12 @@
 /** 业务层能力协商。远程通道（DLP/1）与内层证书钉扎不因这些字段改变。 */
 
+import { createRequire } from "node:module"
 import { MAX_WORKSPACE_DIR_ENTRIES, MAX_WORKSPACE_FILE_BYTES } from "./workspace-file.js"
 import { MAX_DIFF_LINES } from "./workspace-changes.js"
+
+const require = createRequire(import.meta.url)
+const DEFAULT_PLUGIN_VERSION = require("../package.json").version
+export const MIN_COMPAT_APP_VERSION = "0.5.0-beta.27"
 
 export const PLUGIN_PROTOCOL = 2
 export const CAP_SYNC2 = "sync2"
@@ -26,7 +31,7 @@ export function parseClientCaps(raw) {
  *   服务（DSH 0.1.7 起的 `@deepseek-ai/dsh-workspace-changes`）；host：宿主能力探针的结论
  *   （`{ checkedAt, missing, unknown }`，见 host-probe.js）。旧 App 忽略未知字段。
  */
-export function pluginCapabilities({ changes = false, host } = {}) {
+export function pluginCapabilities({ changes = false, host, pluginVersion = DEFAULT_PLUGIN_VERSION, minAppVersion = MIN_COMPAT_APP_VERSION } = {}) {
   return {
     protocol: PLUGIN_PROTOCOL,
     sync: { resync: true, catchupIntegrity: true },
@@ -52,6 +57,11 @@ export function pluginCapabilities({ changes = false, host } = {}) {
     ...(host && typeof host === "object" ? { host } : {}),
     // 已批准的本机预览端口。detect=1 表示可以列出工具输出里看到的端口。旧 App 忽略未知字段。手机不能批准端口。
     preview: { v: 1, detect: 1 },
+    compat: {
+      pluginVersion,
+      minAppVersion,
+      protocolVersion: 1,
+    },
   }
 }
 

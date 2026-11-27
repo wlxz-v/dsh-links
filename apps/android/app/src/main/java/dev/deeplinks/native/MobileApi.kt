@@ -2,7 +2,11 @@ package dev.deeplinks.native
 import dev.deeplinks.native.util.optStringOrEmpty
 import dev.deeplinks.core.BoundedIo
 import dev.deeplinks.core.Host
+import dev.deeplinks.BuildConfig
 import dev.deeplinks.core.HostCapabilitiesCache
+import dev.deeplinks.core.HostCompatCache
+import dev.deeplinks.core.checkCompatibility
+import dev.deeplinks.core.parsePluginCompat
 import dev.deeplinks.core.HostHttp
 import dev.deeplinks.core.JsonHttpCache
 import dev.deeplinks.core.conditionalJsonGet
@@ -201,8 +205,10 @@ class MobileApiClient(private val host: Host) {
             preview = root.optJSONObject("capabilities")?.optJSONObject("preview")?.optInt("v") == 1,
             previewDetect = root.optJSONObject("capabilities")?.optJSONObject("preview")?.optInt("detect") == 1,
             hostMissing = parseMissingHostRemotes(root.optJSONObject("capabilities")?.optJSONObject("host")),
+            compat = parsePluginCompat(root.optJSONObject("capabilities")?.optJSONObject("compat")),
         )
         HostCapabilitiesCache.put(host.slotKey, info.hostMissing)
+        HostCompatCache.put(host.slotKey, checkCompatibility(BuildConfig.VERSION_NAME, info.compat))
         return info to applyBootstrapRemote(host, root)
     }
 
