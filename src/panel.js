@@ -869,6 +869,37 @@ const createPanelModule = (require) => {
     )
   }
 
+  const FEATURE_ITEMS = [
+    { key: "previewProxy", title: "本地预览代理", desc: "允许手机通过中转查看电脑已批准的本地开发端口" },
+    { key: "workspaceFiles", title: "工作区文件与改动", desc: "允许手机浏览工作区目录、下载文件与查看本轮 diff" },
+    { key: "diagnostics", title: "手机端连接诊断", desc: "允许手机拉取只读诊断快照（电脑面板始终可用）" },
+  ]
+
+  function FeaturesGroup({ features, actions }) {
+    if (!features) return null
+    const map = features.features || {}
+    return h(Group, { title: "功能开关" },
+      FEATURE_ITEMS.map((item) => {
+        const on = map[item.key] !== false
+        return h(Row, {
+          key: item.key,
+          title: item.title,
+          desc: item.desc,
+          actions: h("button", {
+            type: "button",
+            className: on ? "dl-btn is-primary" : "dl-btn",
+            onClick: () => actions.setFeature(item.key, !on),
+          }, on ? "已开启" : "已关闭"),
+        })
+      }),
+      h(Row, {
+        title: "远程连接（DLP/1）",
+        desc: "在上方「远程连接」分区控制，切换立即生效",
+        actions: h("span", { className: "dl-note" }, features.remoteRelay ? "已开启" : "已关闭"),
+      }),
+    )
+  }
+
   function ExposureNote({ exposure }) {
     if (exposure?.level !== 'untrusted' || !exposure.warning) return null
     return h('p', { className: 'dl-banner is-danger' }, exposure.warning)
@@ -884,7 +915,7 @@ const createPanelModule = (require) => {
   }
 
   function usePanelData(active) {
-    const [data, setData] = React.useState({ info: null, devices: [], workspaceApprovals: [], remote: null, previews: [], detected: [] })
+    const [data, setData] = React.useState({ info: null, devices: [], workspaceApprovals: [], remote: null, previews: [], detected: [], features: null })
     const [err, setErr] = React.useState('')
     // pair-info 503(proxy_not_ready) = HTTPS 还没 listen；有限重试后给出明确失败
     const [starting, setStarting] = React.useState(false)
@@ -926,20 +957,22 @@ const createPanelModule = (require) => {
         }
         if (!resInfo.ok) throw new Error(`HTTP ${resInfo.status}`)
         startRetries.current = 0
-        const [resDevices, resApprovals, resRemote, resPreviews] = await Promise.all([
+        const [resDevices, resApprovals, resRemote, resPreviews, resFeatures] = await Promise.all([
           fetch('/dsh-link/devices', { signal }),
           fetch('/dsh-link/workspace-approvals', { signal }),
           fetch('/dsh-link/remote-status', { signal }).catch(() => null),
           fetch('/dsh-link/previews', { signal }).catch(() => null),
+          fetch('/dsh-link/features.json', { signal }).catch(() => null),
         ])
         if (!mountedRef.current || seq !== reqSeq.current) return
         if (!resDevices.ok || !resApprovals.ok) throw new Error(`HTTP ${resDevices.status}/${resApprovals.status}`)
-        const [info, devices, approvals, remote, previewBody] = await Promise.all([
+        const [info, devices, approvals, remote, previewBody, featureBody] = await Promise.all([
           resInfo.json(),
           resDevices.json(),
           resApprovals.json(),
           resRemote?.ok ? resRemote.json().catch(() => null) : null,
           resPreviews?.ok ? resPreviews.json().catch(() => null) : null,
+          resFeatures?.ok ? resFeatures.json().catch(() => null) : null,
         ])
         if (!mountedRef.current || seq !== reqSeq.current) return
         const nextDevices = devices.devices ?? []
@@ -954,6 +987,7 @@ const createPanelModule = (require) => {
           remote,
           previews: previewBody ? (previewBody.previews ?? []) : prev.previews,
           detected: previewBody ? (previewBody.detected ?? []) : prev.detected,
+          features: featureBody ?? prev.features,
         }))
         setStarting(false)
         setErr('')
@@ -1001,6 +1035,9 @@ const createPanelModule = (require) => {
       remoteReset: () => after(postJson('/dsh-link/remote-reset-identity', { confirm: true })),
       approvePreview: (body) => postJson('/dsh-link/previews', body).finally(load),
       revokePreview: (previewId) => after(postJson('/dsh-link/previews/revoke', { previewId }).catch(() => {})),
+      setFeature: (name, enabled) => postJson('/dsh-link/features', { [name]: enabled })
+        .then((next) => setData((prev) => ({ ...prev, features: next })))
+        .catch(() => load()),
     }
     return { ...data, err, starting, load, actions }
   }
@@ -1008,7 +1045,7 @@ const createPanelModule = (require) => {
   // ─── 组装 ────────────────────────────────────────────────────────────────
 
   function PanelBody(pair) {
-    const { info, devices, workspaceApprovals, remote, previews, detected, err, starting, load, actions } = pair
+    const { info, devices, workspaceApprovals, remote, previews, detected, features, err, starting, load, actions } = pair
     if (starting) return h('div', { className: 'dl-status' }, '手机连接正在启动…')
     if (err) return h('div', { className: 'dl-status is-error' }, `加载失败：${err}`)
     if (!info) return h('div', { className: 'dl-status' }, '加载中…')
@@ -1018,6 +1055,7 @@ const createPanelModule = (require) => {
       h(RemoteGroup, { remote, actions }),
       h(DevicesGroup, { devices, remote, actions }),
       h(PreviewGroup, { previews, detected, actions }),
+      h(FeaturesGroup, { features, actions }),
       h(DiagnosticsGroup, {}),
       h(ExposureNote, { exposure: info.exposure }),
     )

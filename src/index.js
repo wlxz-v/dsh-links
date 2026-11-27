@@ -54,6 +54,7 @@ export {
 }
 
 import { createPreviewService, rejectUpgrade, matchPreviewPath } from "./preview-proxy.js"
+import { createFeatureManager } from "./features.js"
 import { createPreviewDetector, publicDetections, refreshPreviewDetections, DETECT_HISTORY_MESSAGES } from "./preview-detect.js"
 import { workspaceChangesService } from "./workspace-changes.js"
 import { resolveSessionLogPathAsync, sessionDirFor } from "./session-log-path.js"
@@ -957,6 +958,7 @@ async function handleStreamRoute(sessionId, res, targetPort, config, req, rt, de
     capabilities: pluginCapabilities({
       changes: Boolean(workspaceChangesService(rt.workspaceChanges)),
       host: rt.hostProbe?.capabilities?.(),
+      features: rt.features?.snapshot?.().features,
     }),
   })}\n\n`)
   try { res.flush?.() } catch {}
@@ -1112,6 +1114,8 @@ const PANEL_ONLY_PATHS = new Set([
   "/dsh-link/diagnostics",
   "/dsh-link/previews",
   "/dsh-link/previews/revoke",
+  "/dsh-link/features.json",
+  "/dsh-link/features",
 ])
 
 function sessionEvents(session) {
@@ -1309,6 +1313,8 @@ export function apply(ctx, config) {
     call: (method, params, opts) => callLocalRpc(targetPort, method, params ?? {}, opts),
   })
   rt.hostProbe = hostProbe
+  const features = createFeatureManager({ state, save: () => saveState(stateFile, state) })
+  rt.features = features
   let inflightDetections = null
   async function currentDetections() {
     if (inflightDetections) return inflightDetections
@@ -1664,6 +1670,38 @@ export function apply(ctx, config) {
         json(res, 200, { ok: true, ...view })
       },
     }),
+    web.register({
+      kind: "exact",
+      path: "/dsh-link/features.json",
+      handler: (req, res) => {
+        if (!guardAdminGet(req, res)) return
+        json(
+          res,
+          200,
+          { ...features.snapshot(), remoteRelay: Boolean(remote.status()?.enabled) },
+          ADMIN_NO_STORE_HEADERS,
+        )
+      },
+    }),
+    web.register({
+      kind: "exact",
+      path: "/dsh-link/features",
+      handler: async (req, res) => {
+        const body = await readLoopbackPost(req, res)
+        if (!body) return
+        const result = features.update(body)
+        if (!result.ok) return json(res, result.status, { error: result.error }, ADMIN_NO_STORE_HEADERS)
+        if (result.disabledNow?.includes("previewProxy")) {
+          try { previews.stop() } catch {}
+        }
+        json(
+          res,
+          200,
+          { features: result.features, updatedAt: result.updatedAt, remoteRelay: Boolean(remote.status()?.enabled) },
+          ADMIN_NO_STORE_HEADERS,
+        )
+      },
+    }),
   ]
 
   /**
@@ -1984,14 +2022,19 @@ export function apply(ctx, config) {
           return handleHostEvents(req, res, hostEvents)
         }
         if (req.method === "GET" && pathname === "/dsh-link/mobile/previews") {
+          if (!features.isEnabled("previewProxy")) return json(res, 403, { error: "feature_disabled", feature: "previewProxy" })
           return json(res, 200, { previews: previews.listPublic() })
         }
         if (req.method === "GET" && pathname === "/dsh-link/mobile/preview-detections") {
+          if (!features.isEnabled("previewProxy")) return json(res, 403, { error: "feature_disabled", feature: "previewProxy" })
           let detections = []
           try { detections = await currentDetections() } catch { detections = [] }
           return json(res, 200, { detections })
         }
-        if (previews.handleHttp(req, res, device.deviceId)) return
+        if (matchPreviewPath(pathname)) {
+          if (!features.isEnabled("previewProxy")) return json(res, 403, { error: "feature_disabled", feature: "previewProxy" })
+          if (previews.handleHttp(req, res, device.deviceId)) return
+        }
         const streamMatch = pathname.match(/^\/dsh-link\/mobile\/sessions\/([^/]+)\/stream$/)
         if (req.method === "GET" && streamMatch) {
           const sessionId = safeDecodeUriComponent(streamMatch[1])
@@ -2031,6 +2074,10 @@ export function apply(ctx, config) {
         return
       }
       touchDevice(state, device, stateFile)
+      if (!features.isEnabled("previewProxy")) {
+        rejectUpgrade(socket, 403, "feature_disabled")
+        return
+      }
       previews.handleUpgrade(req, socket, head, device.deviceId)
     })
     // 远程每条连接都是一次 WSS + 会合 + 内层 TLS，必须让 App 的连接池复用（RFC §4.2）。

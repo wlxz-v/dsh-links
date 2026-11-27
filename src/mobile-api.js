@@ -384,6 +384,9 @@ export async function handleMobileApi(req, res, targetPort, state, stateFile, de
       if (!requireJsonWrite(req, res)) return
     }
     if (req.method === "GET" && pathname === "/dsh-link/mobile/diagnostics") {
+      if (rt.features && !rt.features.isEnabled("diagnostics")) {
+        return json(res, 403, { error: "feature_disabled", feature: "diagnostics" })
+      }
       const source = typeof diagnosticsSource === "function" ? diagnosticsSource(device) : null
       if (!source) return json(res, 503, { error: "diagnostics_unavailable" })
       const report = await runDiagnostics(source, { scope: "mobile" })
@@ -399,6 +402,7 @@ export async function handleMobileApi(req, res, targetPort, state, stateFile, de
         capabilities: pluginCapabilities({
           changes: Boolean(workspaceChangesService(rt.workspaceChanges)),
           host: rt.hostProbe?.capabilities?.(),
+          features: rt.features?.snapshot?.().features,
         }),
         host: { name: hostname(), deviceId: state.deviceId },
         device: { name: device.name },
@@ -890,6 +894,9 @@ export async function handleMobileApi(req, res, targetPort, state, stateFile, de
 
     const fileMatch = pathname.match(/^\/dsh-link\/mobile\/sessions\/([^/]+)\/file$/)
     if (req.method === "GET" && fileMatch) {
+      if (rt.features && !rt.features.isEnabled("workspaceFiles")) {
+        return json(res, 403, { error: "feature_disabled", feature: "workspaceFiles" })
+      }
       const sessionId = safeDecodeUriComponent(fileMatch[1])
       if (!sessionId) return json(res, 400, { error: "sessionId 无效" })
       // 只有正在查看该会话（持有活跃 SSE 订阅）的设备才能下载其文件。
@@ -934,6 +941,9 @@ export async function handleMobileApi(req, res, targetPort, state, stateFile, de
     // 工作区文件树：按层列目录，与 /file 同一沙箱与订阅门槛（只有正在查看该会话的设备可列）。
     const treeMatch = pathname.match(/^\/dsh-link\/mobile\/sessions\/([^/]+)\/tree$/)
     if (req.method === "GET" && treeMatch) {
+      if (rt.features && !rt.features.isEnabled("workspaceFiles")) {
+        return json(res, 403, { error: "feature_disabled", feature: "workspaceFiles" })
+      }
       const sessionId = safeDecodeUriComponent(treeMatch[1])
       if (!sessionId) return json(res, 400, { error: "sessionId 无效" })
       if (!isDeviceSubscribedToSession(rt, sessionId, device.deviceId)) {
@@ -958,6 +968,9 @@ export async function handleMobileApi(req, res, targetPort, state, stateFile, de
     // 本轮改动文件：转发 Host workspaceChanges（摘要 = 路径 + 行数；对比 = 按需取的 hunk）。
     const changesMatch = pathname.match(/^\/dsh-link\/mobile\/sessions\/([^/]+)\/changes(\/diff)?$/)
     if (req.method === "GET" && changesMatch) {
+      if (rt.features && !rt.features.isEnabled("workspaceFiles")) {
+        return json(res, 403, { error: "feature_disabled", feature: "workspaceFiles" })
+      }
       const sessionId = safeDecodeUriComponent(changesMatch[1])
       if (!sessionId) return json(res, 400, { error: "sessionId 无效" })
       const isDiff = Boolean(changesMatch[2])
