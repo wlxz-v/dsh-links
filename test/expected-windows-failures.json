@@ -1,0 +1,5 @@
+{
+  "schemaVersion": 1,
+  "description": "Known Windows environment-specific test failures baseline (empty on current main).",
+  "entries": []
+}

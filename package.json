@@ -35,8 +35,9 @@
   },
   "scripts": {
     "build:client": "node build-client.mjs",
-    "test": "node --test --test-force-exit test/*.mjs",
-    "prepack": "node build-client.mjs && node --test --test-force-exit test/*.mjs",
+    "test": "node scripts/run-tests.mjs",
+    "test:file": "node --test --test-isolation=none --test-force-exit",
+    "prepack": "node build-client.mjs && node scripts/run-tests.mjs",
     "test:dlp1-e2e": "node scripts/dlp1-e2e.mjs"
   },
   "dependencies": {
