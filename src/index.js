@@ -29,6 +29,7 @@ import {
   listenExposure,
 } from "./lan-address.js"
 import {
+  ADMIN_NO_STORE_HEADERS,
   ifNoneMatchHit,
   isLoopbackAddress,
   json,
@@ -285,6 +286,16 @@ function pairInfo(config, state, certFingerprint, port = config.port) {
   info.issuedAt = Date.now()
   info.expiresAt = state.pairing?.expiresAt ?? null
   return info
+}
+
+/** 回环面板的只读 GET 守卫。 */
+function guardAdminGet(req, res) {
+  if (!requireLoopbackSameOrigin(req, res)) return false
+  if (req.method !== "GET") {
+    json(res, 405, { error: "method not allowed" })
+    return false
+  }
+  return true
 }
 
 /** 回环面板的 JSON POST。响应已写出时返回 null。 */
@@ -1415,7 +1426,7 @@ export function apply(ctx, config) {
       kind: "exact",
       path: "/dsh-link/pair-info",
       handler: (req, res) => {
-        if (!requireLoopbackSameOrigin(req, res)) return
+        if (!guardAdminGet(req, res)) return
         if (readiness.phase !== "ready") return proxyPending(res)
         sweepExpiredPending(state, stateFile, rt)
         // 面板只需要远程的状态与地址（决定码下方的文案）；bootstrap 种子只随二维码图片出去
@@ -1424,7 +1435,7 @@ export function apply(ctx, config) {
           res,
           200,
           { ...pairInfo(config, state, fp(), boundPort()), remoteStatus: { state: view.state, host: view.host } },
-          { "cache-control": "no-store" },
+          ADMIN_NO_STORE_HEADERS,
         )
       },
     }),
@@ -1432,7 +1443,7 @@ export function apply(ctx, config) {
       kind: "exact",
       path: "/dsh-link/qr.png",
       handler: (req, res) => {
-        if (!requireLoopbackSameOrigin(req, res)) return
+        if (!guardAdminGet(req, res)) return
         if (readiness.phase !== "ready") return proxyPending(res)
         return qrPng(res, config, state, fp(), remote.qrPayload(), boundPort())
       },
@@ -1486,9 +1497,8 @@ export function apply(ctx, config) {
       kind: "exact",
       path: "/dsh-link/workspace-approvals",
       handler: (req, res) => {
-        if (!requireLoopbackSameOrigin(req, res)) return
-        if (req.method !== "GET") return json(res, 405, { error: "method not allowed" })
-        json(res, 200, { approvals: rt.workspaceApprovals.list() })
+        if (!guardAdminGet(req, res)) return
+        json(res, 200, { approvals: rt.workspaceApprovals.list() }, ADMIN_NO_STORE_HEADERS)
       },
     }),
     web.register({
@@ -1539,13 +1549,12 @@ export function apply(ctx, config) {
       kind: "exact",
       path: "/dsh-link/diagnostics",
       handler: async (req, res) => {
-        if (!requireLoopbackSameOrigin(req, res)) return
-        if (req.method !== "GET") return json(res, 405, { error: "method not allowed" })
+        if (!guardAdminGet(req, res)) return
         if (readiness.phase !== "ready") return proxyPending(res)
         try {
           const report = await runDiagnostics(diagnosticsSource(null), { scope: "panel" })
           ctx.logger.info(`dsh-links: diagnostics scope=panel ${report.checks.map((item) => `${item.id}=${item.status}`).join(" ")}`)
-          json(res, 200, report)
+          json(res, 200, report, ADMIN_NO_STORE_HEADERS)
         } catch (err) {
           ctx.logger.warn(`dsh-links: diagnostics failed: ${err?.message ?? err}`)
           json(res, 500, { error: "diagnostics failed" })
@@ -1567,7 +1576,7 @@ export function apply(ctx, config) {
             detectedError = String(err?.code ?? err?.message ?? "error").slice(0, 40)
             try { ctx.logger.warn(`dsh-links: preview detection failed: ${detectedError}`) } catch {}
           }
-          return json(res, 200, { previews: previews.listPanel(), detected, ...(detectedError ? { detectedError } : {}) })
+          return json(res, 200, { previews: previews.listPanel(), detected, ...(detectedError ? { detectedError } : {}) }, ADMIN_NO_STORE_HEADERS)
         }
         if (req.method !== "POST") return json(res, 405, { error: "method not allowed" })
         const body = await readLoopbackPost(req, res)
@@ -1590,11 +1599,11 @@ export function apply(ctx, config) {
       kind: "exact",
       path: "/dsh-link/devices",
       handler: (req, res) => {
-        if (!requireLoopbackSameOrigin(req, res)) return
+        if (!guardAdminGet(req, res)) return
         sweepExpiredPending(state, stateFile, rt)
         json(res, 200, {
           devices: state.devices.map(publicDevice),
-        })
+        }, ADMIN_NO_STORE_HEADERS)
       },
     }),
     // ---------- 远程连接面板 API（RFC §6.6；全部回环同源，且在 PANEL_ONLY_PATHS 里对 18640 隐藏） ----------
@@ -1602,8 +1611,8 @@ export function apply(ctx, config) {
       kind: "exact",
       path: "/dsh-link/remote-status",
       handler: (req, res) => {
-        if (!requireLoopbackSameOrigin(req, res)) return
-        json(res, 200, remote.status())
+        if (!guardAdminGet(req, res)) return
+        json(res, 200, remote.status(), ADMIN_NO_STORE_HEADERS)
       },
     }),
     web.register({

@@ -140,11 +140,14 @@ export function json(res, code, obj, extraHeaders) {
   res.end(method === "HEAD" ? undefined : encoded)
 }
 
+export const ADMIN_NO_STORE_HEADERS = Object.freeze({
+  "cache-control": "no-store",
+  vary: "accept-encoding, origin, sec-fetch-site",
+})
+
 export function isLoopbackHostname(hostname) {
   const host = String(hostname ?? "").toLowerCase().replace(/^\[|\]$/g, "")
-  if (host === "localhost" || host === "::1") return true
-  const parts = host.split(".")
-  return parts.length === 4 && parts[0] === "127" && parts.every((part) => /^\d{1,3}$/.test(part) && Number(part) <= 255)
+  return host === "localhost" || host === "127.0.0.1" || host === "::1"
 }
 
 /**
@@ -166,14 +169,31 @@ export function safeDecodeUriComponent(raw) {
   }
 }
 
-export function requireLoopbackSameOrigin(req, res) {
+function hasDuplicateHeader(rawHeaders, name) {
+  if (!Array.isArray(rawHeaders)) return false
+  const target = name.toLowerCase()
+  let count = 0
+  for (let i = 0; i < rawHeaders.length; i += 2) {
+    if (String(rawHeaders[i] ?? "").toLowerCase() === target) {
+      count += 1
+      if (count > 1) return true
+    }
+  }
+  return false
+}
+
+export function requireLoopbackSameOrigin(req, res, { expectedPort } = {}) {
   const remote = req.socket?.remoteAddress ?? req.connection?.remoteAddress
   if (!isLoopbackAddress(remote)) {
     json(res, 403, { error: "forbidden" })
     return false
   }
+  if (hasDuplicateHeader(req.rawHeaders, "host") || Array.isArray(req.headers?.host)) {
+    json(res, 403, { error: "forbidden" })
+    return false
+  }
   const host = headerVal(req.headers, "host")
-  if (!host) {
+  if (!host || /\s/.test(host)) {
     json(res, 403, { error: "forbidden" })
     return false
   }
@@ -184,19 +204,38 @@ export function requireLoopbackSameOrigin(req, res) {
     json(res, 403, { error: "forbidden" })
     return false
   }
-  if (!isLoopbackHostname(hostUrl.hostname)) {
+  if (hostUrl.username || hostUrl.password || hostUrl.pathname !== "/" || !isLoopbackHostname(hostUrl.hostname)) {
+    json(res, 403, { error: "forbidden" })
+    return false
+  }
+  const targetPort = Number.isInteger(expectedPort) && expectedPort > 0
+    ? expectedPort
+    : (Number.isInteger(req.socket?.localPort) && req.socket.localPort > 0 ? req.socket.localPort : null)
+  if (targetPort !== null) {
+    const hostPort = hostUrl.port ? Number(hostUrl.port) : (req.socket?.encrypted ? 443 : 80)
+    if (!Number.isInteger(hostPort) || hostPort !== targetPort) {
+      json(res, 403, { error: "forbidden" })
+      return false
+    }
+  }
+  if (Array.isArray(req.headers?.["sec-fetch-site"])) {
     json(res, 403, { error: "forbidden" })
     return false
   }
   const fetchSite = headerVal(req.headers, "sec-fetch-site")
-  if (fetchSite && fetchSite !== "same-origin" && fetchSite !== "none") {
+  if (fetchSite !== undefined && fetchSite !== "same-origin" && fetchSite !== "none") {
+    json(res, 403, { error: "forbidden" })
+    return false
+  }
+  if (Array.isArray(req.headers?.origin)) {
     json(res, 403, { error: "forbidden" })
     return false
   }
   const origin = headerVal(req.headers, "origin")
   if (origin !== undefined) {
     try {
-      if (new URL(origin).host !== hostUrl.host) {
+      const originUrl = new URL(origin)
+      if ((originUrl.protocol !== "http:" && originUrl.protocol !== "https:") || originUrl.username || originUrl.password || originUrl.host !== hostUrl.host) {
         json(res, 403, { error: "forbidden" })
         return false
       }
