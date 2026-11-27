@@ -139,10 +139,13 @@ dsh-links/
 ```bash
 cd D:/DSH/dsh-links
 
-# 全量单测（注意：不要用 npm test 一把梭，见 6.1）
-node --test --test-isolation=none --test-force-exit test/xxx.test.mjs
+# 全量单测（已封装逐文件隔离与基线比对）
+npm test
 
-# 发布前门禁（构建 client.js + 414 项测试）
+# 单文件调试
+npm run test:file -- test/xxx.test.mjs
+
+# 发布前门禁（构建 client.js + 全量测试）
 npm run prepack
 
 # DLP/1 端到端（需要 relay 可起）
@@ -185,32 +188,8 @@ go build ./... && go vet ./... && go test -race ./...
 
 ## 6. 测试与门禁
 
-### 6.1 为什么必须「逐文件 + `--test-isolation=none`」
-
-- 一次 `node --test test/*.mjs` 会挂：测试运行器要 spawn 子进程，本机沙箱报 `spawn EPERM`。
-- 即使 `--test-isolation=none`，把**所有**文件塞进同一个进程也会互相污染（如 remote-plugin 的 5 个远程用例）。
-- 正确姿势：**一个文件一次调用**，脚本化循环。
-
-### 6.2 已知 Windows 环境失败（13 例，不是回归）
-
-| 文件 | 原因 |
-| --- | --- |
-| `auth`、`workspace-create`、`workspace-path`、`workspace-tree` | symlink 需要特权 → 用 `"junction"` 类型 / 环境无权限，属预期 |
-| `auth` | `chmod` 语义断言（Windows 无 POSIX 权限位） |
-| `diagnostics` | `openssl` 不存在 → 改走 `selfsigned` |
-| `plugin-package` | `npm` 不在 PATH → 用 `node_modules/npm/bin/npm-cli.js` |
-| `session-log-path` | POSIX 分隔符断言 vs Windows 反斜杠 → 用 `path.join()` |
-
-判断标准：失败集合**恰好等于**这 13 例 → 视为与改造前基线一致。
-
-### 6.3 硬约束（违反会被 CI 抓）
-
-- `CodeHygieneTest` 的函数体行数/文件行数基线**只能下调**，不许上调。
-  - 注意它把**单表达式函数**（无花括号）量到「下一个行尾 `{`」，而 `object DshNotifier {` 正好在文件末尾 → 新增函数会连带把前面的函数判超预算。修法是合并进已有函数或写成块体。
-- `DshSizeUsageTest` 守护裸 `dp` 使用：production 代码里裸尺寸只降不升（用 `fillMaxHeight(0.85f)` 这类相对值替代 `heightIn(max=640.dp)`）。
-- Compose 截图基线只能由 `.github/workflows/regen-screenshots.yml` 在 ubuntu-latest 生成；开发机不许生成后提交。
-- **绝不**对 release 变体跑 `connectedAndroidTest`（会卸载用户配对数据）。
-- `src/preview-proxy.js` 的 `PREVIEW_BLACKLIST` 内容被测试精确断言，不要「顺手优化」。
+- **一键全量运行**：`npm test`（`node scripts/run-tests.mjs`）会按文件逐个以 `--test-isolation=none --test-force-exit` 隔离执行，并与 `test/expected-windows-failures.json` 比对基线（Linux CI 默认 `--strict` 要求 0 失败）。单文件运行用 `npm run test:file -- test/<name>.test.mjs`。
+- 详细原理、历史 Windows 环境差异与全部 CI 硬约束（`CodeHygieneTest`、`DshSizeUsageTest`、截图基线、release 测试禁忌、`PREVIEW_BLACKLIST`）已集中迁移至 [`docs/pitfalls.md`](pitfalls.md)。
 
 ---
 
@@ -267,27 +246,9 @@ go build ./... && go vet ./... && go test -race ./...
 | 手机一直走公网中继而非局域网 | `state.json` 里设备 `via:"remote"` | 防火墙入站规则（18640）需放行；排查手机 VPN/AP 隔离 |
 | Windows 思考内容读不到 | 目录是否形如 `--C-Users-~65E0~754C15X--` | `src/session-log-path.js` 编码对齐宿主实现 |
 
-### 9.3 本机排障专用
+### 9.3 本机排障与已知坑位索引
 
-- **agy 沙箱内 `java.exe` 报 `STATUS_DLL_INIT_FAILED (-1073741502)`**：继承的 `DisallowWin32kSystemCalls` 限制；用 `Invoke-CimMethod Win32_Process Create` 起进程并读 `.exit` 文件。
-- `java` 不在 PATH：必须写绝对路径 `D:/DSH/android-tools/jdk-21.0.13/bin/java.exe`。
-- `cmd //c gradlew.bat` 在部分沙箱只打印横幅不执行：直接调 `java -classpath ...gradle-launcher-9.5.0.jar org.gradle.launcher.GradleMain`。
-- PowerShell 经工具转发会丢嵌套引号/`$_`：复杂脚本写成 `.ps1` 或 `.mjs` 文件再执行。
-
----
-
-## 10. 已知坑与禁忌
-
-1. 不要上调 `CodeHygieneTest` 基线（只许下调）。
-2. 不要动 `PREVIEW_BLACKLIST` 的内容（测试精确断言）。
-3. 不要用 `npm test` / `node --test test/*.mjs` 跑全量（会挂，见 6.1）。
-4. 不要在开发机生成并提交 Compose 截图基线。
-5. 不要对 release 变体跑 connectedAndroidTest。
-6. 不要直接读 `config.port` 构造对外地址（必须 `boundPort()`）。
-7. 不要在 `detail` 里放带冒号/点的长字符串（会被 ENUM_STRING 清洗）。
-8. 不要把单表达式函数追加到 `DshNotifier.kt` 顶部（会连带量到文件末尾超预算）。
-9. `2c86839` 的教训：**只有 GET 能走条件请求**；写请求必须保留方法与 body，无 body 的 DELETE 要补 `Content-Type: application/json`（否则服务端 415）。
-10. `state.json` 是全局共享（`~/.dsh/dsh-links/state.json`）：冒烟测试必须用 `stateDir` 隔离，**不要吊销用户设备**。
+- Windows 沙箱 `java.exe` / `gradlew` / PowerShell 排障要点与全部 10 条历史禁忌已迁入 [`docs/pitfalls.md`](pitfalls.md)（重点锚点：`#windows-sandbox-java`、`#code-hygiene-dsh-notifier`、`#delete-content-type-415`、`#bound-port-not-config`、`#state-dir-isolation`）。
 
 ---
 
@@ -311,10 +272,6 @@ go build ./... && go vet ./... && go test -race ./...
 
 ---
 
-## 12. 尚未做的方向（按价值排序）
+## 12. 尚未做的方向与技术债
 
-1. **设备/会话有效期**：当前配对后永久有效；建议 90 天设备 TTL + 8 小时会话 TTL。
-2. **管理路由 DNS-rebinding 防护**：面板/配对路由加「仅回环 + Host 白名单 + `Sec-Fetch-Site`」三重校验。
-3. **第二台手机配对**：电脑面板设 PIN，已配对手机输入后出示一次性 QR。
-4. **分发**：一键安装脚本 + npm 发布 + 插件市场索引。
-5. **中继就近化**：外网场景自建更近 relay，或引导用户走 Tailscale。
+已迁移至 [`docs/debt-backlog.md`](debt-backlog.md)（含暂缓原因与触发重开的信号）。

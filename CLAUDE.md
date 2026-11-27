@@ -21,8 +21,13 @@ DSH 手机插件（本仓插件源码）：局域网配对 + 设备管理 + 1864
 
 ## 深入文档
 
+> 通用任务路由表与硬约束总入口见 [`AGENTS.md`](AGENTS.md)，已知坑位锚点见 [`docs/pitfalls.md`](docs/pitfalls.md)。
+
 | 主题 | 文件 |
 |---|---|
+| 通用 AI 协作与场景路由表 | `AGENTS.md` |
+| 已知坑位与约束锚点 | `docs/pitfalls.md` |
+| 暂缓需求与技术债 | `docs/debt-backlog.md` |
 | 架构总览（分层 / 目录契约 / 数据流，新人入口） | `docs/ARCHITECTURE.md` |
 | 手机同步契约（字段级，改手机 API 必读） | `docs/MOBILE_SYNC_CONTRACT.md` |
 | 兼容矩阵 / DSH 基线 / 冒烟隔离警告 | `docs/COMPATIBILITY.md` |
