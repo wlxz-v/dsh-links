@@ -109,6 +109,7 @@ internal fun ApprovalDecisionBar(
             if (!ok) error = L.approvalNotAccepted
         }
     }
+    val isHighRisk = msg.riskLevel == "high"
     DlDecisionBar(
         status = L.decisionWaitApproval,
         question = when {
@@ -122,7 +123,25 @@ internal fun ApprovalDecisionBar(
         secondary = DlAction(L.reject, { submit("rejected") }, enabled = !submitting),
         primary = DlAction(L.allowOnce, { submit("allowed-once") }, enabled = !submitting),
         modifier = modifier,
-        extra = error?.let { message -> { DecisionError(message) } },
+        extra = if (isHighRisk || error != null) {
+            {
+                if (isHighRisk) HighRiskWarningNote(msg.riskReason)
+                error?.let { message -> DecisionError(message) }
+            }
+        } else {
+            null
+        },
+        primaryContent = if (isHighRisk) {
+            { btnModifier ->
+                HoldToApproveButton(
+                    enabled = !submitting,
+                    onConfirmed = { submit("allowed-once") },
+                    modifier = btnModifier,
+                )
+            }
+        } else {
+            null
+        },
     )
 }
 

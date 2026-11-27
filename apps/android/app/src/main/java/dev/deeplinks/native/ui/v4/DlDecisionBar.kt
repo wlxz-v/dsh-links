@@ -57,6 +57,7 @@ fun DlDecisionBar(
     options: List<DlDecisionOption> = emptyList(),
     /** 选项下方的补充内容（如自定义答案输入框、提交失败提示）。 */
     extra: (@Composable ColumnScope.() -> Unit)? = null,
+    primaryContent: (@Composable (Modifier) -> Unit)? = null,
 ) {
     Column(modifier.fillMaxWidth().background(Dsh.bgBase)) {
         HorizontalDivider(thickness = 1.dp, color = Dsh.outline)
@@ -119,7 +120,11 @@ fun DlDecisionBar(
                 horizontalArrangement = Arrangement.spacedBy(DshSpace.s12),
             ) {
                 DlButton(secondary.copy(style = DlButtonStyle.Tonal), Modifier.weight(1f))
-                DlButton(primary.copy(style = DlButtonStyle.Filled), Modifier.weight(1f))
+                if (primaryContent != null) {
+                    primaryContent(Modifier.weight(1f))
+                } else {
+                    DlButton(primary.copy(style = DlButtonStyle.Filled), Modifier.weight(1f))
+                }
             }
         }
     }

@@ -21,6 +21,7 @@ class ApprovalActionReceiver : BroadcastReceiver() {
         val sessionId = intent.getStringExtra(EXTRA_SESSION_ID) ?: return
         val approvalId = intent.getStringExtra(EXTRA_APPROVAL_ID) ?: return
         val approve = intent.getBooleanExtra(EXTRA_APPROVE, false)
+        val riskLevel = intent.getStringExtra(EXTRA_RISK_LEVEL)
         val host = HostStore.load(context).resolveFromIntentExact(intent) ?: return
         val prefs = WorkspacePrefs(context)
         // 兜底顺序：先看接管是否还开着，再看通知栏直批开关，最后才是锁屏。
@@ -33,6 +34,7 @@ class ApprovalActionReceiver : BroadcastReceiver() {
                 backgroundTakeover = prefs.backgroundTakeover,
                 quickApprove = prefs.allowApproveFromNotification,
                 locked = locked,
+                riskLevel = riskLevel,
             )
         ) {
             ApprovalReceiverDecision.Cancel -> DshNotifier.cancelApproval(context, host, sessionId)
@@ -47,6 +49,7 @@ class ApprovalActionReceiver : BroadcastReceiver() {
         const val EXTRA_SESSION_ID = "approvalSessionId"
         const val EXTRA_APPROVAL_ID = "approvalId"
         const val EXTRA_APPROVE = "approvalApprove"
+        const val EXTRA_RISK_LEVEL = "approvalRiskLevel"
 
         /** 与 ApprovalCard / RequestState 同一套取值，别处改这里也要跟着改。 */
         const val OUTCOME_ALLOW = "allowed-once"
@@ -62,17 +65,20 @@ internal enum class ApprovalReceiverDecision { Cancel, ConfirmInApp, NeedsUnlock
  *
  * 顺序即优先级：
  * 1. 接管已关闭：审批已交回电脑网页，旧通知直接收回；
- * 2. 通知栏直批已被关闭（例如关开关前弹出的旧通知）：不批准，提示去 App 内确认；
- * 3. 锁屏：不批准，提示解锁后在 App 内确认；
- * 4. 其余（拒绝、或允许且条件都满足）交给后台监控服务答复。
+ * 2. 高危命令禁止通知栏直批：提示进 App 二次确认；
+ * 3. 通知栏直批已被关闭（例如关开关前弹出的旧通知）：不批准，提示去 App 内确认；
+ * 4. 锁屏：不批准，提示解锁后在 App 内确认；
+ * 5. 其余（拒绝、或允许且条件都满足）交给后台监控服务答复。
  */
 internal fun approvalReceiverDecision(
     approve: Boolean,
     backgroundTakeover: Boolean,
     quickApprove: Boolean,
     locked: Boolean,
+    riskLevel: String? = null,
 ): ApprovalReceiverDecision = when {
     !backgroundTakeover -> ApprovalReceiverDecision.Cancel
+    approve && riskLevel == "high" -> ApprovalReceiverDecision.ConfirmInApp
     approve && !quickApprove -> ApprovalReceiverDecision.ConfirmInApp
     approve && locked -> ApprovalReceiverDecision.NeedsUnlock
     else -> ApprovalReceiverDecision.Answer

@@ -62,6 +62,8 @@ data class MobileMessage(
     val goalRound: Int? = null,
     val goalMaxRounds: Int? = null,
     val goalObjective: String? = null,
+    val riskLevel: String? = null,
+    val riskReason: String? = null,
 )
 
 @Immutable
@@ -179,6 +181,8 @@ data class SessionRequestState(
     val callId: String? = null,
     /** 审批的工作内容（命令原文等）；老插件不发。 */
     val detail: String? = null,
+    val riskLevel: String? = null,
+    val riskReason: String? = null,
 )
 
 data class SessionRequestSnapshot(
@@ -202,6 +206,8 @@ internal fun parseSessionRequestSnapshot(root: JSONObject): SessionRequestSnapsh
                 toolName = obj.optNullableString("toolName"),
                 callId = obj.optNullableString("callId"),
                 detail = obj.optNullableString("detail"),
+                riskLevel = obj.optNullableString("riskLevel"),
+                riskReason = obj.optNullableString("riskReason"),
             )
         },
         questions = (0 until questions.length()).mapNotNull { i ->

@@ -889,5 +889,8 @@ val DshStringsEn = DshStrings(
         put("checkingUpdates", "Checking…")
         put("updateUpToDate", "You are on the latest version")
         put("updateCheckFailed", "Update check failed")
+        put("highRiskWarning", "High-risk command — hold to confirm")
+        put("holdToApprove", "Hold 1.5s to allow")
+        put("holdToApproveProgress", "Keep holding…")
     }
 )

@@ -22,6 +22,8 @@ data class HostStateFields(
     val approvalToolName: String? = null,
     /** 这次审批要做什么（命令原文等）。 */
     val approvalDetail: String? = null,
+    val approvalRiskLevel: String? = null,
+    val approvalRiskReason: String? = null,
     /** 待回答的澄清请求 id 与第一题题干（双端澄清）。 */
     val questionId: String? = null,
     val questionText: String? = null,
@@ -50,6 +52,8 @@ fun parseHostStateFields(body: String, eventSeq: Long? = null): HostStateFields?
         approvalId = obj.optString("approvalId").takeIf { it.isNotBlank() },
         approvalToolName = obj.optString("approvalToolName").takeIf { it.isNotBlank() },
         approvalDetail = obj.optString("approvalDetail").takeIf { it.isNotBlank() },
+        approvalRiskLevel = obj.optString("approvalRiskLevel").takeIf { it.isNotBlank() },
+        approvalRiskReason = obj.optString("approvalRiskReason").takeIf { it.isNotBlank() },
         questionId = obj.optString("questionId").takeIf { it.isNotBlank() },
         questionText = obj.optString("questionText").takeIf { it.isNotBlank() },
     )

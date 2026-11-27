@@ -70,6 +70,8 @@ private fun coalesceKeyedRequestMessages(
             questionPayloadJson = existing.second.questionPayloadJson ?: message.questionPayloadJson,
             questionOptions = existing.second.questionOptions.ifEmpty { message.questionOptions },
             questionHeader = existing.second.questionHeader ?: message.questionHeader,
+            riskLevel = existing.second.riskLevel ?: message.riskLevel,
+            riskReason = existing.second.riskReason ?: message.riskReason,
         )
         winnerById[key] = existing.first to merged
     }
@@ -108,6 +110,8 @@ internal fun applyRequestSnapshotToMessages(
                     callId = withState.callId ?: rec.callId,
                     // 快照里的工作内容补上历史投影缺的那份（老会话、翻页边界都可能缺）。
                     detail = withState.detail ?: rec.detail,
+                    riskLevel = withState.riskLevel ?: rec.riskLevel,
+                    riskReason = withState.riskReason ?: rec.riskReason,
                     text = withState.text.ifBlank { rec.detail ?: rec.toolName.orEmpty() },
                     takenOverByPhone = true,
                 )
@@ -151,6 +155,8 @@ internal fun mergeMessagesWithRequestSnapshot(
                     text = rec.detail?.takeIf { it.isNotBlank() } ?: rec.toolName.orEmpty(),
                     toolName = rec.toolName,
                     detail = rec.detail,
+                    riskLevel = rec.riskLevel,
+                    riskReason = rec.riskReason,
                     approvalId = rec.id,
                     callId = rec.callId,
                     type = "approval",

@@ -1375,11 +1375,13 @@ fun WorkspaceScreen(
                     type = "approval",
                     seq = item.seq,
                     requestStatus = REQUEST_PENDING,
+                    riskLevel = data.optNullableString("riskLevel"),
+                    riskReason = data.optNullableString("riskReason"),
                 ))
                 workspaceViewModel.refreshRequestSnapshot()
                 val sid = currentSessionId
                 if (!isForeground && sid != null) {
-                    DshNotifier.notifyApproval(context, host, sid, toolName, detail = detail)
+                    DshNotifier.notifyApproval(context, host, sid, toolName, detail = detail, riskLevel = data.optNullableString("riskLevel"), riskReason = data.optNullableString("riskReason"))
                 }
             }
             "approval/decided" -> {

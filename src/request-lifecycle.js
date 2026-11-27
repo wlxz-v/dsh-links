@@ -207,6 +207,8 @@ export function createRequestRegistry({
         detail: rec.detail ?? null,
         headline: rec.headline ?? null,
         reason: rec.reason ?? null,
+        riskLevel: rec.riskLevel === "high" ? "high" : null,
+        riskReason: rec.riskLevel === "high" ? (rec.riskReason ?? null) : null,
       })
     }
     for (const rec of pendingQuestions.values()) {

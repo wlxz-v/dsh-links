@@ -9,6 +9,7 @@
   "plugin": {
     "questions": { "multi": true, "serverValidation": true },
     "requests": { "snapshot": true },
+    "approvals": { "riskLevel": 1 },
     "events": { "host": true, "since": true },
     "files": { "workspace": true, "sha256": true },
     "diagnostics": { "v": 1 },
@@ -19,7 +20,7 @@
     "required": ["version"],
     "approval": {
       "required": ["approvalId", "status", "sessionId", "createdAt", "deadlineAt"],
-      "optional": ["outcome", "callId", "toolName", "detail", "headline", "reason"]
+      "optional": ["outcome", "callId", "toolName", "detail", "headline", "reason", "riskLevel", "riskReason"]
     },
     "question": {
       "required": ["rpcId", "status", "sessionId", "createdAt", "deadlineAt", "questions"],
@@ -27,6 +28,25 @@
     }
   },
   "frames": [
+    {
+      "name": "session/state 高危待审批",
+      "event": "session/state",
+      "required": ["type", "sessionId", "state", "seq", "approvalId"],
+      "optional": ["title", "origin", "notify", "approvalId", "approvalToolName", "approvalDetail", "approvalRiskLevel", "approvalRiskReason", "questionId", "questionText"],
+      "data": {
+        "type": "session/state",
+        "sessionId": "s-1",
+        "state": "awaitingApproval",
+        "title": "会话标题",
+        "origin": "desktop",
+        "seq": 13,
+        "approvalId": "ap-high-1",
+        "approvalToolName": "bash",
+        "approvalDetail": "rm -rf /tmp/build",
+        "approvalRiskLevel": "high",
+        "approvalRiskReason": "destructive_fs"
+      }
+    },
     {
       "name": "session/state",
       "event": "session/state",

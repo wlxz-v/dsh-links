@@ -21,8 +21,9 @@ import java.util.concurrent.ConcurrentHashMap
  * 纯函数：根据设置与 SDK 版本决定审批通知里要挂几个 action，以及每个 action 是不是「允许」。
  * v4 8.2：默认不挂动作，只能点开 App；打开「允许在通知栏直接批准」且系统支持时才给「拒绝 / 允许一次」。
  */
-internal fun approvalActionKinds(quickApprove: Boolean, sdkInt: Int): List<Boolean> {
-    return if (quickApprove && sdkInt >= Build.VERSION_CODES.S) listOf(false, true) else emptyList()
+internal fun approvalActionKinds(quickApprove: Boolean, sdkInt: Int, riskLevel: String? = null): List<Boolean> {
+    if (!quickApprove || sdkInt < Build.VERSION_CODES.S) return emptyList()
+    return if (riskLevel == "high") listOf(false) else listOf(false, true)
 }
 
 /**
@@ -160,6 +161,8 @@ object DshNotifier {
         // 澄清通知复用同一条通道：标题/正文改成「有一道选择题在等你」+ 题干本身。
         titleText: String? = null,
         bodyText: String? = null,
+        riskLevel: String? = null,
+        riskReason: String? = null,
     ) {
         // 阶段 8 第 3 条：设置页的两个开关（存本机）决定发不发。关卡放在这里而不是调用点，
         // 是为了「一个地方管住所有通知」——调用点分散在 WorkspaceActivity 多处，漏一处就是 bug。
@@ -185,10 +188,11 @@ object DshNotifier {
             val kinds = approvalActionKinds(
                 quickApprove = WorkspacePrefs(context).allowApproveFromNotification,
                 sdkInt = Build.VERSION.SDK_INT,
+                riskLevel = riskLevel,
             )
             kinds.forEachIndexed { index, approve ->
                 val label = if (approve) L.allowOnce else L.reject
-                builder.addAction(approvalAction(context, host, sessionId, approvalId, approve, label, 11 + index))
+                builder.addAction(approvalAction(context, host, sessionId, approvalId, approve, label, 11 + index, riskLevel))
             }
         }
         // 锁屏只显示「有一项操作等待确认」，不暴露工具名。
@@ -213,12 +217,14 @@ object DshNotifier {
         approve: Boolean,
         label: String,
         requestCode: Int,
+        riskLevel: String? = null,
     ): NotificationCompat.Action {
         val intent = Intent(context, ApprovalActionReceiver::class.java).apply {
             host.putInto(this)
             putExtra(ApprovalActionReceiver.EXTRA_SESSION_ID, sessionId)
             putExtra(ApprovalActionReceiver.EXTRA_APPROVAL_ID, approvalId)
             putExtra(ApprovalActionReceiver.EXTRA_APPROVE, approve)
+            if (!riskLevel.isNullOrBlank()) putExtra(ApprovalActionReceiver.EXTRA_RISK_LEVEL, riskLevel)
         }
         val pending = PendingIntent.getBroadcast(
             context,

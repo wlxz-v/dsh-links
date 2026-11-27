@@ -44,6 +44,8 @@ class HostEventClient(
             val approvalToolName: String? = null,
             /** 这次审批要做什么（命令原文等），通知正文直接显示；老插件不发。 */
             val approvalDetail: String? = null,
+            val approvalRiskLevel: String? = null,
+            val approvalRiskReason: String? = null,
             /**
              * 待回答的澄清请求 id 与第一题题干（双端澄清）。有它就能在通知栏说清
              * 「在问什么」，点进来由请求快照把整张澄清卡补回；老插件不发。
@@ -211,6 +213,8 @@ class HostEventClient(
                         approvalId = fields.approvalId,
                         approvalToolName = fields.approvalToolName,
                         approvalDetail = fields.approvalDetail,
+                        approvalRiskLevel = fields.approvalRiskLevel,
+                        approvalRiskReason = fields.approvalRiskReason,
                         questionId = fields.questionId,
                         questionText = fields.questionText,
                     ),

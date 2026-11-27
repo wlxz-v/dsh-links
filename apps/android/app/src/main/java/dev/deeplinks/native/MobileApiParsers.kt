@@ -154,6 +154,8 @@ internal fun parseHistoryResponse(root: JSONObject, beforeSeq: Long?): HistoryRe
             goalRound = obj.optJSONObject("goal")?.optIntOrNull("round"),
             goalMaxRounds = obj.optJSONObject("goal")?.optIntOrNull("maxRounds"),
             goalObjective = obj.optJSONObject("goal")?.optNullableString("objective"),
+            riskLevel = obj.optNullableString("riskLevel"),
+            riskReason = obj.optNullableString("riskReason"),
         )
     }
     // stats（StatsLine：轮次/步骤/LLM 耗时/工具调用/首 token/吞吐/缓存/tokens）

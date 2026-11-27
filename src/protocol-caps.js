@@ -41,6 +41,7 @@ export function pluginCapabilities({ changes = false, host, features = null, plu
     sync: { resync: true, catchupIntegrity: true },
     questions: { multi: true, serverValidation: true },
     requests: { snapshot: true, reconnectGraceMs: RECONNECT_GRACE_MS },
+    approvals: { riskLevel: 1 },
     // 排队消息管理、目标操作、定时任务（DSH 不支持的 Host 上会返回 400/502，App 据此隐藏入口）
     control: { queue: true, goals: true, schedules: true },
     ...(filesEnabled

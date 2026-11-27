@@ -65,6 +65,7 @@ test("protocol vectors: 能力声明包含 spec 里承诺的每一项", () => {
   assert.equal(caps.events.since, spec.plugin.events.since)
   assert.equal(caps.questions.multi, spec.plugin.questions.multi)
   assert.equal(caps.requests.snapshot, spec.plugin.requests.snapshot)
+  assert.equal(caps.approvals.riskLevel, spec.plugin.approvals.riskLevel)
   assert.equal(caps.files.workspace, spec.plugin.files.workspace)
   assert.equal(caps.diagnostics.v, spec.plugin.diagnostics.v)
   assert.equal(caps.compat.minAppVersion, spec.plugin.compat.minAppVersion)

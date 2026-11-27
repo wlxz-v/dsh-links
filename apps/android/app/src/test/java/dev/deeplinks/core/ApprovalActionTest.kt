@@ -98,4 +98,34 @@ class ApprovalActionTest {
             ),
         )
     }
+
+    @Test
+    fun `high risk omits quick allow action even when quick approve enabled`() {
+        val kinds = approvalActionKinds(quickApprove = true, sdkInt = 34, riskLevel = "high")
+        assertEquals(listOf(false), kinds)
+    }
+
+    @Test
+    fun `high risk allow intent falls back to ConfirmInApp`() {
+        assertEquals(
+            ApprovalReceiverDecision.ConfirmInApp,
+            approvalReceiverDecision(
+                approve = true,
+                backgroundTakeover = true,
+                quickApprove = true,
+                locked = false,
+                riskLevel = "high",
+            ),
+        )
+        assertEquals(
+            ApprovalReceiverDecision.Answer,
+            approvalReceiverDecision(
+                approve = false,
+                backgroundTakeover = true,
+                quickApprove = true,
+                locked = false,
+                riskLevel = "high",
+            ),
+        )
+    }
 }

@@ -94,6 +94,7 @@ import {
 import { createRemoteRuntime } from "./remote/runtime.js"
 import { createHostProbe } from "./host-probe.js"
 import { oneLine, toolCallDetail } from "./approval-detail.js"
+import { classifyApprovalRisk } from "./approval-risk.js"
 
 import { applyMobileSessionSafety, handleMobileApi } from "./mobile-api.js"
 import { hostDiagnosticsSource, runDiagnostics, tlsExpiryMs } from "./diagnostics.js"
@@ -1746,6 +1747,10 @@ export function apply(ctx, config) {
         callId: req?.callId ?? null,
         toolName: req?.toolName ?? req?.name ?? req?.payload?.toolName ?? null,
         reason: typeof req?.reason === "string" && req.reason.trim() ? req.reason.trim().slice(0, 400) : null,
+        ...(() => {
+          const risk = classifyApprovalRisk({ toolName: req?.toolName ?? req?.name, detail: req?.reason })
+          return risk.riskLevel === "high" ? { riskLevel: "high", riskReason: risk.riskReason } : {}
+        })(),
         signal: req?.signal,
         settle: (outcome) => resolve(APPROVAL_OUTCOMES.has(outcome) ? outcome : "unavailable"),
       }
@@ -1788,6 +1793,11 @@ export function apply(ctx, config) {
             const call = (history?.events ?? []).find((item) =>
               item?.event?.type === "tool/call" && String(item.event.data?.callId ?? "") === callId)
             const detail = toolCallDetail(rec.toolName, call?.event?.data?.arguments)
+            const risk = classifyApprovalRisk({ toolName: rec.toolName, toolArgs: call?.event?.data?.arguments, detail })
+            if (risk.riskLevel === "high") {
+              rec.riskLevel = "high"
+              rec.riskReason = risk.riskReason
+            }
             if (!detail) return
             rec.detail = detail
             rec.headline = oneLine(detail)
@@ -1914,6 +1924,8 @@ export function apply(ctx, config) {
           pendingApprovalToolName: approval?.toolName ?? null,
           // 通知栏也要能看见「在跑什么命令」，否则只能盲批。
           pendingApprovalDetail: approval?.detail ? String(approval.detail).slice(0, 600) : null,
+          pendingApprovalRiskLevel: approval?.riskLevel === "high" ? "high" : null,
+          pendingApprovalRiskReason: approval?.riskLevel === "high" ? (approval.riskReason ?? null) : null,
           pendingQuestion: questions.has(item?.sessionId),
           // 双端澄清：通知栏带上请求 id 与题干，点进来就能直接答。
           pendingQuestionId: questions.get(item?.sessionId)?.id || null,

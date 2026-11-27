@@ -888,5 +888,8 @@ val DshStringsZh = DshStrings(
         put("checkingUpdates", "正在检查…")
         put("updateUpToDate", "当前已是最新版本")
         put("updateCheckFailed", "检查更新失败")
+        put("highRiskWarning", "高危命令，请核对后长按确认")
+        put("holdToApprove", "长按 1.5s 允许")
+        put("holdToApproveProgress", "继续按住…")
     }
 )

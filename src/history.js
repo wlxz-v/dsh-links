@@ -1,5 +1,6 @@
 import { classifyUserMessage } from "./context-injection.js"
 import { toolCallDetail } from "./approval-detail.js"
+import { approvalRiskFields } from "./approval-risk.js"
 import { mutationPath, toolResultContent, toolResultIsError, toolResultMeta, uniquePaths } from "./produced-files.js"
 import { mapApprovalUiStatus } from "./request-lifecycle.js"
 import { MAX_EMBEDDED_CHANGED_FILES, projectChangesSummary } from "./workspace-changes.js"
@@ -194,6 +195,7 @@ export function projectHistoryPage({ events, reasoningBySeq = new Map(), hasMore
         toolName,
         // App 的决策栏优先从 args 里取 command/cmd/script；老 App 忽略多出来的键。
         ...(args ? { args } : {}),
+        ...approvalRiskFields({ toolName, toolArgs: callArgs, detail }),
         approvalId,
         callId: e.data?.callId ?? "",
         requestStatus: decided ? approvalUiStatus(outcome) : "pending",
@@ -220,6 +222,7 @@ export function projectHistoryPage({ events, reasoningBySeq = new Map(), hasMore
         reason,
         toolName,
         ...(args ? { args } : {}),
+        ...approvalRiskFields({ toolName, toolArgs: callArgs, detail }),
         approvalId,
         callId: e.data?.callId ?? "",
         requestStatus: approvalUiStatus(outcome),

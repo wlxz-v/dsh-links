@@ -269,7 +269,7 @@ class SessionBackgroundMonitorService : Service() {
                 // 双端审批：宿主把审批同时给了电脑和手机。带上 approvalId 就能在通知上
                 // 直接「允许一次 / 拒绝」（先答先算）；老插件不给 id 时退回旧提示。
                 if (!approvalId.isNullOrBlank() && !tool.isNullOrBlank()) {
-                    DshNotifier.notifyApproval(this, host, item.sessionId, tool, approvalId, title, item.approvalDetail)
+                    DshNotifier.notifyApproval(this, host, item.sessionId, tool, approvalId, title, item.approvalDetail, riskLevel = item.approvalRiskLevel, riskReason = item.approvalRiskReason)
                 } else {
                     DshNotifier.notifyHandleOnComputer(this, host, item.sessionId, title)
                 }
@@ -287,7 +287,7 @@ class SessionBackgroundMonitorService : Service() {
                 val approvalId = item.approvalId
                 val tool = item.approvalToolName
                 if (background && !approvalId.isNullOrBlank() && !tool.isNullOrBlank()) {
-                    DshNotifier.notifyApproval(this, host, item.sessionId, tool, approvalId, item.title.ifBlank { sessionTitle }, item.approvalDetail)
+                    DshNotifier.notifyApproval(this, host, item.sessionId, tool, approvalId, item.title.ifBlank { sessionTitle }, item.approvalDetail, riskLevel = item.approvalRiskLevel, riskReason = item.approvalRiskReason)
                 } else {
                     // 老插件未在主机事件里带 approvalId/toolName 时再回查 /requests 补齐
                     reconcilePendingApproval(host, item.sessionId)

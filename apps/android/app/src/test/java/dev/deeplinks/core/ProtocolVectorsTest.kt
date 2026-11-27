@@ -54,6 +54,8 @@ class ProtocolVectorsTest {
             assertEquals(data.optString("approvalDetail").takeIf { it.isNotBlank() }, fields.approvalDetail)
             assertEquals(data.optString("questionId").takeIf { it.isNotBlank() }, fields.questionId)
             assertEquals(data.optString("questionText").takeIf { it.isNotBlank() }, fields.questionText)
+            assertEquals(data.optString("approvalRiskLevel").takeIf { it.isNotBlank() }, fields.approvalRiskLevel)
+            assertEquals(data.optString("approvalRiskReason").takeIf { it.isNotBlank() }, fields.approvalRiskReason)
         }
     }
 
