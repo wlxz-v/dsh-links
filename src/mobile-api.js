@@ -24,6 +24,7 @@ import { decompressZstdFrames } from "./zstd-frames.js"
 import { getBounded, setBounded } from "./bounded-map.js"
 import { safeDecodeUriComponent } from "./http-utils.js"
 import { DEVICE_MUTATION_REVOKED } from "./device-mutation-gate.js"
+import { runIsolatedSessionModelSwitch } from "./session-model.js"
 
 const MAX_REASONING_CACHE = 32
 const MAX_ACTIVITY_CACHE = 256
@@ -309,16 +310,23 @@ async function selectSessionModel(targetPort, sessionId, provider, model, reason
     group?.id ? { sessionId, provider: group.id, model: resolvedModel } : null,
     group?.name ? { sessionId, provider: group.name, model: resolvedModel } : null,
   ])
-  let lastErr
-  for (const payload of attempts) {
-    if (!stillAuthorized()) return DEVICE_MUTATION_REVOKED
-    try {
-      return await callLocalRpc(targetPort, "session.selectModel", payload)
-    } catch (err) {
-      lastErr = err
-    }
-  }
-  throw lastErr ?? new Error("切换模型失败")
+  return runIsolatedSessionModelSwitch({
+    rpcCall: (method, payload) => callLocalRpc(targetPort, method, payload),
+    isRevoked: (result) => result === DEVICE_MUTATION_REVOKED,
+    onWarn: (err) => console.warn(`dsh-links: restore agent-default-model failed: ${err?.message ?? err}`),
+    executeSelect: async () => {
+      let lastErr
+      for (const payload of attempts) {
+        if (!stillAuthorized()) return DEVICE_MUTATION_REVOKED
+        try {
+          return await callLocalRpc(targetPort, "session.selectModel", payload)
+        } catch (err) {
+          lastErr = err
+        }
+      }
+      throw lastErr ?? new Error("切换模型失败")
+    },
+  })
 }
 
 async function readSessionLogText(path) {
