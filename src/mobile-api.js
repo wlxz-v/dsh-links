@@ -275,6 +275,7 @@ function uniqueRpcPayloads(payloads) {
  * 推理等级不在该模型允许列表里时回落到默认等级；再按候选载荷依次尝试 session.selectModel。
  * （445a21f 拆分 mobile-api.js 时曾漏掉本函数，接口一直 ReferenceError，见 mobile-error-map 测试。）
  */
+// @patch(select-model-payload-retry)
 async function selectSessionModel(targetPort, sessionId, provider, model, reasoningEffort, stillAuthorized = () => true) {
   let groups = []
   try {

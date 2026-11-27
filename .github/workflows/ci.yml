@@ -44,6 +44,9 @@ jobs:
       - name: Run tests
         run: pnpm test
 
+      - name: Check patches registry
+        run: pnpm run check:patches
+
       - name: Verify plugin package contents
         run: npm pack --dry-run
 

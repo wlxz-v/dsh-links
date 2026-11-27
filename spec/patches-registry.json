@@ -1,0 +1,53 @@
+{
+  "schemaVersion": 1,
+  "patches": [
+    {
+      "id": "gateway-peer-recreate",
+      "file": "src/index.js",
+      "for": "DSH 0.2.x typertGateway request.peer & gateway/peer-disposed",
+      "why": "DSH 0.2.x validates request.peer in prepareInvocation and throws gateway/peer-disposed after host reload or session dispose; lazy recreate avoids forcing a client restart.",
+      "until": "Host typertGateway manages owner peer lifecycle transparently or auto-rebinds disposed peers.",
+      "test": "test/host-probe.test.mjs"
+    },
+    {
+      "id": "local-rpc-http-fallback",
+      "file": "src/local-rpc.js",
+      "for": "DSH typertGateway absent / headless test HTTP fallback (/api/{ns}/{method})",
+      "why": "Allows unary RPC calls in unit tests or startup windows before typertGateway is active via loopback HTTP POST.",
+      "until": "typertGateway is guaranteed active in all runtime and test harnesses.",
+      "test": "test/rpc-allowlist.test.mjs"
+    },
+    {
+      "id": "schedule-edit-fallback",
+      "file": "src/mobile-session-control.js",
+      "for": "DSH 0.2.x schedule/edit vs 0.1.x schedule/update and schedule/delete",
+      "why": "DSH 0.2.x merged schedule/update and schedule/delete into schedule/edit; fallback on missing-method keeps 0.1.7-alpha.1 hosts working.",
+      "until": "Minimum supported DSH host version is >= 0.2.0 and 0.1.x fallback is retired.",
+      "test": "test/schedule-edit-fallback.test.mjs"
+    },
+    {
+      "id": "session-log-path-encoding",
+      "file": "src/session-log-path.js",
+      "for": "DSH Windows non-ASCII project path encoding (--C-Users-~65E0~754C15X--)",
+      "why": "Replicates @deepseek-ai/dsh-session-format canonical directory key encoding so session logs resolve on Windows paths with non-ASCII characters.",
+      "until": "Host exposes the resolved session log file path directly via RPC.",
+      "test": "test/session-log-path.test.mjs"
+    },
+    {
+      "id": "approval-detail-backfill",
+      "file": "src/approval-detail.js",
+      "for": "DSH approval/request omitting tool call arguments",
+      "why": "Host approval/request hook does not carry command or tool arguments; backfills human-readable detail from matching callId in session.history tool/call.",
+      "until": "Host approval/request hook payload includes full tool arguments or formatted summary.",
+      "test": "test/approval-detail.test.mjs"
+    },
+    {
+      "id": "select-model-payload-retry",
+      "file": "src/mobile-api.js",
+      "for": "DSH session.selectModel multi-payload & reasoningEffort compatibility",
+      "why": "Host builds vary on accepting provider/model id vs display name or rejecting unsupported reasoningEffort; retries ordered candidate payloads.",
+      "until": "Host session.selectModel standardizes on one canonical schema and error contract.",
+      "test": "test/mobile-error-map.test.mjs"
+    }
+  ]
+}

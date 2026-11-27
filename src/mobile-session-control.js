@@ -104,6 +104,7 @@ export function isMissingRemoteError(error) {
  * 定时任务写操作：先用 0.2.x 的 schedule/edit（{ id, action, patch }），老版本 DSH 没有这个
  * Remote 时回退到 schedule/update（CAS：expected + change）或 schedule/delete。
  */
+// @patch(schedule-edit-fallback)
 async function callScheduleWrite(targetPort, action, editFields, legacyPayload) {
   try {
     return await callLocalRpc(targetPort, "schedule.edit", { id: editFields.id, action, ...(editFields.patch ? { patch: editFields.patch } : {}) })

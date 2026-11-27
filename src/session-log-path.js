@@ -56,6 +56,7 @@ export function encodeSessionSegment(raw) {
   return out
 }
 
+// @patch(session-log-path-encoding)
 export function encodeSessionProjectKey(cwd) {
   const s = String(cwd ?? "")
   if (s.length === 0) throw new Error("cannot encode an empty project path")

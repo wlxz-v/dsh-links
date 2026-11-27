@@ -1161,6 +1161,7 @@ export function apply(ctx, config) {
     if (!dead) return
     try { Promise.resolve(dead.dispose?.()).catch(() => {}) } catch {}
   }
+  // @patch(gateway-peer-recreate)
   const ensureGatewayPeer = () => {
     // peer 是长连接身份：宿主热重载 / 会话 dispose 后旧 peer 会被 abort。
     // 只看「有没有」会一直拿着一个 aborted 的 peer，所有 RPC 都变成 gateway/peer-disposed，

@@ -329,6 +329,7 @@ async function firstStreamValue(request) {
   }
 }
 
+// @patch(local-rpc-http-fallback)
 function postHttpRpc(targetPort, endpoint, args, pluginMethod, { signal } = {}) {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) {

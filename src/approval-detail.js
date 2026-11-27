@@ -59,6 +59,7 @@ export function oneLine(text, max = APPROVAL_HEADLINE_LIMIT) {
  * 把 tool 参数拼成一段给人看的工作内容。
  * 命令类工具直接给命令原文（保留换行），其他工具给「键: 值」列表；没有可展示的参数时返回 null。
  */
+// @patch(approval-detail-backfill)
 export function toolCallDetail(toolName, args) {
   const parsed = parseToolArguments(args)
   if (!parsed) return null
