@@ -47,6 +47,9 @@ jobs:
       - name: Check patches registry
         run: pnpm run check:patches
 
+      - name: Check host compatibility contracts
+        run: pnpm run check:contracts
+
       - name: Verify plugin package contents
         run: npm pack --dry-run
 

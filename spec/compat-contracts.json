@@ -1,0 +1,325 @@
+{
+  "schemaVersion": 1,
+  "dshBaseline": {
+    "verifiedRange": ">=0.1.7-alpha.1 <=0.2.x",
+    "recommended": "0.2.2-rc.1"
+  },
+  "services": {
+    "required": {
+      "webServer": [
+        "port",
+        "register",
+        "tapIndex"
+      ],
+      "typertGateway": [
+        "call",
+        "stream"
+      ]
+    },
+    "optional": {
+      "connection": [
+        "createPeer"
+      ],
+      "sessions": [
+        "get"
+      ],
+      "workspaceChanges": []
+    }
+  },
+  "rpcMethods": [
+    {
+      "method": "account.getBalance",
+      "wire": "account/getBalance",
+      "tier": "optional",
+      "probeMode": "static-only"
+    },
+    {
+      "method": "agentPreset.list",
+      "wire": "agentPresets/list",
+      "tier": "optional",
+      "probeMode": "readonly",
+      "params": {}
+    },
+    {
+      "method": "credentials.describe",
+      "wire": "credentials/describe",
+      "tier": "optional",
+      "probeMode": "readonly",
+      "params": {
+        "refs": []
+      }
+    },
+    {
+      "method": "credentials.set",
+      "wire": "credentials/set",
+      "tier": "optional",
+      "probeMode": "static-only"
+    },
+    {
+      "method": "goals.clear",
+      "wire": "goals/clear",
+      "tier": "optional",
+      "probeMode": "static-only"
+    },
+    {
+      "method": "goals.edit",
+      "wire": "goals/edit",
+      "tier": "optional",
+      "probeMode": "static-only"
+    },
+    {
+      "method": "goals.pause",
+      "wire": "goals/pause",
+      "tier": "optional",
+      "probeMode": "static-only"
+    },
+    {
+      "method": "goals.resume",
+      "wire": "goals/resume",
+      "tier": "optional",
+      "probeMode": "static-only"
+    },
+    {
+      "method": "llm.discoverModels",
+      "wire": "llm/discoverModels",
+      "tier": "optional",
+      "probeMode": "static-only"
+    },
+    {
+      "method": "llm.listConfigurableProviders",
+      "wire": "llm/listConfigurableProviders",
+      "tier": "optional",
+      "probeMode": "static-only"
+    },
+    {
+      "method": "llm.listProviders",
+      "wire": "llm/listProviders",
+      "tier": "optional",
+      "probeMode": "readonly",
+      "params": {}
+    },
+    {
+      "method": "llm.models",
+      "wire": "session/modelCatalog",
+      "tier": "optional",
+      "probeMode": "static-only"
+    },
+    {
+      "method": "messageFeedback.delete",
+      "wire": "messageFeedback/delete",
+      "tier": "optional",
+      "probeMode": "static-only"
+    },
+    {
+      "method": "messageFeedback.list",
+      "wire": "messageFeedback/list",
+      "tier": "optional",
+      "probeMode": "static-only"
+    },
+    {
+      "method": "messageFeedback.put",
+      "wire": "messageFeedback/put",
+      "tier": "optional",
+      "probeMode": "static-only"
+    },
+    {
+      "method": "session.cancel",
+      "wire": "session/cancel",
+      "tier": "required",
+      "probeMode": "static-only"
+    },
+    {
+      "method": "session.create",
+      "wire": "session/create",
+      "tier": "required",
+      "probeMode": "static-only"
+    },
+    {
+      "method": "session.fork",
+      "wire": "session/fork",
+      "tier": "optional",
+      "probeMode": "static-only"
+    },
+    {
+      "method": "session.history",
+      "wire": "session/history",
+      "tier": "required",
+      "probeMode": "static-only"
+    },
+    {
+      "method": "session.list",
+      "wire": "session/list",
+      "tier": "required",
+      "probeMode": "static-only"
+    },
+    {
+      "method": "session.models",
+      "wire": "session/modelCatalog",
+      "tier": "required",
+      "probeMode": "static-only"
+    },
+    {
+      "method": "session.prompt",
+      "wire": "session/prompt",
+      "tier": "required",
+      "probeMode": "static-only"
+    },
+    {
+      "method": "session.rename",
+      "wire": "session/rename",
+      "tier": "optional",
+      "probeMode": "static-only"
+    },
+    {
+      "method": "session.search",
+      "wire": "session/search",
+      "tier": "optional",
+      "probeMode": "static-only"
+    },
+    {
+      "method": "session.selectModel",
+      "wire": "session/selectModel",
+      "tier": "optional",
+      "probeMode": "static-only"
+    },
+    {
+      "method": "session.updateQueue",
+      "wire": "session/updateQueue",
+      "tier": "optional",
+      "probeMode": "static-only"
+    },
+    {
+      "method": "schedule.catalog",
+      "wire": "schedule/catalog",
+      "tier": "optional",
+      "probeMode": "readonly",
+      "params": {}
+    },
+    {
+      "method": "schedule.delete",
+      "wire": "schedule/delete",
+      "tier": "optional",
+      "probeMode": "static-only"
+    },
+    {
+      "method": "schedule.edit",
+      "wire": "schedule/edit",
+      "tier": "optional",
+      "probeMode": "not-found",
+      "params": {
+        "id": "probe-missing",
+        "action": "delete"
+      }
+    },
+    {
+      "method": "schedule.history",
+      "wire": "schedule/history",
+      "tier": "optional",
+      "probeMode": "static-only"
+    },
+    {
+      "method": "schedule.list",
+      "wire": "schedule/list",
+      "tier": "optional",
+      "probeMode": "static-only"
+    },
+    {
+      "method": "schedule.update",
+      "wire": "schedule/update",
+      "tier": "optional",
+      "probeMode": "static-only"
+    },
+    {
+      "method": "schedule.view",
+      "wire": "schedule/view",
+      "tier": "optional",
+      "probeMode": "static-only"
+    },
+    {
+      "method": "settings.describe",
+      "wire": "settings/describe",
+      "tier": "required",
+      "probeMode": "readonly",
+      "params": {}
+    },
+    {
+      "method": "settings.mutate",
+      "wire": "settings/mutate",
+      "tier": "optional",
+      "probeMode": "static-only"
+    },
+    {
+      "method": "settings.update",
+      "wire": "settings/update",
+      "tier": "optional",
+      "probeMode": "static-only"
+    },
+    {
+      "method": "workspace.archiveSession",
+      "wire": "workspace/archiveSession",
+      "tier": "optional",
+      "probeMode": "static-only"
+    },
+    {
+      "method": "workspace.create",
+      "wire": "workspace/create",
+      "tier": "required",
+      "probeMode": "static-only"
+    },
+    {
+      "method": "workspace.delete",
+      "wire": "workspace/delete",
+      "tier": "optional",
+      "probeMode": "static-only"
+    },
+    {
+      "method": "workspace.list",
+      "wire": "workspace/list",
+      "tier": "required",
+      "probeMode": "readonly",
+      "params": {}
+    }
+  ],
+  "hooks": {
+    "approval/request": {
+      "required": false,
+      "fields": [
+        "agent.session.id",
+        "callId",
+        "toolName",
+        "reason",
+        "signal"
+      ]
+    },
+    "user-questions/request": {
+      "required": false,
+      "fields": [
+        "agent.session.id",
+        "questions",
+        "signal"
+      ]
+    }
+  },
+  "settingsAllowlist": {
+    "agent-presets": [
+      "default"
+    ],
+    "permission": [
+      "defaultPreset"
+    ],
+    "locale": [
+      "preference"
+    ],
+    "ui-theme": [
+      "preference"
+    ],
+    "ui-conversation": [
+      "busyEnter"
+    ],
+    "agent-default-model": [
+      "provider",
+      "model",
+      "reasoningEffort"
+    ]
+  }
+}
