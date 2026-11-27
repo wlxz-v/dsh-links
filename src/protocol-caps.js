@@ -1,7 +1,7 @@
 /** 业务层能力协商。远程通道（DLP/1）与内层证书钉扎不因这些字段改变。 */
 
 import { createRequire } from "node:module"
-import { MAX_WORKSPACE_DIR_ENTRIES, MAX_WORKSPACE_FILE_BYTES } from "./workspace-file.js"
+import { MAX_RANGE_CHUNK_BYTES, MAX_RANGE_FILE_BYTES, MAX_WORKSPACE_DIR_ENTRIES, MAX_WORKSPACE_FILE_BYTES } from "./workspace-file.js"
 import { MAX_DIFF_LINES } from "./workspace-changes.js"
 
 const require = createRequire(import.meta.url)
@@ -49,6 +49,9 @@ export function pluginCapabilities({ changes = false, host, features = null, plu
           files: {
             workspace: true,
             maxBytes: MAX_WORKSPACE_FILE_BYTES,
+            range: true,
+            maxRangeBytes: MAX_RANGE_FILE_BYTES,
+            chunkBytes: MAX_RANGE_CHUNK_BYTES,
             tree: true,
             treeMaxEntries: MAX_WORKSPACE_DIR_ENTRIES,
             sha256: true,

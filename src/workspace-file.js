@@ -3,6 +3,8 @@ import { constants as fsConstants, lstatSync, readdirSync, realpathSync, statSyn
 import { lstat, open, readdir, realpath, stat } from "node:fs/promises"
 
 export const MAX_WORKSPACE_FILE_BYTES = 8 * 1024 * 1024
+export const MAX_RANGE_FILE_BYTES = 256 * 1024 * 1024
+export const MAX_RANGE_CHUNK_BYTES = 2 * 1024 * 1024
 export const MAX_WORKSPACE_DIR_ENTRIES = 2000
 
 function httpError(message, status) {
@@ -61,8 +63,11 @@ export function resolveWorkspaceFile(cwd, requested) {
   }
 }
 
-/** 异步解析并从同一打开句柄读取文件（消除 resolve→read 间的 TOCTOU 与大文件 OOM，不阻塞事件循环）。 */
-export async function readWorkspaceFileAsync(cwd, requested) {
+function buildWorkspaceFileEtag(st) {
+  return `"${st.size}-${Math.trunc(st.mtimeMs)}"`
+}
+
+async function openWorkspaceFileAsync(cwd, requested) {
   if (typeof cwd !== "string" || !cwd.trim()) throw httpError("缺少工作区", 400)
   if (typeof requested !== "string" || !requested.trim()) throw httpError("缺少 path", 400)
   let root
@@ -96,26 +101,140 @@ export async function readWorkspaceFileAsync(cwd, requested) {
   try {
     const st = await fh.stat()
     if (!st.isFile()) throw httpError("不是文件", 400)
-    if (st.size > MAX_WORKSPACE_FILE_BYTES) throw httpError("文件过大", 413)
+    return {
+      fh,
+      st,
+      abs: real,
+      rel: rel.split("\\").join("/"),
+      name: real.slice(real.lastIndexOf(sep) + 1),
+    }
+  } catch (err) {
+    await fh.close().catch(() => {})
+    throw err
+  }
+}
+
+/** 异步解析并从同一打开句柄读取文件（消除 resolve→read 间的 TOCTOU 与大文件 OOM，不阻塞事件循环）。 */
+export async function readWorkspaceFileAsync(cwd, requested) {
+  const opened = await openWorkspaceFileAsync(cwd, requested)
+  try {
+    if (opened.st.size > MAX_WORKSPACE_FILE_BYTES) throw httpError("文件过大", 413)
     const chunks = []
     let total = 0
-    const buf = Buffer.allocUnsafe(Math.min(Math.max(st.size, 4096), 256 * 1024))
+    const buf = Buffer.allocUnsafe(Math.min(Math.max(opened.st.size, 4096), 256 * 1024))
     for (;;) {
-      const { bytesRead } = await fh.read(buf, 0, buf.length, null)
+      const { bytesRead } = await opened.fh.read(buf, 0, buf.length, null)
       if (bytesRead === 0) break
       total += bytesRead
       if (total > MAX_WORKSPACE_FILE_BYTES) throw httpError("文件过大", 413)
       chunks.push(Buffer.from(buf.subarray(0, bytesRead)))
     }
     return {
-      abs: real,
-      rel: rel.split("\\").join("/"),
+      abs: opened.abs,
+      rel: opened.rel,
       size: total,
-      name: real.slice(real.lastIndexOf(sep) + 1),
+      name: opened.name,
       body: Buffer.concat(chunks, total),
     }
   } finally {
-    await fh.close().catch(() => {})
+    await opened.fh.close().catch(() => {})
+  }
+}
+
+/** 读取工作区文件元信息与强/一致性 ETag，供 HEAD 与 Range 预检。 */
+export async function statWorkspaceFileAsync(cwd, requested, maxFileBytes = MAX_RANGE_FILE_BYTES) {
+  const opened = await openWorkspaceFileAsync(cwd, requested)
+  try {
+    if (opened.st.size > maxFileBytes) throw httpError("文件过大", 413)
+    return {
+      abs: opened.abs,
+      rel: opened.rel,
+      size: opened.st.size,
+      mtimeMs: opened.st.mtimeMs,
+      etag: buildWorkspaceFileEtag(opened.st),
+      name: opened.name,
+    }
+  } finally {
+    await opened.fh.close().catch(() => {})
+  }
+}
+
+/** 解析单段 HTTP Byte Range（拒绝多段逗号 Range 与空文件越界）。 */
+export function parseByteRangeHeader(rawHeader, totalSize) {
+  if (typeof rawHeader !== "string" || !Number.isSafeInteger(totalSize) || totalSize < 0) return null
+  const m = rawHeader.trim().match(/^bytes\s*=\s*(.+)$/i)
+  if (!m) return null
+  const spec = m[1].trim()
+  if (!spec || spec.includes(",")) return null
+  if (totalSize === 0) return null
+  const bounds = spec.match(/^(\d*)-(\d*)$/)
+  if (!bounds) return null
+  const [, startStr, endStr] = bounds
+  let start
+  let end
+  if (startStr !== "" && endStr !== "") {
+    start = Number(startStr)
+    end = Number(endStr)
+    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start > end || start >= totalSize) return null
+    end = Math.min(end, totalSize - 1)
+  } else if (startStr !== "") {
+    start = Number(startStr)
+    if (!Number.isSafeInteger(start) || start >= totalSize) return null
+    end = totalSize - 1
+  } else if (endStr !== "") {
+    const suffix = Number(endStr)
+    if (!Number.isSafeInteger(suffix) || suffix <= 0) return null
+    start = Math.max(0, totalSize - suffix)
+    end = totalSize - 1
+  } else {
+    return null
+  }
+  return { start, end }
+}
+
+/** 按字节区间读取工作区文件分片（单次最多返回 maxChunkBytes，复用同一打开句柄防 TOCTOU）。 */
+export async function readWorkspaceFileRangeAsync(
+  cwd,
+  requested,
+  { start, end, maxFileBytes = MAX_RANGE_FILE_BYTES, maxChunkBytes = MAX_RANGE_CHUNK_BYTES } = {},
+) {
+  const opened = await openWorkspaceFileAsync(cwd, requested)
+  try {
+    const total = opened.st.size
+    if (total > maxFileBytes) throw httpError("文件过大", 413)
+    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || start >= total || end < start) {
+      const err = httpError("请求范围无效", 416)
+      err.total = total
+      throw err
+    }
+    const clampedEnd = Math.min(end, total - 1, start + maxChunkBytes - 1)
+    const targetLen = clampedEnd - start + 1
+    const buf = Buffer.allocUnsafe(targetLen)
+    let offset = 0
+    while (offset < targetLen) {
+      const { bytesRead } = await opened.fh.read(buf, offset, targetLen - offset, start + offset)
+      if (bytesRead === 0) break
+      offset += bytesRead
+    }
+    if (offset === 0) {
+      const err = httpError("请求范围无效", 416)
+      err.total = total
+      throw err
+    }
+    const chunk = offset === targetLen ? buf : buf.subarray(0, offset)
+    return {
+      abs: opened.abs,
+      rel: opened.rel,
+      name: opened.name,
+      size: total,
+      mtimeMs: opened.st.mtimeMs,
+      etag: buildWorkspaceFileEtag(opened.st),
+      start,
+      end: start + chunk.length - 1,
+      chunk,
+    }
+  } finally {
+    await opened.fh.close().catch(() => {})
   }
 }
 

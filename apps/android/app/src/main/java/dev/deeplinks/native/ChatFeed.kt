@@ -164,6 +164,9 @@ internal class ChatFeedActions(
     val openChanges: (Long, Int?) -> Unit = { _, _ -> },
     /** 工具摘要行点按：切到轨迹视图看明细。 */
     val openTrace: () -> Unit = {},
+    private val filesRangeSupported: () -> Boolean = { false },
+    private val filesMaxRangeBytes: () -> Long = { dev.deeplinks.core.MAX_WORKSPACE_RANGE_FILE_BYTES },
+    private val filesChunkBytes: () -> Int = { dev.deeplinks.core.DEFAULT_RANGE_CHUNK_BYTES },
 ) {
     fun onCopy(msg: MobileMessage): () -> Unit = {
         val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
@@ -273,6 +276,23 @@ internal class ChatFeedActions(
             client.getSessionFile(sid, path)
         }
     }
+
+    fun onDownloadProducedFile(
+        msg: MobileMessage,
+    ): ((String, (Long, Long) -> Unit) -> dev.deeplinks.core.DownloadedWorkspaceFile)? {
+        if (msg.role != "produced_files" || !filesRangeSupported()) return null
+        return { path, onProgress ->
+            val sid = currentSessionId() ?: throw IllegalStateException(L.unknownError)
+            client.downloadWorkspaceFile(
+                sessionId = sid,
+                path = path,
+                cacheRootDir = context.cacheDir,
+                maxFileBytes = filesMaxRangeBytes(),
+                chunkBytes = filesChunkBytes(),
+                onProgress = onProgress,
+            )
+        }
+    }
 }
 
 /**
@@ -370,6 +390,7 @@ internal fun LazyListScope.chatMessageItems(
                     val onRate = remember(actions, msg.id, msg.role, feedbackSupported) { actions.onRate(msg) }
                     val onRetract = remember(actions, msg.id, msg.role, feedbackSupported) { actions.onRetract(msg) }
                     val onFetchProducedFile = remember(actions, msg.id, msg.role) { actions.onFetchProducedFile(msg) }
+                    val onDownloadProducedFile = remember(actions, msg.id, msg.role) { actions.onDownloadProducedFile(msg) }
                     MessageItem(
                         msg = msg,
                         running = sweepingId != null && msg.id == sweepingId,
@@ -382,6 +403,7 @@ internal fun LazyListScope.chatMessageItems(
                         onRate = onRate,
                         onRetract = onRetract,
                         onFetchProducedFile = onFetchProducedFile,
+                        onDownloadProducedFile = onDownloadProducedFile,
                         onOpenChanges = actions.openChanges,
                         showActions = msg.id in prepared.turnEnds,
                         turnModelLabel = prepared.turnModelById[msg.id],

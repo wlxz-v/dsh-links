@@ -79,9 +79,11 @@ class ProtocolVectorsTest {
 
     @Test
     fun pluginCompatSpecIsParseable() {
-        val compatObj = spec().getJSONObject("plugin").getJSONObject("compat")
+        val pluginObj = spec().getJSONObject("plugin")
+        val compatObj = pluginObj.getJSONObject("compat")
         assertTrue(compatObj.getString("minAppVersion").isNotBlank())
         assertEquals(1, compatObj.getInt("protocolVersion"))
+        assertTrue(pluginObj.getJSONObject("files").getBoolean("range"))
     }
 
     @Test

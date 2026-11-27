@@ -159,6 +159,12 @@ data class MobileBootstrap(
     val requestSnapshot: Boolean = false,
     /** 插件支持按层列工作区目录（capabilities.files.tree）。 */
     val filesTree: Boolean = false,
+    /** 插件支持 HTTP Range / 206 分片下载（capabilities.files.range）。 */
+    val filesRange: Boolean = false,
+    /** Range 分片下载支持的最大文件字节数（capabilities.files.maxRangeBytes）。 */
+    val filesMaxRangeBytes: Long = dev.deeplinks.core.BoundedIo.MAX_WORKSPACE_FILE_BYTES.toLong(),
+    /** Range 单片建议上限字节数（capabilities.files.chunkBytes）。 */
+    val filesChunkBytes: Int = dev.deeplinks.core.DEFAULT_RANGE_CHUNK_BYTES,
     /** 插件支持排队 / 目标 / 定时任务管理（capabilities.control）。 */
     val sessionControl: Boolean = false,
     /** 插件可以列出已批准的本机预览（capabilities.preview.v = 1）。 */

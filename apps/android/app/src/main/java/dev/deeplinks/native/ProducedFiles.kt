@@ -52,6 +52,9 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
+import dev.deeplinks.core.BoundedIo
+import dev.deeplinks.core.DownloadedWorkspaceFile
+import dev.deeplinks.core.DshS
 import dev.deeplinks.core.dshRipple
 import dev.deeplinks.core.Dsh
 import dev.deeplinks.core.L
@@ -69,16 +72,30 @@ import kotlinx.coroutines.withContext
 
 private const val PREVIEW_MAX_EDGE = 2048
 
+private fun computeSampleSize(width: Int, height: Int, maxEdge: Int): Int {
+    var sample = 1
+    while (width / sample > maxEdge || height / sample > maxEdge) sample *= 2
+    return sample
+}
+
 internal fun decodeSampledBitmap(bytes: ByteArray, maxEdge: Int = PREVIEW_MAX_EDGE): Bitmap? {
     val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
     BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
-    val width = bounds.outWidth
-    val height = bounds.outHeight
-    if (width <= 0 || height <= 0) return null
-    var sample = 1
-    while (width / sample > maxEdge || height / sample > maxEdge) sample *= 2
-    val opts = BitmapFactory.Options().apply { inSampleSize = sample }
+    if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+    val opts = BitmapFactory.Options().apply {
+        inSampleSize = computeSampleSize(bounds.outWidth, bounds.outHeight, maxEdge)
+    }
     return BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts)
+}
+
+internal fun decodeSampledBitmap(file: java.io.File, maxEdge: Int = PREVIEW_MAX_EDGE): Bitmap? {
+    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+    BitmapFactory.decodeFile(file.absolutePath, bounds)
+    if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+    val opts = BitmapFactory.Options().apply {
+        inSampleSize = computeSampleSize(bounds.outWidth, bounds.outHeight, maxEdge)
+    }
+    return BitmapFactory.decodeFile(file.absolutePath, opts)
 }
 
 internal sealed interface ProducedPreview {
@@ -116,12 +133,34 @@ internal fun renderPdfPages(file: java.io.File, maxPages: Int = PDF_PREVIEW_MAX_
  * 下载到本机缓存再交给系统应用打开（WPS / Office / 阅读器 / 播放器）。
  * 返回 false 表示这台手机没有能接过该类型的应用。
  */
-internal fun openWithSystemApp(context: android.content.Context, path: String, mime: String, bytes: ByteArray): Boolean {
+internal fun openWithSystemApp(
+    context: android.content.Context,
+    path: String,
+    mime: String,
+    bytes: ByteArray,
+): Boolean {
     return try {
         val dir = java.io.File(context.cacheDir, "opened").apply { mkdirs() }
         // 只留最近一次的留档：缓存目录不该无限长。
         dir.listFiles()?.forEach { it.delete() }
         val file = java.io.File(dir, safeCacheFileName(path)).apply { writeBytes(bytes) }
+        openWithSystemApp(context, path, mime, file)
+    } catch (_: Exception) {
+        false
+    }
+}
+
+internal fun openWithSystemApp(
+    context: android.content.Context,
+    path: String,
+    mime: String,
+    file: java.io.File,
+): Boolean {
+    return try {
+        val dir = java.io.File(context.cacheDir, "opened")
+        if (dir.isDirectory) {
+            dir.listFiles()?.forEach { if (it.absolutePath != file.absolutePath) it.delete() }
+        }
         val uri = androidx.core.content.FileProvider.getUriForFile(
             context,
             "${context.packageName}.fileprovider",
@@ -134,10 +173,47 @@ internal fun openWithSystemApp(context: android.content.Context, path: String, m
             .addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
         context.startActivity(chooser)
         true
-    } catch (e: android.content.ActivityNotFoundException) {
+    } catch (_: android.content.ActivityNotFoundException) {
         false
-    } catch (e: Exception) {
+    } catch (_: Exception) {
         false
+    }
+}
+
+internal fun resolveProducedFilePreview(
+    context: android.content.Context,
+    path: String,
+    serverMime: String,
+    file: java.io.File,
+): Pair<ProducedPreview?, String?> {
+    val kind = producedFileKind(path)
+    return when {
+        kind == ProducedFileKind.IMAGE || serverMime.startsWith("image/") -> {
+            val bmp = decodeSampledBitmap(file)
+            if (bmp != null) ProducedPreview.Image(bmp) to null else null to "decode"
+        }
+        kind == ProducedFileKind.TEXT || isProducedTextMime(serverMime) -> {
+            if (file.length() <= BoundedIo.MAX_WORKSPACE_FILE_BYTES) {
+                ProducedPreview.Text(path, decodeProducedText(file.readBytes())) to null
+            } else {
+                val opened = openWithSystemApp(context, path, mimeForProducedFile(path, serverMime), file)
+                null to if (opened) "external" else "no-app"
+            }
+        }
+        kind == ProducedFileKind.PDF -> {
+            val rendered = runCatching { renderPdfPages(file) }.getOrNull()
+            if (rendered != null && rendered.first.isNotEmpty()) {
+                ProducedPreview.Pdf(producedFileName(path), rendered.first, rendered.second) to null
+            } else if (openWithSystemApp(context, path, mimeForProducedFile(path, serverMime), file)) {
+                null to "external"
+            } else {
+                null to "pdf"
+            }
+        }
+        else -> {
+            val opened = openWithSystemApp(context, path, mimeForProducedFile(path, serverMime), file)
+            null to if (opened) "external" else "no-app"
+        }
     }
 }
 
@@ -165,11 +241,14 @@ private const val PDF_PREVIEW_WIDTH_PX = 1080
 internal fun ProducedFilesRow(
     files: List<String>,
     onFetchFile: ((String) -> Pair<String, ByteArray>)? = null,
+    onDownloadFile: ((String, (Long, Long) -> Unit) -> DownloadedWorkspaceFile)? = null,
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
+    val progressFmt = DshS.translation("downloadingFileProgress")
     var preview by remember { mutableStateOf<ProducedPreview?>(null) }
     var loadingPath by remember { mutableStateOf<String?>(null) }
+    var downloadProgress by remember { mutableStateOf<Pair<Long, Long>?>(null) }
     var errorPath by remember { mutableStateOf<String?>(null) }
     var copiedPath by remember { mutableStateOf<String?>(null) }
     // 不能只改芯片文字：打开失败/超限要留一行说明，否则看起来还是「点了没反应」。
@@ -202,43 +281,52 @@ internal fun ProducedFilesRow(
 
     fun openPath(path: String) {
         val fetch = onFetchFile
-        if (fetch == null) {
+        val download = onDownloadFile
+        if (fetch == null && download == null) {
             copyPath(path)
             return
         }
         val kind = producedFileKind(path)
         loadingPath = path
+        downloadProgress = null
         errorPath = null
         notice = null
         scope.launch(Dispatchers.IO) {
-            val result = runCatching { fetch(path) }
-            val resolved = result.mapCatching { (serverMime, bytes) ->
-                when {
-                    kind == ProducedFileKind.IMAGE || serverMime.startsWith("image/") -> {
-                        val bmp = decodeSampledBitmap(bytes)
-                        if (bmp != null) ProducedPreview.Image(bmp) to null else null to "decode"
+            val resolved = runCatching {
+                if (download != null) {
+                    val downloaded = download(path) { got, total ->
+                        scope.launch(Dispatchers.Main) { if (loadingPath == path) downloadProgress = got to total }
                     }
-                    kind == ProducedFileKind.TEXT || isProducedTextMime(serverMime) -> {
-                        ProducedPreview.Text(path, decodeProducedText(bytes)) to null
-                    }
-                    kind == ProducedFileKind.PDF -> {
-                        val dir = java.io.File(context.cacheDir, "opened").apply { mkdirs() }
-                        val file = java.io.File(dir, safeCacheFileName(path)).apply { writeBytes(bytes) }
-                        val rendered = runCatching { renderPdfPages(file) }.getOrNull()
-                        if (rendered != null && rendered.first.isNotEmpty()) {
-                            ProducedPreview.Pdf(producedFileName(path), rendered.first, rendered.second) to null
-                        } else {
-                            null to "pdf"
+                    resolveProducedFilePreview(context, path, downloaded.mime, downloaded.file)
+                } else {
+                    val (serverMime, bytes) = fetch!!.invoke(path)
+                    when {
+                        kind == ProducedFileKind.IMAGE || serverMime.startsWith("image/") -> {
+                            val bmp = decodeSampledBitmap(bytes)
+                            if (bmp != null) ProducedPreview.Image(bmp) to null else null to "decode"
                         }
-                    }
-                    else -> {
-                        val opened = openWithSystemApp(context, path, mimeForProducedFile(path, serverMime), bytes)
-                        null to if (opened) "external" else "no-app"
+                        kind == ProducedFileKind.TEXT || isProducedTextMime(serverMime) ->
+                            ProducedPreview.Text(path, decodeProducedText(bytes)) to null
+                        kind == ProducedFileKind.PDF -> {
+                            val dir = java.io.File(context.cacheDir, "opened").apply { mkdirs() }
+                            val file = java.io.File(dir, safeCacheFileName(path)).apply { writeBytes(bytes) }
+                            val rendered = runCatching { renderPdfPages(file) }.getOrNull()
+                            if (rendered != null && rendered.first.isNotEmpty()) {
+                                ProducedPreview.Pdf(producedFileName(path), rendered.first, rendered.second) to null
+                            } else {
+                                null to "pdf"
+                            }
+                        }
+                        else -> {
+                            val opened = openWithSystemApp(context, path, mimeForProducedFile(path, serverMime), bytes)
+                            null to if (opened) "external" else "no-app"
+                        }
                     }
                 }
             }
             withContext(Dispatchers.Main) {
                 loadingPath = null
+                downloadProgress = null
                 resolved.fold(
                     onSuccess = { (nextPreview, status) ->
                         when {
@@ -290,8 +378,9 @@ internal fun ProducedFilesRow(
                 val loading = loadingPath == path
                 val failed = errorPath == path
                 val copied = copiedPath == path
+                val pct = if (loading) downloadProgress?.takeIf { it.second > 0L }?.let { ((it.first * 100L) / it.second).toInt().coerceIn(0, 100) } else null
                 val label = when {
-                    loading -> L.loadingFile
+                    loading -> if (pct != null) progressFmt.format(pct) else L.loadingFile
                     failed -> L.retry
                     copied -> L.copied
                     else -> name

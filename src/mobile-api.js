@@ -12,7 +12,7 @@ import { runDiagnostics } from "./diagnostics.js"
 import { workspaceChangesService, parseChangesCoordinates, projectChangesSummary, projectFileDiff } from "./workspace-changes.js"
 import { clampHistoryMaxMessages, projectHistoryPage } from "./history.js"
 import { buildEstimatedCost, modelIdFromProjections } from "./pricing.js"
-import { listWorkspaceDirAsync, mimeFromName, readWorkspaceFileAsync } from "./workspace-file.js"
+import { listWorkspaceDirAsync, mimeFromName, parseByteRangeHeader, readWorkspaceFileAsync, readWorkspaceFileRangeAsync, statWorkspaceFileAsync } from "./workspace-file.js"
 import { optionalString, omitNullFields } from "./optional-string.js"
 import { MobileWorkspaceCreateError, planMobileWorkspaceCreate, ensureMobileWorkspaceDirectory, resolveAbsoluteWorkspaceDirectoryAsync } from "./workspace-create.js"
 import { normalizeComparisonPath } from "./workspace-path.js"
@@ -893,7 +893,7 @@ export async function handleMobileApi(req, res, targetPort, state, stateFile, de
     }
 
     const fileMatch = pathname.match(/^\/dsh-link\/mobile\/sessions\/([^/]+)\/file$/)
-    if (req.method === "GET" && fileMatch) {
+    if ((req.method === "GET" || req.method === "HEAD") && fileMatch) {
       if (rt.features && !rt.features.isEnabled("workspaceFiles")) {
         return json(res, 403, { error: "feature_disabled", feature: "workspaceFiles" })
       }
@@ -904,6 +904,26 @@ export async function handleMobileApi(req, res, targetPort, state, stateFile, de
         return json(res, 403, { error: "仅正在查看该会话的设备可下载文件" })
       }
       const requested = String(new URL(req.url ?? "/", "http://x").searchParams.get("path") ?? "").trim()
+      const etagMatchesIfRange = (rawIfRange, currentEtag) => {
+        const reqTag = String(rawIfRange ?? "").trim().replace(/^W\//i, "")
+        if (!reqTag) return true
+        const curTag = String(currentEtag ?? "").trim().replace(/^W\//i, "")
+        return reqTag === curTag || reqTag === curTag.replace(/^"|"$/g, "")
+      }
+      const buildFileHeaders = (name, mime, contentLength, extra = {}) => {
+        const headers = {
+          "content-type": mime,
+          "content-length": contentLength,
+          "accept-ranges": "bytes",
+          "x-content-type-options": "nosniff",
+          "x-dsh-link-filename": encodeURIComponent(name),
+          ...extra,
+        }
+        if (mime.startsWith("text/html") || mime === "image/svg+xml") {
+          headers["content-disposition"] = `attachment; filename="${encodeURIComponent(name)}"`
+        }
+        return headers
+      }
       try {
         const looked = await resolveSessionCwd(targetPort, sessionId, rt)
         if (!looked.found) {
@@ -911,25 +931,82 @@ export async function handleMobileApi(req, res, targetPort, state, stateFile, de
           err.status = 404
           throw err
         }
+        if (req.method === "HEAD") {
+          const meta = await statWorkspaceFileAsync(looked.cwd, requested)
+          const mime = mimeFromName(meta.name)
+          res.writeHead(200, buildFileHeaders(meta.name, mime, meta.size, {
+            "cache-control": "private, no-store",
+            etag: meta.etag,
+          }))
+          res.end()
+          return
+        }
+        const rawRange = req.headers.range
+        if (rawRange !== undefined) {
+          const meta = await statWorkspaceFileAsync(looked.cwd, requested)
+          const ifRange = req.headers["if-range"]
+          if (!etagMatchesIfRange(ifRange, meta.etag)) {
+            res.writeHead(412, {
+              "content-type": "application/json; charset=utf-8",
+              "cache-control": "no-store",
+              etag: meta.etag,
+            })
+            res.end(JSON.stringify({ error: "文件已变化，请重新下载", etag: meta.etag }))
+            return
+          }
+          const parsedRange = parseByteRangeHeader(String(rawRange), meta.size)
+          if (!parsedRange) {
+            res.writeHead(416, {
+              "content-type": "application/json; charset=utf-8",
+              "content-range": `bytes */${meta.size}`,
+              "accept-ranges": "bytes",
+              "cache-control": "no-store",
+            })
+            res.end(JSON.stringify({ error: "请求范围无效" }))
+            return
+          }
+          const part = await readWorkspaceFileRangeAsync(looked.cwd, requested, parsedRange)
+          if (!etagMatchesIfRange(ifRange, part.etag)) {
+            res.writeHead(412, {
+              "content-type": "application/json; charset=utf-8",
+              "cache-control": "no-store",
+              etag: part.etag,
+            })
+            res.end(JSON.stringify({ error: "文件已变化，请重新下载", etag: part.etag }))
+            return
+          }
+          const mime = mimeFromName(part.name)
+          res.writeHead(206, buildFileHeaders(part.name, mime, part.chunk.length, {
+            "cache-control": "private, no-store",
+            "content-range": `bytes ${part.start}-${part.end}/${part.size}`,
+            etag: part.etag,
+            "x-dsh-link-chunk-sha256": createHash("sha256").update(part.chunk).digest("hex"),
+          }))
+          res.end(part.chunk)
+          return
+        }
         const resolved = await readWorkspaceFileAsync(looked.cwd, requested)
         const body = resolved.body
         const mime = mimeFromName(resolved.name)
-        const headers = {
-          "content-type": mime,
-          "content-length": body.length,
+        const headers = buildFileHeaders(resolved.name, mime, body.length, {
           "cache-control": "private, max-age=60",
-          "x-content-type-options": "nosniff",
-          "x-dsh-link-filename": encodeURIComponent(resolved.name),
           // 完整性校验：App 下载完按此 SHA-256 复核，传输被截断 / 篡改时拒收
           "x-dsh-link-sha256": createHash("sha256").update(body).digest("hex"),
-        }
-        if (mime.startsWith("text/html") || mime === "image/svg+xml") {
-          headers["content-disposition"] = `attachment; filename="${encodeURIComponent(resolved.name)}"`
-        }
+        })
         res.writeHead(200, headers)
         res.end(body)
       } catch (err) {
         const status = Number.isInteger(err?.status) ? err.status : 500
+        if (status === 416) {
+          res.writeHead(416, {
+            "content-type": "application/json; charset=utf-8",
+            "content-range": `bytes */${err?.total ?? 0}`,
+            "accept-ranges": "bytes",
+            "cache-control": "no-store",
+          })
+          res.end(JSON.stringify({ error: err?.message || "请求范围无效" }))
+          return
+        }
         // Only the endpoint's own validation messages (4xx) are safe to echo; an
         // unexpected 5xx (e.g. an fs error) must not leak its internal text.
         const message = status >= 500 ? "读取文件失败" : (err?.message || "读取文件失败")

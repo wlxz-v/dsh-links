@@ -892,5 +892,6 @@ val DshStringsEn = DshStrings(
         put("highRiskWarning", "High-risk command — hold to confirm")
         put("holdToApprove", "Hold 1.5s to allow")
         put("holdToApproveProgress", "Keep holding…")
+        put("downloadingFileProgress", "Downloading %1\$d%%")
     }
 )

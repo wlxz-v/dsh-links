@@ -89,6 +89,7 @@ internal fun MessageItem(
     onRate: ((String) -> Unit)? = null,
     onRetract: (() -> Unit)? = null,
     onFetchProducedFile: ((String) -> Pair<String, ByteArray>)? = null,
+    onDownloadProducedFile: ((String, (Long, Long) -> Unit) -> dev.deeplinks.core.DownloadedWorkspaceFile)? = null,
     onOpenChanges: ((seq: Long, fileIndex: Int?) -> Unit)? = null,
     /** 复制 / 赞踩 / 时间一行：只在一轮的最后一条回复上显示。 */
     showActions: Boolean = true,
@@ -161,6 +162,7 @@ internal fun MessageItem(
             msg.role == "produced_files" -> ProducedFilesRow(
                 files = msg.files.ifEmpty { msg.text.lineSequence().map { it.trim() }.filter { it.isNotEmpty() }.toList() },
                 onFetchFile = onFetchProducedFile,
+                onDownloadFile = onDownloadProducedFile,
             )
             else -> {
                 Column(modifier = Modifier.fillMaxWidth()) {

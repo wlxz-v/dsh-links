@@ -891,5 +891,6 @@ val DshStringsZh = DshStrings(
         put("highRiskWarning", "高危命令，请核对后长按确认")
         put("holdToApprove", "长按 1.5s 允许")
         put("holdToApproveProgress", "继续按住…")
+        put("downloadingFileProgress", "下载中 %1\$d%%")
     }
 )

@@ -1,7 +1,15 @@
 package dev.deeplinks.native
 import dev.deeplinks.native.util.optStringOrEmpty
 import dev.deeplinks.core.BoundedIo
+import dev.deeplinks.core.DEFAULT_RANGE_CHUNK_BYTES
+import dev.deeplinks.core.DownloadedWorkspaceFile
 import dev.deeplinks.core.Host
+import dev.deeplinks.core.MAX_WORKSPACE_RANGE_FILE_BYTES
+import dev.deeplinks.core.RangePreconditionException
+import dev.deeplinks.core.WorkspaceChunkDownloader
+import dev.deeplinks.core.WorkspaceFileHead
+import dev.deeplinks.core.WorkspaceFileRangeChunk
+import dev.deeplinks.core.WorkspaceRangeTransport
 import dev.deeplinks.BuildConfig
 import dev.deeplinks.core.HostCapabilitiesCache
 import dev.deeplinks.core.HostCompatCache
@@ -201,6 +209,9 @@ class MobileApiClient(private val host: Host) {
             multiQuestion = root.optJSONObject("capabilities")?.optJSONObject("questions")?.optBoolean("multi") == true,
             requestSnapshot = root.optJSONObject("capabilities")?.optJSONObject("requests")?.optBoolean("snapshot") == true,
             filesTree = root.optJSONObject("capabilities")?.optJSONObject("files")?.optBoolean("tree") == true,
+            filesRange = root.optJSONObject("capabilities")?.optJSONObject("files")?.optBoolean("range") == true,
+            filesMaxRangeBytes = root.optJSONObject("capabilities")?.optJSONObject("files")?.optLong("maxRangeBytes", BoundedIo.MAX_WORKSPACE_FILE_BYTES.toLong()) ?: BoundedIo.MAX_WORKSPACE_FILE_BYTES.toLong(),
+            filesChunkBytes = root.optJSONObject("capabilities")?.optJSONObject("files")?.optInt("chunkBytes", DEFAULT_RANGE_CHUNK_BYTES)?.coerceIn(64 * 1024, DEFAULT_RANGE_CHUNK_BYTES) ?: DEFAULT_RANGE_CHUNK_BYTES,
             sessionControl = root.optJSONObject("capabilities")?.optJSONObject("control")?.optBoolean("queue") == true,
             preview = root.optJSONObject("capabilities")?.optJSONObject("preview")?.optInt("v") == 1,
             previewDetect = root.optJSONObject("capabilities")?.optJSONObject("preview")?.optInt("detect") == 1,
@@ -295,11 +306,15 @@ class MobileApiClient(private val host: Host) {
         request("POST", "/dsh-link/mobile/sessions/" + java.net.URLEncoder.encode(sessionId, "UTF-8") + "/prompt", body)
     }
 
-    fun getSessionFile(sessionId: String, path: String): Pair<String, ByteArray> {
+    private fun sessionFileApiPath(sessionId: String, path: String): String {
         if (host.token.isBlank()) throw MobileAuthException("缺少或无效的连接 token", 401)
         val encodedSid = java.net.URLEncoder.encode(sessionId, "UTF-8")
         val encodedPath = java.net.URLEncoder.encode(path, "UTF-8").replace("+", "%20")
-        val apiPath = "/dsh-link/mobile/sessions/$encodedSid/file?path=$encodedPath"
+        return "/dsh-link/mobile/sessions/$encodedSid/file?path=$encodedPath"
+    }
+
+    fun getSessionFile(sessionId: String, path: String): Pair<String, ByteArray> {
+        val apiPath = sessionFileApiPath(sessionId, path)
         // 远程路径的超时由 HostHttp 按路由放宽；这里只给局域网的值
         val connectMs = 8_000
         val readMs = 12_000
@@ -340,6 +355,136 @@ class MobileApiClient(private val host: Host) {
         } catch (e: Exception) {
             throw IllegalStateException(friendlyNetworkError(e), e)
         }
+    }
+
+    /** 探测工作区文件长度与 ETag（显式绕过 JSON 条件请求缓存，供 Range 分片下载）。 */
+    internal fun headWorkspaceFile(sessionId: String, path: String): WorkspaceFileHead {
+        val apiPath = sessionFileApiPath(sessionId, path)
+        try {
+            HostHttp.execute(
+                host,
+                HostHttp.DshRequest(
+                    method = "HEAD",
+                    path = apiPath,
+                    headers = dshAuthHeaders() + listOf("Accept" to "*/*", "Accept-Encoding" to "identity"),
+                    connectTimeoutMs = 8_000,
+                    readTimeoutMs = 12_000,
+                ),
+            ).use { response ->
+                val code = response.code
+                if (code !in 200..299) {
+                    val text = response.body.byteStream().use { BoundedIo.readText(it) }
+                    val msg = parseMobileApiError(code, text)
+                    if (code == 401 || code == 403) throw MobileAuthException(msg, code)
+                    throw IllegalStateException(msg)
+                }
+                val total = response.header("Content-Length")?.trim()?.toLongOrNull() ?: -1L
+                val etag = response.header("ETag")?.trim()?.takeIf { it.isNotEmpty() }
+                val mime = response.header("Content-Type")?.substringBefore(';')?.trim().orEmpty()
+                    .ifBlank { "application/octet-stream" }
+                val acceptRanges = response.header("Accept-Ranges").orEmpty().contains("bytes", ignoreCase = true)
+                return WorkspaceFileHead(totalBytes = total, etag = etag, mime = mime, supportsRanges = acceptRanges)
+            }
+        } catch (e: MobileAuthException) {
+            throw e
+        } catch (e: Exception) {
+            throw IllegalStateException(friendlyNetworkError(e), e)
+        }
+    }
+
+    /** 按字节区间拉取单片工作区文件（校验 X-Dsh-Link-Chunk-Sha256，412 触发重置续传）。 */
+    internal fun fetchWorkspaceFileRange(
+        sessionId: String,
+        path: String,
+        start: Long,
+        endInclusive: Long,
+        ifRangeEtag: String?,
+    ): WorkspaceFileRangeChunk {
+        val apiPath = sessionFileApiPath(sessionId, path)
+        val headers = buildList {
+            addAll(dshAuthHeaders())
+            add("Accept" to "*/*")
+            add("Accept-Encoding" to "identity")
+            add("Range" to "bytes=$start-$endInclusive")
+            if (!ifRangeEtag.isNullOrBlank()) add("If-Range" to ifRangeEtag)
+        }
+        try {
+            HostHttp.execute(
+                host,
+                HostHttp.DshRequest(
+                    method = "GET",
+                    path = apiPath,
+                    headers = headers,
+                    connectTimeoutMs = 8_000,
+                    readTimeoutMs = 20_000,
+                ),
+            ).use { response ->
+                val code = response.code
+                if (code == 412) {
+                    throw RangePreconditionException("workspace file changed while downloading")
+                }
+                if (code !in 200..299) {
+                    val text = response.body.byteStream().use { BoundedIo.readText(it) }
+                    val msg = parseMobileApiError(code, text)
+                    if (code == 401 || code == 403) throw MobileAuthException(msg, code)
+                    throw IllegalStateException(msg)
+                }
+                val requestedLen = (endInclusive - start + 1L).coerceIn(1L, DEFAULT_RANGE_CHUNK_BYTES.toLong()).toInt()
+                val maxRead = maxOf(requestedLen, DEFAULT_RANGE_CHUNK_BYTES) + 65_536
+                val bytes = response.body.byteStream().use { BoundedIo.readBytes(it, maxRead) }
+                val chunkDigest = if (code == 206) response.header("x-dsh-link-chunk-sha256") else response.header("x-dsh-link-sha256")
+                if (!sha256Matches(chunkDigest, bytes)) {
+                    dev.deeplinks.core.PrivacySafeDiagnostics.event(
+                        dev.deeplinks.core.PrivacySafeDiagnostics.Area.File,
+                        dev.deeplinks.core.PrivacySafeDiagnostics.Op.Verify,
+                        ok = false,
+                        count = bytes.size,
+                    )
+                    throw FileIntegrityException(L.fileIntegrityFailed)
+                }
+                val mime = response.header("Content-Type")?.substringBefore(';')?.trim().orEmpty()
+                    .ifBlank { "application/octet-stream" }
+                val etag = response.header("ETag")?.trim()?.takeIf { it.isNotEmpty() }
+                val totalFromRange = response.header("Content-Range")?.substringAfterLast('/')?.trim()?.toLongOrNull() ?: -1L
+                return WorkspaceFileRangeChunk(
+                    bytes = bytes,
+                    start = start,
+                    endInclusive = start + bytes.size - 1L,
+                    totalBytes = totalFromRange,
+                    etag = etag,
+                    mime = mime,
+                    chunkSha256 = chunkDigest,
+                )
+            }
+        } catch (e: RangePreconditionException) {
+            throw e
+        } catch (e: FileIntegrityException) {
+            throw e
+        } catch (e: MobileAuthException) {
+            throw e
+        } catch (e: Exception) {
+            throw IllegalStateException(friendlyNetworkError(e), e)
+        }
+    }
+
+    /** 通过 Range/206 + `.part` 断点续传把工作区大文件下载到本机缓存，不整体装入内存。 */
+    internal fun downloadWorkspaceFile(
+        sessionId: String,
+        path: String,
+        cacheRootDir: java.io.File,
+        maxFileBytes: Long = MAX_WORKSPACE_RANGE_FILE_BYTES,
+        chunkBytes: Int = DEFAULT_RANGE_CHUNK_BYTES,
+        onProgress: (downloaded: Long, total: Long) -> Unit = { _, _ -> },
+    ): DownloadedWorkspaceFile {
+        val targetDir = java.io.File(cacheRootDir, "opened").apply { mkdirs() }
+        val targetFile = java.io.File(targetDir, dev.deeplinks.native.util.safeCacheFileName(path))
+        val downloader = WorkspaceChunkDownloader(cacheRootDir, maxFileBytes, chunkBytes)
+        val transport = object : WorkspaceRangeTransport {
+            override fun head(): WorkspaceFileHead = headWorkspaceFile(sessionId, path)
+            override fun fetchRange(start: Long, endInclusive: Long, ifRangeEtag: String?): WorkspaceFileRangeChunk =
+                fetchWorkspaceFileRange(sessionId, path, start, endInclusive, ifRangeEtag)
+        }
+        return downloader.download("${host.slotKey}\u0000$sessionId\u0000$path", targetFile, transport, onProgress)
     }
 
     /**

@@ -2346,6 +2346,9 @@ fun WorkspaceScreen(
                     fork = { sid -> forkNow(sid) },
                     openChanges = { seq, fileIndex -> scope.launch { changesPanel.open(seq, fileIndex) } },
                     openTrace = { selectViewMode("trace") },
+                    filesRangeSupported = { workspaceViewModel.filesRangeSupported.value },
+                    filesMaxRangeBytes = { workspaceViewModel.filesMaxRangeBytes.value },
+                    filesChunkBytes = { workspaceViewModel.filesChunkBytes.value },
                 )
             }
             // 消息列表进入组合（手机从首页点进会话、轨迹切回对话）时补一次贴底：
@@ -2979,6 +2982,20 @@ fun WorkspaceScreen(
             sessionId = browseSessionId,
             loadDir = client::getWorkspaceTree,
             fetchFile = client::getSessionFile,
+            downloadFile = if (workspaceViewModel.filesRangeSupported.value) {
+                { sid, filePath, onProgress ->
+                    client.downloadWorkspaceFile(
+                        sessionId = sid,
+                        path = filePath,
+                        cacheRootDir = context.cacheDir,
+                        maxFileBytes = workspaceViewModel.filesMaxRangeBytes.value,
+                        chunkBytes = workspaceViewModel.filesChunkBytes.value,
+                        onProgress = onProgress,
+                    )
+                }
+            } else {
+                null
+            },
             onDismiss = { showFileBrowser = false },
             rootName = currentSession?.cwd?.trimEnd('/')?.substringAfterLast('/'),
             onQuote = { path -> inputText = L.fileQuotePrefill.format(path) + inputText; showFileBrowser = false },

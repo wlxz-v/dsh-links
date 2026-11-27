@@ -32,7 +32,10 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import dev.deeplinks.core.BoundedIo
+import dev.deeplinks.core.DownloadedWorkspaceFile
 import dev.deeplinks.core.Dsh
+import dev.deeplinks.core.DshS
 import dev.deeplinks.core.DshType
 import dev.deeplinks.core.L
 import dev.deeplinks.native.util.ProducedFileKind
@@ -68,6 +71,7 @@ internal fun WorkspaceFileBrowserSheet(
     sessionId: String,
     loadDir: (sessionId: String, path: String) -> WorkspaceDirListing,
     fetchFile: (sessionId: String, path: String) -> Pair<String, ByteArray>,
+    downloadFile: ((sessionId: String, path: String, onProgress: (Long, Long) -> Unit) -> DownloadedWorkspaceFile)? = null,
     onDismiss: () -> Unit,
     /** 面包屑第一段：工作区目录名；null 时写「工作区根目录」。 */
     rootName: String? = null,
@@ -79,8 +83,10 @@ internal fun WorkspaceFileBrowserSheet(
     var dir by remember(sessionId) { mutableStateOf("") }
     var state by remember(sessionId) { mutableStateOf<DirState>(DirState.Loading) }
     var reloadTick by remember { mutableIntStateOf(0) }
+    val progressFmt = DshS.translation("downloadingFileProgress")
     var preview by remember { mutableStateOf<ProducedPreview?>(null) }
     var openingName by remember { mutableStateOf<String?>(null) }
+    var openingProgress by remember { mutableStateOf<Pair<Long, Long>?>(null) }
     var rowNotice by remember { mutableStateOf<Pair<String, String>?>(null) }
     var openJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
 
@@ -116,26 +122,40 @@ internal fun WorkspaceFileBrowserSheet(
         val sniff = kind == ProducedFileKind.OTHER && (entry.size ?: Long.MAX_VALUE) <= SNIFF_MAX_BYTES
         openJob?.cancel()
         openingName = entry.name
+        openingProgress = null
         rowNotice = null
+        val preferRange = downloadFile != null && (entry.size == null || entry.size > BoundedIo.MAX_WORKSPACE_FILE_BYTES)
         openJob = scope.launch {
             val result = try {
-                val (serverMime, bytes) = withContext(Dispatchers.IO) { fetchFile(sessionId, path) }
                 val outcome = withContext(Dispatchers.IO) {
-                    when {
-                        kind == ProducedFileKind.IMAGE || serverMime.startsWith("image/") ->
-                            decodeSampledBitmap(bytes)?.let { ProducedPreview.Image(it) } to null
-                        kind == ProducedFileKind.TEXT || isProducedTextMime(serverMime) ||
-                            (sniff && looksLikeText(bytes)) ->
-                            ProducedPreview.Text(path, decodeProducedText(bytes)) to null
-                        kind == ProducedFileKind.PDF -> runCatching {
-                            val cacheDir = java.io.File(context.cacheDir, "opened").apply { mkdirs() }
-                            val file = java.io.File(cacheDir, safeCacheFileName(path)).apply { writeBytes(bytes) }
-                            renderPdfPages(file)
-                        }.getOrNull()?.takeIf { it.first.isNotEmpty() }
-                            ?.let { ProducedPreview.Pdf(entry.name, it.first, it.second) } to null
-                        else -> {
-                            val opened = openWithSystemApp(context, path, mimeForProducedFile(path, serverMime), bytes)
-                            null to if (opened) "external" else "no-app"
+                    val reportProgress: (Long, Long) -> Unit = { got, total ->
+                        scope.launch(Dispatchers.Main) { if (openingName == entry.name) openingProgress = got to total }
+                    }
+                    if (preferRange) {
+                        val dl = downloadFile!!.invoke(sessionId, path, reportProgress)
+                        if (sniff && dl.file.length() <= SNIFF_MAX_BYTES && looksLikeText(dl.file.readBytes())) {
+                            ProducedPreview.Text(path, decodeProducedText(dl.file.readBytes())) to null
+                        } else {
+                            resolveProducedFilePreview(context, path, dl.mime, dl.file)
+                        }
+                    } else {
+                        val (serverMime, bytes) = fetchFile(sessionId, path)
+                        when {
+                            kind == ProducedFileKind.IMAGE || serverMime.startsWith("image/") ->
+                                decodeSampledBitmap(bytes)?.let { ProducedPreview.Image(it) } to null
+                            kind == ProducedFileKind.TEXT || isProducedTextMime(serverMime) ||
+                                (sniff && looksLikeText(bytes)) ->
+                                ProducedPreview.Text(path, decodeProducedText(bytes)) to null
+                            kind == ProducedFileKind.PDF -> runCatching {
+                                val cacheDir = java.io.File(context.cacheDir, "opened").apply { mkdirs() }
+                                val file = java.io.File(cacheDir, safeCacheFileName(path)).apply { writeBytes(bytes) }
+                                renderPdfPages(file)
+                            }.getOrNull()?.takeIf { it.first.isNotEmpty() }
+                                ?.let { ProducedPreview.Pdf(entry.name, it.first, it.second) } to null
+                            else -> {
+                                val opened = openWithSystemApp(context, path, mimeForProducedFile(path, serverMime), bytes)
+                                null to if (opened) "external" else "no-app"
+                            }
                         }
                     }
                 }
@@ -146,6 +166,7 @@ internal fun WorkspaceFileBrowserSheet(
                 Result.failure(e)
             }
             openingName = null
+            openingProgress = null
             result.fold(
                 onSuccess = { (shown, status) ->
                     if (shown != null) {
@@ -190,9 +211,12 @@ internal fun WorkspaceFileBrowserSheet(
                         item(key = "empty") { EmptyNote(L.fileTreeEmpty) }
                     }
                     items(s.listing.entries, key = { it.name }) { entry ->
+                        val isOpening = openingName == entry.name
+                        val pct = if (isOpening) openingProgress?.takeIf { it.second > 0L }?.let { ((it.first * 100L) / it.second).toInt().coerceIn(0, 100) } else null
                         FileEntryRow(
                             entry = entry,
-                            opening = openingName == entry.name,
+                            opening = isOpening,
+                            openingLabel = if (pct != null) progressFmt.format(pct) else null,
                             notice = rowNotice?.takeIf { it.first == entry.name }?.second,
                             onOpenDir = { dir = childWorkspacePath(dir, entry.name) },
                             onOpenFile = { openFile(entry) },
@@ -247,12 +271,13 @@ private fun Breadcrumb(root: String, dir: String, onOpen: (String) -> Unit) {
 private fun FileEntryRow(
     entry: WorkspaceDirEntry,
     opening: Boolean,
+    openingLabel: String? = null,
     notice: String?,
     onOpenDir: () -> Unit,
     onOpenFile: () -> Unit,
 ) {
     val subtitle = when {
-        opening -> L.loadingFile
+        opening -> openingLabel ?: L.loadingFile
         notice != null -> notice
         entry.outside -> L.fileTreeOutside
         entry.isFile -> entry.size?.let(::formatFileSize)

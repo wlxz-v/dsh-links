@@ -118,6 +118,10 @@ internal class WorkspaceViewModel(
     val composerActionError = mutableStateOf<String?>(null)
     /** 插件是否支持工作区文件树（bootstrap capabilities.files.tree）。 */
     val filesTreeSupported = mutableStateOf(false)
+    /** 插件是否支持 Range/206 分片下载大文件（bootstrap capabilities.files.range）。 */
+    val filesRangeSupported = mutableStateOf(false)
+    val filesMaxRangeBytes = mutableStateOf(dev.deeplinks.core.BoundedIo.MAX_WORKSPACE_FILE_BYTES.toLong())
+    val filesChunkBytes = mutableStateOf(dev.deeplinks.core.DEFAULT_RANGE_CHUNK_BYTES)
 
     /**
      * 这台电脑上实测缺失的宿主能力（bootstrap capabilities.host.missing，B1）。
