@@ -1,6 +1,7 @@
 package dev.deeplinks.native.util
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Test
 
 class WorkspacePathsTest {
@@ -83,5 +84,29 @@ class WorkspacePathsTest {
         assertEquals(true, isProducedTextMime("text/plain; charset=utf-8"))
         assertEquals(true, isProducedTextMime("application/json"))
         assertEquals(false, isProducedTextMime("application/pdf"))
+    }
+
+    @Test
+    fun windowsBackslashPaths_extractLeafFilename() {
+        assertEquals("README.md", producedFileName("D:\\DSH\\dsh-links\\README.md"))
+        assertEquals("README.md", safeCacheFileName("D:\\DSH\\dsh-links\\README.md"))
+    }
+
+    @Test
+    fun parseSessionFileLinkPath_handlesFileUrisAndRejectsWeb() {
+        assertEquals(
+            "D:/DSH/dsh-links/README.md",
+            parseSessionFileLinkPath("file:///D:/DSH/dsh-links/README.md#L10-L20"),
+        )
+        assertEquals(
+            "D:/DSH/hello world+1.txt",
+            parseSessionFileLinkPath("file:///D:/DSH/hello%20world+1.txt"),
+        )
+        assertEquals(
+            "/Users/alice/notes.md",
+            parseSessionFileLinkPath("file://localhost/Users/alice/notes.md"),
+        )
+        assertNull(parseSessionFileLinkPath("https://example.com/a.txt"))
+        assertNull(parseSessionFileLinkPath("relative/path.md"))
     }
 }

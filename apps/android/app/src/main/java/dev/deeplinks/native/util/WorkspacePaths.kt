@@ -13,7 +13,7 @@ fun abbreviateHomePath(path: String?): String {
 
 fun producedFileName(path: String): String {
     val trimmed = path.trim()
-    return trimmed.substringAfterLast('/').ifBlank { trimmed }
+    return trimmed.substringAfterLast('/').substringAfterLast('\\').ifBlank { trimmed }
 }
 
 enum class ProducedFileKind { IMAGE, TEXT, PDF, OTHER }
@@ -74,10 +74,32 @@ fun mimeForProducedFile(path: String, serverMime: String?): String {
 
 /** 缓存目录里的文件名：去掉路径分隔与控制字符，避免在外面打开时被拼出奇怪路径。 */
 fun safeCacheFileName(path: String): String {
-    val name = path.trim().substringAfterLast('/')
+    val name = path.trim().substringAfterLast('/').substringAfterLast('\\')
         .replace(Regex("[\\\\/:*?\"<>|\\u0000-\\u001f]"), "_")
         .trim()
     return name.ifBlank { "file" }
+}
+
+/** 把桌面会话消息里的 `file://` 链接还原成可读路径（支持 Windows `file:///D:/...` 与 `#L...` 锚点）。 */
+fun parseSessionFileLinkPath(rawUrl: String): String? {
+    val trimmed = rawUrl.trim()
+    if (!trimmed.startsWith("file://", ignoreCase = true)) return null
+    val withoutFragment = trimmed.substringBefore('#').substringBefore('?')
+    val afterScheme = withoutFragment.substring("file://".length)
+    val rawPath = when {
+        afterScheme.startsWith("localhost/", ignoreCase = true) -> afterScheme.substring("localhost".length)
+        afterScheme.startsWith("/") -> afterScheme
+        else -> return null
+    }
+    val decoded = runCatching {
+        java.net.URLDecoder.decode(rawPath.replace("+", "%2B"), "UTF-8")
+    }.getOrNull() ?: rawPath
+    val normalized = if (decoded.length >= 3 && decoded[0] == '/' && decoded[1].isLetter() && decoded[2] == ':') {
+        decoded.substring(1)
+    } else {
+        decoded
+    }
+    return normalized.trim().takeIf { it.isNotEmpty() }
 }
 
 fun decodeProducedText(bytes: ByteArray, maxChars: Int = 32_768): String {

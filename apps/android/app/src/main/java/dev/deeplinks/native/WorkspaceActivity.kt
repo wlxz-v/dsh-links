@@ -2323,6 +2323,7 @@ fun WorkspaceScreen(
             val visibleGroups = chatFeed.visibleGroups
             val preparedChatFeed = remember(visibleGroups, running) { prepareChatFeed(visibleGroups, isRunning = running) }
             val sweepingId = remember(messages, running) { resolveSweepingId(messages, running) }
+            val onPreviewChatFile = rememberProducedFilePreviewSink()
             // 消息渲染的副作用集合（COM-001 拆解）：状态用 getter/setter 注入，调用时读最新值
             val chatActions = remember(client, host, context) {
                 ChatFeedActions(
@@ -2349,6 +2350,7 @@ fun WorkspaceScreen(
                     filesRangeSupported = { workspaceViewModel.filesRangeSupported.value },
                     filesMaxRangeBytes = { workspaceViewModel.filesMaxRangeBytes.value },
                     filesChunkBytes = { workspaceViewModel.filesChunkBytes.value },
+                    onPreviewFile = onPreviewChatFile,
                 )
             }
             // 消息列表进入组合（手机从首页点进会话、轨迹切回对话）时补一次贴底：
@@ -2982,22 +2984,9 @@ fun WorkspaceScreen(
             sessionId = browseSessionId,
             loadDir = client::getWorkspaceTree,
             fetchFile = client::getSessionFile,
-            downloadFile = if (workspaceViewModel.filesRangeSupported.value) {
-                { sid, filePath, onProgress ->
-                    client.downloadWorkspaceFile(
-                        sessionId = sid,
-                        path = filePath,
-                        cacheRootDir = context.cacheDir,
-                        maxFileBytes = workspaceViewModel.filesMaxRangeBytes.value,
-                        chunkBytes = workspaceViewModel.filesChunkBytes.value,
-                        onProgress = onProgress,
-                    )
-                }
-            } else {
-                null
-            },
+            downloadFile = buildWorkspaceRangeDownloader(client, context.cacheDir, workspaceViewModel),
             onDismiss = { showFileBrowser = false },
-            rootName = currentSession?.cwd?.trimEnd('/')?.substringAfterLast('/'),
+            rootName = currentSession?.cwd?.trimEnd('/', '\\')?.substringAfterLast('/')?.substringAfterLast('\\'),
             onQuote = { path -> inputText = L.fileQuotePrefill.format(path) + inputText; showFileBrowser = false },
         )
     }

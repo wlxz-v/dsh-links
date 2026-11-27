@@ -74,7 +74,7 @@ import dev.deeplinks.native.util.tableToCsv
 import dev.deeplinks.native.util.tableToTsv
 
 @Composable
-internal fun MarkdownContent(text: String, streaming: Boolean = false) {
+internal fun MarkdownContent(text: String, streaming: Boolean = false, onOpenFileLink: ((String) -> Unit)? = null) {
     val context = androidx.compose.ui.platform.LocalContext.current
     val blocks = remember(text) { splitMarkdownBlocks(text) }
     blocks.forEachIndexed { index, block ->
@@ -106,7 +106,7 @@ internal fun MarkdownContent(text: String, streaming: Boolean = false) {
             MarkdownBlockType.LIST -> {
                 Row(modifier = Modifier.fillMaxWidth()) {
                     Text("•  ", color = Dsh.labelTertiary, style = DshType.bodyLarge)
-                    InlineMarkdownText(block.content, streaming = streamTail)
+                    InlineMarkdownText(block.content, streaming = streamTail, onOpenFileLink = onOpenFileLink)
                 }
             }
             MarkdownBlockType.QUOTE -> {
@@ -126,7 +126,7 @@ internal fun MarkdownContent(text: String, streaming: Boolean = false) {
                         }
                         .padding(start = DshSpace.s12, top = DshSpace.s4, bottom = DshSpace.s4)
                 ) {
-                    InlineMarkdownText(block.content, color = Dsh.labelSecondary, streaming = streamTail)
+                    InlineMarkdownText(block.content, color = Dsh.labelSecondary, streaming = streamTail, onOpenFileLink = onOpenFileLink)
                 }
             }
             MarkdownBlockType.TABLE -> {
@@ -155,7 +155,7 @@ internal fun MarkdownContent(text: String, streaming: Boolean = false) {
                 if (streamTail) StreamCaret()
             }
             MarkdownBlockType.EMPTY -> if (streamTail) StreamCaret()
-            else -> InlineMarkdownText(block.content, streaming = streamTail)
+            else -> InlineMarkdownText(block.content, streaming = streamTail, onOpenFileLink = onOpenFileLink)
         }
     }
 }
@@ -358,15 +358,19 @@ private fun InlineMarkdownText(
     streaming: Boolean = false,
     /** 标题等纯文本块不解析行内标记。 */
     markdown: Boolean = true,
+    onOpenFileLink: ((String) -> Unit)? = null,
 ) {
     val pressed = Dsh.pressed
     val labelPrimaryColor = Dsh.labelPrimary
     val brand400Color = Dsh.brand400
     val context = androidx.compose.ui.platform.LocalContext.current
-    val openUrl: (String) -> Unit = remember(context) {
+    val openUrl: (String) -> Unit = remember(context, onOpenFileLink) {
         { url ->
-            // 普通 Markdown 链接与图片使用同一 HTTPS/公网校验，避免打开明文、私网或元数据地址。
-            if (MarkdownMedia.isSafeImageUrl(url)) {
+            val filePath = dev.deeplinks.native.util.parseSessionFileLinkPath(url)
+            if (filePath != null && onOpenFileLink != null) {
+                onOpenFileLink(filePath)
+            } else if (MarkdownMedia.isSafeImageUrl(url)) {
+                // 普通 Markdown 链接与图片使用同一 HTTPS/公网校验，避免打开明文、私网或元数据地址。
                 runCatching {
                     context.startActivity(android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse(url)))
                 }

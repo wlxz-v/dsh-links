@@ -171,6 +171,9 @@ internal fun openWithSystemApp(
             .addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
         val chooser = android.content.Intent.createChooser(view, producedFileName(path))
             .addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        if (context !is android.app.Activity) {
+            chooser.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
         context.startActivity(chooser)
         true
     } catch (_: android.content.ActivityNotFoundException) {
@@ -180,41 +183,94 @@ internal fun openWithSystemApp(
     }
 }
 
-internal fun resolveProducedFilePreview(
-    context: android.content.Context,
+internal sealed interface PreparedFileAction {
+    data class Preview(val preview: ProducedPreview) : PreparedFileAction
+    data class OpenExternal(val path: String, val mime: String, val file: java.io.File) : PreparedFileAction
+    data class Failed(val status: String) : PreparedFileAction
+}
+
+internal fun prepareProducedFileAction(
     path: String,
     serverMime: String,
     file: java.io.File,
-): Pair<ProducedPreview?, String?> {
+): PreparedFileAction {
     val kind = producedFileKind(path)
     return when {
         kind == ProducedFileKind.IMAGE || serverMime.startsWith("image/") -> {
             val bmp = decodeSampledBitmap(file)
-            if (bmp != null) ProducedPreview.Image(bmp) to null else null to "decode"
+            if (bmp != null) PreparedFileAction.Preview(ProducedPreview.Image(bmp)) else PreparedFileAction.Failed("decode")
         }
         kind == ProducedFileKind.TEXT || isProducedTextMime(serverMime) -> {
             if (file.length() <= BoundedIo.MAX_WORKSPACE_FILE_BYTES) {
-                ProducedPreview.Text(path, decodeProducedText(file.readBytes())) to null
+                PreparedFileAction.Preview(ProducedPreview.Text(path, decodeProducedText(file.readBytes())))
             } else {
-                val opened = openWithSystemApp(context, path, mimeForProducedFile(path, serverMime), file)
-                null to if (opened) "external" else "no-app"
+                PreparedFileAction.OpenExternal(path, mimeForProducedFile(path, serverMime), file)
             }
         }
         kind == ProducedFileKind.PDF -> {
             val rendered = runCatching { renderPdfPages(file) }.getOrNull()
             if (rendered != null && rendered.first.isNotEmpty()) {
-                ProducedPreview.Pdf(producedFileName(path), rendered.first, rendered.second) to null
-            } else if (openWithSystemApp(context, path, mimeForProducedFile(path, serverMime), file)) {
-                null to "external"
+                PreparedFileAction.Preview(ProducedPreview.Pdf(producedFileName(path), rendered.first, rendered.second))
             } else {
-                null to "pdf"
+                PreparedFileAction.OpenExternal(path, mimeForProducedFile(path, serverMime), file)
             }
         }
+        else -> PreparedFileAction.OpenExternal(path, mimeForProducedFile(path, serverMime), file)
+    }
+}
+
+internal fun prepareProducedFileActionFromBytes(
+    context: android.content.Context,
+    path: String,
+    serverMime: String,
+    bytes: ByteArray,
+    sniffText: Boolean = false,
+): PreparedFileAction {
+    val kind = producedFileKind(path)
+    return when {
+        kind == ProducedFileKind.IMAGE || serverMime.startsWith("image/") -> {
+            val bmp = decodeSampledBitmap(bytes)
+            if (bmp != null) PreparedFileAction.Preview(ProducedPreview.Image(bmp)) else PreparedFileAction.Failed("decode")
+        }
+        kind == ProducedFileKind.TEXT || isProducedTextMime(serverMime) || (sniffText && dev.deeplinks.native.util.looksLikeText(bytes)) -> {
+            PreparedFileAction.Preview(ProducedPreview.Text(path, decodeProducedText(bytes)))
+        }
         else -> {
-            val opened = openWithSystemApp(context, path, mimeForProducedFile(path, serverMime), file)
-            null to if (opened) "external" else "no-app"
+            val dir = java.io.File(context.cacheDir, "opened").apply { mkdirs() }
+            val file = java.io.File(dir, safeCacheFileName(path)).apply { writeBytes(bytes) }
+            prepareProducedFileAction(path, serverMime, file)
         }
     }
+}
+
+/** 在主线程兑现已准备好的文件打开动作（预览框 / 系统应用 / 失败码）。 */
+internal fun dispatchPreparedFileAction(
+    context: android.content.Context,
+    action: PreparedFileAction,
+): Pair<ProducedPreview?, String?> = when (action) {
+    is PreparedFileAction.Preview -> action.preview to null
+    is PreparedFileAction.OpenExternal -> {
+        val opened = openWithSystemApp(context, action.path, action.mime, action.file)
+        null to if (opened) "external" else "no-app"
+    }
+    is PreparedFileAction.Failed -> null to action.status
+}
+
+@Composable
+internal fun rememberProducedFilePreviewSink(): (ProducedPreview) -> Unit {
+    var preview by remember { mutableStateOf<ProducedPreview?>(null) }
+    androidx.compose.runtime.DisposableEffect(preview) {
+        val owned = preview
+        onDispose {
+            when (owned) {
+                is ProducedPreview.Image -> if (!owned.bitmap.isRecycled) owned.bitmap.recycle()
+                is ProducedPreview.Pdf -> owned.pages.forEach { if (!it.isRecycled) it.recycle() }
+                else -> Unit
+            }
+        }
+    }
+    preview?.let { current -> ProducedPreviewDialog(current, onDismiss = { preview = null }) }
+    return { preview = it }
 }
 
 /** 8 MiB 上限是在读流时抛的 IOException，外面又包了一层本地化文案，所以要顺 cause 链找。 */
@@ -297,38 +353,18 @@ internal fun ProducedFilesRow(
                     val downloaded = download(path) { got, total ->
                         scope.launch(Dispatchers.Main) { if (loadingPath == path) downloadProgress = got to total }
                     }
-                    resolveProducedFilePreview(context, path, downloaded.mime, downloaded.file)
+                    prepareProducedFileAction(path, downloaded.mime, downloaded.file)
                 } else {
                     val (serverMime, bytes) = fetch!!.invoke(path)
-                    when {
-                        kind == ProducedFileKind.IMAGE || serverMime.startsWith("image/") -> {
-                            val bmp = decodeSampledBitmap(bytes)
-                            if (bmp != null) ProducedPreview.Image(bmp) to null else null to "decode"
-                        }
-                        kind == ProducedFileKind.TEXT || isProducedTextMime(serverMime) ->
-                            ProducedPreview.Text(path, decodeProducedText(bytes)) to null
-                        kind == ProducedFileKind.PDF -> {
-                            val dir = java.io.File(context.cacheDir, "opened").apply { mkdirs() }
-                            val file = java.io.File(dir, safeCacheFileName(path)).apply { writeBytes(bytes) }
-                            val rendered = runCatching { renderPdfPages(file) }.getOrNull()
-                            if (rendered != null && rendered.first.isNotEmpty()) {
-                                ProducedPreview.Pdf(producedFileName(path), rendered.first, rendered.second) to null
-                            } else {
-                                null to "pdf"
-                            }
-                        }
-                        else -> {
-                            val opened = openWithSystemApp(context, path, mimeForProducedFile(path, serverMime), bytes)
-                            null to if (opened) "external" else "no-app"
-                        }
-                    }
+                    prepareProducedFileActionFromBytes(context, path, serverMime, bytes)
                 }
             }
             withContext(Dispatchers.Main) {
                 loadingPath = null
                 downloadProgress = null
                 resolved.fold(
-                    onSuccess = { (nextPreview, status) ->
+                    onSuccess = { action ->
+                        val (nextPreview, status) = dispatchPreparedFileAction(context, action)
                         when {
                             nextPreview != null -> preview = nextPreview
                             status == "no-app" -> notice = L.noAppToOpen
@@ -337,7 +373,11 @@ internal fun ProducedFilesRow(
                     },
                     onFailure = { error ->
                         errorPath = path
-                        if (isFileTooLarge(error)) notice = L.fileTooLarge
+                        notice = if (isFileTooLarge(error)) {
+                            L.fileTooLarge
+                        } else {
+                            error.message?.takeIf { it.isNotBlank() && it != L.openFileFailed }
+                        }
                     },
                 )
             }

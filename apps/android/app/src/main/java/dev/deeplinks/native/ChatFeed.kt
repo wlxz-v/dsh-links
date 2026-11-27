@@ -167,6 +167,7 @@ internal class ChatFeedActions(
     private val filesRangeSupported: () -> Boolean = { false },
     private val filesMaxRangeBytes: () -> Long = { dev.deeplinks.core.MAX_WORKSPACE_RANGE_FILE_BYTES },
     private val filesChunkBytes: () -> Int = { dev.deeplinks.core.DEFAULT_RANGE_CHUNK_BYTES },
+    private val onPreviewFile: ((ProducedPreview) -> Unit)? = null,
 ) {
     fun onCopy(msg: MobileMessage): () -> Unit = {
         val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
@@ -293,6 +294,52 @@ internal class ChatFeedActions(
             )
         }
     }
+
+    fun onOpenFileLink(): ((String) -> Unit)? {
+        val previewSink = onPreviewFile ?: return null
+        return { filePath ->
+            val sid = currentSessionId()
+            if (sid != null) {
+                scope.launch(Dispatchers.IO) {
+                    val outcome = runCatching {
+                        if (filesRangeSupported()) {
+                            val dl = client.downloadWorkspaceFile(
+                                sessionId = sid,
+                                path = filePath,
+                                cacheRootDir = context.cacheDir,
+                                maxFileBytes = filesMaxRangeBytes(),
+                                chunkBytes = filesChunkBytes(),
+                            )
+                            prepareProducedFileAction(filePath, dl.mime, dl.file)
+                        } else {
+                            val (mime, bytes) = client.getSessionFile(sid, filePath)
+                            prepareProducedFileActionFromBytes(context, filePath, mime, bytes)
+                        }
+                    }
+                    withContext(Dispatchers.Main) {
+                        outcome.fold(
+                            onSuccess = { action ->
+                                val (shown, status) = dispatchPreparedFileAction(context, action)
+                                when {
+                                    shown != null -> previewSink(shown)
+                                    status == "no-app" -> Toast.makeText(context, L.noAppToOpen, Toast.LENGTH_SHORT).show()
+                                    status != "external" -> Toast.makeText(context, L.openFileFailed, Toast.LENGTH_SHORT).show()
+                                }
+                            },
+                            onFailure = { err ->
+                                val msg = if (isFileTooLarge(err)) {
+                                    L.fileTooLarge
+                                } else {
+                                    err.message?.takeIf { it.isNotBlank() } ?: L.openFileFailed
+                                }
+                                Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+                            },
+                        )
+                    }
+                }
+            }
+        }
+    }
 }
 
 /**
@@ -391,6 +438,7 @@ internal fun LazyListScope.chatMessageItems(
                     val onRetract = remember(actions, msg.id, msg.role, feedbackSupported) { actions.onRetract(msg) }
                     val onFetchProducedFile = remember(actions, msg.id, msg.role) { actions.onFetchProducedFile(msg) }
                     val onDownloadProducedFile = remember(actions, msg.id, msg.role) { actions.onDownloadProducedFile(msg) }
+                    val onOpenFileLink = remember(actions) { actions.onOpenFileLink() }
                     MessageItem(
                         msg = msg,
                         running = sweepingId != null && msg.id == sweepingId,
@@ -404,6 +452,7 @@ internal fun LazyListScope.chatMessageItems(
                         onRetract = onRetract,
                         onFetchProducedFile = onFetchProducedFile,
                         onDownloadProducedFile = onDownloadProducedFile,
+                        onOpenFileLink = onOpenFileLink,
                         onOpenChanges = actions.openChanges,
                         showActions = msg.id in prepared.turnEnds,
                         turnModelLabel = prepared.turnModelById[msg.id],

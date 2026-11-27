@@ -376,7 +376,7 @@ class MobileApiClient(private val host: Host) {
                     val text = response.body.byteStream().use { BoundedIo.readText(it) }
                     val msg = parseMobileApiError(code, text)
                     if (code == 401 || code == 403) throw MobileAuthException(msg, code)
-                    throw IllegalStateException(msg)
+                    throw MobileApiHttpException(code, text, msg)
                 }
                 val total = response.header("Content-Length")?.trim()?.toLongOrNull() ?: -1L
                 val etag = response.header("ETag")?.trim()?.takeIf { it.isNotEmpty() }
@@ -386,6 +386,8 @@ class MobileApiClient(private val host: Host) {
                 return WorkspaceFileHead(totalBytes = total, etag = etag, mime = mime, supportsRanges = acceptRanges)
             }
         } catch (e: MobileAuthException) {
+            throw e
+        } catch (e: MobileApiHttpException) {
             throw e
         } catch (e: Exception) {
             throw IllegalStateException(friendlyNetworkError(e), e)
@@ -478,9 +480,31 @@ class MobileApiClient(private val host: Host) {
     ): DownloadedWorkspaceFile {
         val targetDir = java.io.File(cacheRootDir, "opened").apply { mkdirs() }
         val targetFile = java.io.File(targetDir, dev.deeplinks.native.util.safeCacheFileName(path))
+        val initialHead = try {
+            headWorkspaceFile(sessionId, path)
+        } catch (e: MobileAuthException) {
+            throw e
+        } catch (e: MobileApiHttpException) {
+            if (e.httpCode == 404 || e.httpCode == 413) throw e
+            null
+        } catch (_: Exception) {
+            null
+        }
+        if (initialHead == null || !initialHead.supportsRanges || initialHead.totalBytes < 0L) {
+            val (mime, bytes) = getSessionFile(sessionId, path)
+            targetFile.writeBytes(bytes)
+            val size = bytes.size.toLong()
+            onProgress(size, size)
+            return DownloadedWorkspaceFile(targetFile, mime, size, null)
+        }
         val downloader = WorkspaceChunkDownloader(cacheRootDir, maxFileBytes, chunkBytes)
+        var cachedHead: WorkspaceFileHead? = initialHead
         val transport = object : WorkspaceRangeTransport {
-            override fun head(): WorkspaceFileHead = headWorkspaceFile(sessionId, path)
+            override fun head(): WorkspaceFileHead {
+                val first = cachedHead
+                cachedHead = null
+                return first ?: headWorkspaceFile(sessionId, path)
+            }
             override fun fetchRange(start: Long, endInclusive: Long, ifRangeEtag: String?): WorkspaceFileRangeChunk =
                 fetchWorkspaceFileRange(sessionId, path, start, endInclusive, ifRangeEtag)
         }

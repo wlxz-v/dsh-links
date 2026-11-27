@@ -90,6 +90,7 @@ internal fun MessageItem(
     onRetract: (() -> Unit)? = null,
     onFetchProducedFile: ((String) -> Pair<String, ByteArray>)? = null,
     onDownloadProducedFile: ((String, (Long, Long) -> Unit) -> dev.deeplinks.core.DownloadedWorkspaceFile)? = null,
+    onOpenFileLink: ((String) -> Unit)? = null,
     onOpenChanges: ((seq: Long, fileIndex: Int?) -> Unit)? = null,
     /** 复制 / 赞踩 / 时间一行：只在一轮的最后一条回复上显示。 */
     showActions: Boolean = true,
@@ -175,6 +176,7 @@ internal fun MessageItem(
                             text = textPart ?: msg.text,
                             longPress = longPressModifier,
                             streaming = msg.running == true && isLastPart,
+                            onOpenFileLink = onOpenFileLink,
                         )
                     }
                     // v4 4.2 轮尾：改动卡 → 元信息灰字 → 文字按钮（复制 / 重新生成 / 分享 / ⋯）
@@ -963,13 +965,18 @@ private fun UserBubble(text: String, longPress: Modifier = Modifier) {
 }
 
 @Composable
-private fun AssistantMarkdown(text: String, longPress: Modifier = Modifier, streaming: Boolean = false) {
+private fun AssistantMarkdown(
+    text: String,
+    longPress: Modifier = Modifier,
+    streaming: Boolean = false,
+    onOpenFileLink: ((String) -> Unit)? = null,
+) {
     val decoded = remember(text) { decodeHtmlEntities(text) }
     Column(
         modifier = longPress.fillMaxWidth(),
         verticalArrangement = Arrangement.spacedBy(DshSpace.s12)
     ) {
-        MarkdownContent(decoded, streaming = streaming)
+        MarkdownContent(decoded, streaming = streaming, onOpenFileLink = onOpenFileLink)
     }
 }
 

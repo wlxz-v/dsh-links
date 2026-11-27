@@ -54,6 +54,24 @@ import kotlinx.coroutines.withContext
 /** 超过这个大小的「未知类型」文件不下载嗅探，直接复制路径。 */
 private const val SNIFF_MAX_BYTES = 512L * 1024
 
+internal fun buildWorkspaceRangeDownloader(
+    client: MobileApiClient,
+    cacheDir: java.io.File,
+    vm: WorkspaceViewModel,
+): ((sessionId: String, path: String, onProgress: (Long, Long) -> Unit) -> DownloadedWorkspaceFile)? {
+    if (!vm.filesRangeSupported.value) return null
+    return { sid, filePath, onProgress ->
+        client.downloadWorkspaceFile(
+            sessionId = sid,
+            path = filePath,
+            cacheRootDir = cacheDir,
+            maxFileBytes = vm.filesMaxRangeBytes.value,
+            chunkBytes = vm.filesChunkBytes.value,
+            onProgress = onProgress,
+        )
+    }
+}
+
 private sealed interface DirState {
     data object Loading : DirState
     data class Loaded(val listing: WorkspaceDirListing) : DirState
@@ -127,39 +145,33 @@ internal fun WorkspaceFileBrowserSheet(
         val preferRange = downloadFile != null && (entry.size == null || entry.size > BoundedIo.MAX_WORKSPACE_FILE_BYTES)
         openJob = scope.launch {
             val result = try {
-                val outcome = withContext(Dispatchers.IO) {
+                val prepared = withContext(Dispatchers.IO) {
                     val reportProgress: (Long, Long) -> Unit = { got, total ->
                         scope.launch(Dispatchers.Main) { if (openingName == entry.name) openingProgress = got to total }
                     }
-                    if (preferRange) {
-                        val dl = downloadFile!!.invoke(sessionId, path, reportProgress)
+                    val fromDisk: (DownloadedWorkspaceFile) -> PreparedFileAction = { dl ->
                         if (sniff && dl.file.length() <= SNIFF_MAX_BYTES && looksLikeText(dl.file.readBytes())) {
-                            ProducedPreview.Text(path, decodeProducedText(dl.file.readBytes())) to null
+                            PreparedFileAction.Preview(ProducedPreview.Text(path, decodeProducedText(dl.file.readBytes())))
                         } else {
-                            resolveProducedFilePreview(context, path, dl.mime, dl.file)
+                            prepareProducedFileAction(path, dl.mime, dl.file)
                         }
+                    }
+                    if (preferRange) {
+                        fromDisk(downloadFile!!.invoke(sessionId, path, reportProgress))
                     } else {
-                        val (serverMime, bytes) = fetchFile(sessionId, path)
-                        when {
-                            kind == ProducedFileKind.IMAGE || serverMime.startsWith("image/") ->
-                                decodeSampledBitmap(bytes)?.let { ProducedPreview.Image(it) } to null
-                            kind == ProducedFileKind.TEXT || isProducedTextMime(serverMime) ||
-                                (sniff && looksLikeText(bytes)) ->
-                                ProducedPreview.Text(path, decodeProducedText(bytes)) to null
-                            kind == ProducedFileKind.PDF -> runCatching {
-                                val cacheDir = java.io.File(context.cacheDir, "opened").apply { mkdirs() }
-                                val file = java.io.File(cacheDir, safeCacheFileName(path)).apply { writeBytes(bytes) }
-                                renderPdfPages(file)
-                            }.getOrNull()?.takeIf { it.first.isNotEmpty() }
-                                ?.let { ProducedPreview.Pdf(entry.name, it.first, it.second) } to null
-                            else -> {
-                                val opened = openWithSystemApp(context, path, mimeForProducedFile(path, serverMime), bytes)
-                                null to if (opened) "external" else "no-app"
+                        try {
+                            val (serverMime, bytes) = fetchFile(sessionId, path)
+                            prepareProducedFileActionFromBytes(context, path, serverMime, bytes, sniffText = sniff)
+                        } catch (e: Exception) {
+                            if (downloadFile != null && isFileTooLarge(e)) {
+                                fromDisk(downloadFile.invoke(sessionId, path, reportProgress))
+                            } else {
+                                throw e
                             }
                         }
                     }
                 }
-                Result.success(outcome)
+                Result.success(dispatchPreparedFileAction(context, prepared))
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -178,8 +190,11 @@ internal fun WorkspaceFileBrowserSheet(
                     }
                 },
                 onFailure = { error ->
-                    rowNotice = entry.name to
-                        if (isFileTooLarge(error)) L.fileTooLarge else L.openFileFailed
+                    rowNotice = entry.name to when {
+                        isFileTooLarge(error) -> L.fileTooLarge
+                        !error.message.isNullOrBlank() -> error.message!!
+                        else -> L.openFileFailed
+                    }
                 },
             )
         }

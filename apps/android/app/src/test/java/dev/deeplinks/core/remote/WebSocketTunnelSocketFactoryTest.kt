@@ -255,6 +255,14 @@ class WebSocketTunnelSocketFactoryTest {
                     }
             }
             assertEquals("顺序 5 次请求只应建一条隧道", 1, harness.relay.requestCount)
+            HostHttp.execute(
+                harness.host,
+                HostHttp.DshRequest("HEAD", "/messages"),
+                forceRoute = HostRoute.REMOTE,
+                remoteOverride = harness.remote,
+            ).use { headRes ->
+                assertEquals(200, headRes.code)
+            }
 
             val executor = Executors.newFixedThreadPool(8)
             try {

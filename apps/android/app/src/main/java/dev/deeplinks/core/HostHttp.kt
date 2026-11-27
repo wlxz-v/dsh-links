@@ -309,7 +309,7 @@ object HostHttp {
                 // R5：池里的旧连接被远端关掉（这次 call 没经历 connectStart）时，GET 换新连接再试一次；
                 // 主动取消或读超时不得重放（避免取消失效或把 30s 超时翻倍成 60s），也不驱逐池中其他正常隧道。
                 if (
-                    request.method == "GET" &&
+                    (request.method == "GET" || request.method == "HEAD") &&
                     !reuseRetried &&
                     !marker.connected() &&
                     !call.isCanceled() &&

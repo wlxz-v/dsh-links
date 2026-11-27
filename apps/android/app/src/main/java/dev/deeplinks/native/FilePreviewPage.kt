@@ -71,7 +71,7 @@ internal fun FilePreviewPage(
     val context = LocalContext.current
     val copiedNotice = DshS.filePathCopied
     val subtitle = remember(path, body) {
-        val dir = path.trim().substringBeforeLast('/', missingDelimiterValue = "")
+        val dir = path.trim().replace('\\', '/').substringBeforeLast('/', missingDelimiterValue = "")
         listOfNotNull(dir.ifEmpty { null }, formatFileSize(utf8ByteLength(body))).joinToString(" · ")
     }
     val chunks = remember(body) { chunkPreviewLines(body) }
