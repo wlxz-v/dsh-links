@@ -884,5 +884,9 @@ val DshStringsZh = DshStrings(
         put("compatPluginTooOld", "电脑端插件为 %1\$s，建议升级至 %2\$s 及以上。")
         put("compatAppTooOld", "当前插件要求 App %2\$s 及以上（当前 %1\$s）。")
         put("compatLegacyPlugin", "电脑端插件版本较旧，未声明版本兼容信息。")
+        put("checkUpdatesNow", "立即检查更新")
+        put("checkingUpdates", "正在检查…")
+        put("updateUpToDate", "当前已是最新版本")
+        put("updateCheckFailed", "检查更新失败")
     }
 )

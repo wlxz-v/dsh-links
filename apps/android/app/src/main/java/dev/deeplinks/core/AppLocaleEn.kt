@@ -885,5 +885,9 @@ val DshStringsEn = DshStrings(
         put("compatPluginTooOld", "Computer plugin is %1\$s; %2\$s or newer is recommended.")
         put("compatAppTooOld", "This plugin requires app %2\$s or newer (current %1\$s).")
         put("compatLegacyPlugin", "Computer plugin is older and does not report compatibility info.")
+        put("checkUpdatesNow", "Check for updates now")
+        put("checkingUpdates", "Checking…")
+        put("updateUpToDate", "You are on the latest version")
+        put("updateCheckFailed", "Update check failed")
     }
 )

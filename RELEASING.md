@@ -19,7 +19,7 @@ GitHub `wlxz-v/dsh-links` = **插件源码、DLP/1 中继源码（`relay/`）、
 - [ ] 运行 `apksigner verify --print-certs app/build/outputs/apk/release/app-release.apk`，指纹与根 `README.md` / `SECURITY.md` 记录一致。
 - [ ] Android 正式包：`assembleRelease` 后**务必保存混淆映射表** `app/build/outputs/mapping/release/mapping.txt`（按版本命名，例如 `DeepLinks-<versionName>-mapping.txt`）；用户报崩溃时用它 `retrace` 还原堆栈。映射表不进仓库、不发 Release 附件，只存档。
 - [ ] 用真实 Android 设备完成配对、会话/SSE、审批、吊销、重启后重连验收；远程改动还要在蜂窝网络下跑一遍远程首配与 Wi‑Fi / 蜂窝切换。
-- [ ] 创建 tag `app-v<versionName>`，打 GitHub Release（Pre-release），上传签名 APK 与 `app-release.apk.sha256`；Release 说明附版本号、APK SHA-256、证书 SHA-256、最低 Android 版本与安装说明。
+- [ ] 运行 `node scripts/release-android.mjs --dry-run` 核对签名指纹、SHA-256、外部 `mapping.txt` 归档与 Release 清单；确认无误后执行 `node scripts/release-android.mjs --execute` 创建 `app-v<versionName>` Pre-release（附 APK 与 `.sha256`）。
 - [ ] 校验和与 `shasum -a 256` 输出一致。
 - [ ] 更新 `docs/COMPATIBILITY.md` 记录新组合，并运行 `node scripts/check-versions.mjs` 校验三端版本号一致。
 

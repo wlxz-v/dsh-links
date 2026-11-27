@@ -10,7 +10,15 @@ data class AppRelease(
     val tagName: String,
     val htmlUrl: String,
     val publishedAt: String,
+    val apkUrl: String = "",
+    val bodySummary: String = "",
 )
+
+sealed interface UpdateCheckResult {
+    data object UpToDate : UpdateCheckResult
+    data class UpdateAvailable(val release: AppRelease) : UpdateCheckResult
+    data class Failed(val reason: String) : UpdateCheckResult
+}
 
 private const val DAY_MS = 24L * 60L * 60L * 1000L
 private const val MAX_RELEASE_BODY_BYTES = 512 * 1024
@@ -21,6 +29,21 @@ private const val KEY_TAG = "update_latest_tag"
 private const val KEY_URL = "update_latest_url"
 
 const val GITHUB_RELEASES_URL = "https://api.github.com/repos/wlxz-v/dsh-links/releases?per_page=10"
+private const val ALLOWED_APK_PREFIX = "https://github.com/wlxz-v/dsh-links/"
+private const val MAX_BODY_SUMMARY_CHARS = 400
+
+private fun parseApkUrl(assets: JSONArray?): String {
+    if (assets == null) return ""
+    for (i in 0 until assets.length()) {
+        val asset = assets.optJSONObject(i) ?: continue
+        val name = asset.optString("name", "")
+        val url = asset.optString("browser_download_url", "")
+        if (name.endsWith(".apk", ignoreCase = true) && url.startsWith(ALLOWED_APK_PREFIX)) {
+            return url
+        }
+    }
+    return ""
+}
 
 /** 只认 App 的 `app-v*` 正式发布，插件 tag 和草稿都丢掉。 */
 fun parseReleases(json: String): List<AppRelease> {
@@ -31,10 +54,14 @@ fun parseReleases(json: String): List<AppRelease> {
         if (item.optBoolean("draft", false)) continue
         val tag = item.optString("tag_name")
         if (!tag.startsWith("app-v")) continue
+        val body = item.optString("body", "").trim()
+        val summary = if (body.length > MAX_BODY_SUMMARY_CHARS) body.take(MAX_BODY_SUMMARY_CHARS) else body
         out += AppRelease(
             tagName = tag,
             htmlUrl = item.optString("html_url"),
             publishedAt = item.optString("published_at"),
+            apkUrl = parseApkUrl(item.optJSONArray("assets")),
+            bodySummary = summary,
         )
     }
     return out
@@ -122,11 +149,8 @@ object UpdateChecker {
         .callTimeout(20, TimeUnit.SECONDS)
         .build()
 
-    /** 后台调用。失败只留面包屑，不抛给界面。 */
-    fun checkBlocking(context: Context, versionName: String, url: String = GITHUB_RELEASES_URL, now: Long = System.currentTimeMillis()) {
-        if (!UpdateCheckPrefs.enabled(context)) return
-        if (!shouldCheck(UpdateCheckPrefs.lastCheckedAt(context), now)) return
-        try {
+    internal fun fetchUpdateStatus(versionName: String, url: String = GITHUB_RELEASES_URL): UpdateCheckResult {
+        return try {
             val request = Request.Builder()
                 .url(url)
                 .header("Accept", "application/vnd.github+json")
@@ -135,16 +159,53 @@ object UpdateChecker {
                 .build()
             client.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) {
-                    CrashRecorder.breadcrumb("update", "http ${response.code}")
-                    return
+                    return UpdateCheckResult.Failed("http ${response.code}")
                 }
                 val body = response.body.byteStream().use { BoundedIo.readText(it, MAX_RELEASE_BODY_BYTES) }
                 val newer = newerRelease(versionName, parseReleases(body))
-                UpdateCheckPrefs.setCachedNewer(context, newer)
+                if (newer != null) UpdateCheckResult.UpdateAvailable(newer) else UpdateCheckResult.UpToDate
+            }
+        } catch (e: Exception) {
+            UpdateCheckResult.Failed(e.message?.take(80) ?: "check failed")
+        }
+    }
+
+    /** 手动立即检查更新（绕过 24h 节流），供设置页使用。 */
+    fun checkNow(context: Context, versionName: String, url: String = GITHUB_RELEASES_URL, now: Long = System.currentTimeMillis()): UpdateCheckResult {
+        return when (val result = fetchUpdateStatus(versionName, url)) {
+            is UpdateCheckResult.UpdateAvailable -> {
+                UpdateCheckPrefs.setCachedNewer(context, result.release)
+                UpdateCheckPrefs.setLastCheckedAt(context, now)
+                result
+            }
+            is UpdateCheckResult.UpToDate -> {
+                UpdateCheckPrefs.setCachedNewer(context, null)
+                UpdateCheckPrefs.setLastCheckedAt(context, now)
+                result
+            }
+            is UpdateCheckResult.Failed -> {
+                CrashRecorder.breadcrumb("update", result.reason)
+                result
+            }
+        }
+    }
+
+    /** 后台调用。失败只留面包屑，不抛给界面。 */
+    fun checkBlocking(context: Context, versionName: String, url: String = GITHUB_RELEASES_URL, now: Long = System.currentTimeMillis()) {
+        if (!UpdateCheckPrefs.enabled(context)) return
+        if (!shouldCheck(UpdateCheckPrefs.lastCheckedAt(context), now)) return
+        when (val result = fetchUpdateStatus(versionName, url)) {
+            is UpdateCheckResult.UpdateAvailable -> {
+                UpdateCheckPrefs.setCachedNewer(context, result.release)
                 UpdateCheckPrefs.setLastCheckedAt(context, now)
             }
-        } catch (_: Exception) {
-            CrashRecorder.breadcrumb("update", "check failed")
+            is UpdateCheckResult.UpToDate -> {
+                UpdateCheckPrefs.setCachedNewer(context, null)
+                UpdateCheckPrefs.setLastCheckedAt(context, now)
+            }
+            is UpdateCheckResult.Failed -> {
+                CrashRecorder.breadcrumb("update", result.reason)
+            }
         }
     }
 }

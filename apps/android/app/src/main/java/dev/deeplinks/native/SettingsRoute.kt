@@ -850,6 +850,9 @@ internal fun AboutSettings(onOpenLegal: (fileName: String, title: String) -> Uni
     var newer by androidx.compose.runtime.remember {
         androidx.compose.runtime.mutableStateOf(dev.deeplinks.core.UpdateCheckPrefs.cachedNewer(context))
     }
+    var checkingNow by androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf(false) }
+    var checkStatusText by androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf<String?>(null) }
+    val scope = androidx.compose.runtime.rememberCoroutineScope()
     DshListSection(footer = s.unofficialNotice) {
         DshListRow(
             title = "DeepLinks",
@@ -862,13 +865,45 @@ internal fun AboutSettings(onOpenLegal: (fileName: String, title: String) -> Uni
             onCheckedChange = {
                 checkUpdates = it
                 dev.deeplinks.core.UpdateCheckPrefs.setEnabled(context, it)
-                if (!it) newer = null
+                if (!it) {
+                    newer = null
+                    checkStatusText = null
+                }
             },
         )
+        DshListRow(
+            title = s.translation("checkUpdatesNow"),
+            subtitle = if (checkingNow) s.translation("checkingUpdates") else checkStatusText,
+            icon = RefreshOutline16,
+            onClick = if (checkingNow) null else ({
+                checkingNow = true
+                checkStatusText = null
+                scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                    val result = dev.deeplinks.core.UpdateChecker.checkNow(context, BuildConfig.VERSION_NAME)
+                    kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+                        checkingNow = false
+                        when (result) {
+                            is dev.deeplinks.core.UpdateCheckResult.UpdateAvailable -> {
+                                newer = result.release
+                                checkStatusText = null
+                            }
+                            is dev.deeplinks.core.UpdateCheckResult.UpToDate -> {
+                                newer = null
+                                checkStatusText = s.translation("updateUpToDate")
+                            }
+                            is dev.deeplinks.core.UpdateCheckResult.Failed -> {
+                                checkStatusText = s.translation("updateCheckFailed")
+                            }
+                        }
+                    }
+                }
+            }),
+        )
         val release = newer
-        if (checkUpdates && release != null) {
+        if (release != null) {
             DshListRow(
                 title = s.updateAvailable.format(dev.deeplinks.core.displayVersion(release.tagName)),
+                subtitle = release.bodySummary.takeIf { it.isNotBlank() },
                 icon = InfoOutline16,
                 onClick = { openReleasePage(context, release.htmlUrl) },
             )
